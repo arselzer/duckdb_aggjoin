@@ -5,59 +5,6 @@ specialized AGGJOIN execution. It targets a narrow but important class of
 queries where planner-side preaggregation or a fused aggregate-over-join path
 can avoid paying for the full join result.
 
-## Introducing Example
-
-One concrete example is the exact `spark-eval` `dblp/path02.sql` query over the
-SNAP `com-dblp.ungraph.txt` graph staged to Parquet:
-
-```sql
-select count(*)
-from dblp p1, dblp p2, dblp p3
-where p1.toNode = p2.fromNode
-  and p2.toNode = p3.fromNode;
-```
-
-On the current build, the optimizer rewrites that query into a native
-mixed-side preaggregation plan rather than materializing the full 3-way join.
-The shape from `EXPLAIN` is:
-
-```text
-PROJECTION
-  UNGROUPED_AGGREGATE  sum(#0)
-    PROJECTION  "*"(#1, #3)
-      HASH_JOIN  #0 = #0
-        HASH_GROUP_BY  Groups: #0, Aggregates: count_star()
-          HASH_JOIN  toNode = fromNode
-            SEQ_SCAN dblp
-            SEQ_SCAN dblp
-        HASH_GROUP_BY  Groups: #0, Aggregates: count_star()
-          SEQ_SCAN dblp
-```
-
-With the extension disabled, DuckDB stays on the direct left-deep join plan:
-
-```text
-UNGROUPED_AGGREGATE  count_star()
-  HASH_JOIN  fromNode = toNode
-    HASH_JOIN  toNode = fromNode
-      SEQ_SCAN dblp
-      SEQ_SCAN dblp
-    SEQ_SCAN dblp
-```
-
-On the real `dblp` graph cached as Parquet on the local benchmark host:
-
-| Query | Count | Current plan | Native baseline |
-|-------|-------|--------------|-----------------|
-| `dblp/path02.sql` | `67,520,431` | `0.104s` | `0.162s` |
-| `dblp/path03.sql` | `835,509,083` | `0.113s` | `1.473s` |
-| `dblp/path04.sql` | `12,025,691,265` | `0.243s` | `32.186s` |
-
-So the point of the project is not “always use a custom operator.” It is to
-recognize narrow aggregate-over-join shapes like this and lower them to
-something cheaper than the default plan, while bailing out aggressively on the
-many nearby shapes that do not hold up.
-
 ## Overview
 
 The extension registers an **optimizer extension** that detects narrow
