@@ -8,7 +8,7 @@ DUCKDB_VERSION ?= v1.4.3
 # Build type (Release or Debug)
 BUILD_TYPE ?= Release
 
-.PHONY: all clean test wasm debug
+.PHONY: all clean test smoke wasm debug
 
 EXT_NAME_UPPER := $(shell echo $(EXT_NAME) | tr a-z A-Z)
 
@@ -34,8 +34,10 @@ debug:
 	$(MAKE) BUILD_TYPE=Debug all
 
 test: all
-	cd build/$(BUILD_TYPE) && \
-	./test/unittest "$(CURDIR)/test/sql/aggjoin.test"
+	"$(CURDIR)/scripts/run_sqllogictests.sh" "$(CURDIR)/build/$(BUILD_TYPE)"
+
+smoke: all
+	"$(CURDIR)/scripts/run_regression_smoke.sh" "$(CURDIR)/build/$(BUILD_TYPE)"
 
 # --- WASM build (for DuckDB-WASM frontend) ---
 # Requires: Emscripten 3.1.71, DuckDB source in $(DUCKDB_DIR)

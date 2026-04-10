@@ -1,10 +1,59 @@
 # DuckDB AggJoin Extension
 
-A DuckDB extension that fuses aggregate and join operations into a single physical operator, eliminating intermediate materialization. Designed for Yannakakis-style query evaluation where frequency-weighted aggregation over join results can be computed without constructing the full join output.
+An experimental DuckDB optimizer extension for aggregate-over-join rewrites and
+specialized AGGJOIN execution. It targets a narrow but important class of
+queries where planner-side preaggregation or a fused aggregate-over-join path
+can avoid paying for the full join result.
 
 ## Overview
 
-The extension registers an **optimizer extension** that automatically detects `Aggregate(Join)` patterns in query plans and replaces them with a fused `PhysicalAggJoin` operator. It fires transparently on every query -- no SQL changes needed.
+The extension registers an **optimizer extension** that detects narrow
+`Aggregate(Join)` patterns and rewrites them either to:
+
+- a fused `PhysicalAggJoin` operator, or
+- a native DuckDB preaggregation lowering that is cheaper than the original
+  plan shape
+
+It fires transparently on every query that matches its current envelopes; no
+SQL changes are needed.
+
+## Status
+
+This project should be read as a **benchmark-backed research/engineering
+prototype**, not as a general-purpose replacement for DuckDB planning.
+
+What that means in practice:
+
+- it is strong on specific query families that have been benchmarked and gated
+  carefully
+- it intentionally bails to native DuckDB for many nearby shapes where the win
+  is weak, uncertain, or absent
+- it contains both positive and negative results, and those negative results
+  are part of the design story rather than something hidden
+
+The current public story is therefore:
+
+- **implemented today**: fused AGGJOIN execution for strong dense single-join
+  cases, plus several native preaggregation rewrite families
+- **intentionally narrow**: many variable-width, composite, asymmetric, and
+  weak-latency cases stay native-first
+- **worth trying**: if your workload has aggregate-over-join shapes similar to
+  the benchmark matrix in [benchmarks/README.md](./benchmarks/README.md)
+
+## What It Accelerates
+
+The repo is strongest on:
+
+- grouped and ungrouped aggregate-over-single-join shapes with `SUM/COUNT/AVG`
+  and selected `MIN/MAX`
+- build-heavy and mixed probe/build aggregate shapes that are better served by
+  native preaggregation than by a fused executor
+- narrow 3-way "final-bag" chains where preaggregating the tail of the join
+  graph changes the cost materially
+- dense single-key integer workloads, where the fused AGGJOIN operator can use
+  direct indexing instead of a generic hash path
+
+It is not trying to be universally best for all joins or all aggregates.
 
 ### When it fires
 
@@ -45,11 +94,17 @@ ungrouped numeric `SUM/COUNT/AVG/MIN/MAX` shapes can now use a narrow hash path
 when the planner expects them to be dense enough to matter. The current grouped
 path uses a build-slot hash fast path with direct string-key comparison and
 now also uses a fused single-pass kernel for common all-`DOUBLE`
-`SUM/COUNT/AVG/MIN/MAX` mixes. On the local `100K`-row benchmarks, the heavier
-grouped `SUM+MIN+MAX` mix stays strongly positive through roughly `5K` groups
-and near parity even much farther out, while lighter grouped `COUNT(*)` and
-`AVG` variants remain competitive through about `10K` groups and only slip
-slightly behind native beyond that.
+`SUM/COUNT/AVG/MIN/MAX` mixes. For the heavier grouped `MIN/MAX`-containing
+mixes, finalize now also builds an exact `string_t -> build slot` lookup when
+the grouped single-key `VARCHAR` shape stays small enough to fit the current
+dense envelope (about `<=5K` build keys in the local sweep). A later
+planner-side native build-preaggregation widening now covers more of the next
+grouped single-key boundary too: on the local `100K`-row sweep, heavier grouped
+`MIN/MAX`-containing mixes and lighter grouped `AVG` cases now rewrite cleanly
+through the `10K` to `20K` band instead of riding the older near-parity
+raw-string path, and the same rewrite still stays near native around `50K`
+groups. The dense `<=5K` cases still stay on the narrow raw-string AGGJOIN
+path.
 
 ### Performance snapshot
 
@@ -57,21 +112,36 @@ Current benchmark results are tracked in
 [benchmarks/README.md](./benchmarks/README.md). On DuckDB `v1.5.1`, 10M probe
 rows, the current build is strong on numeric single-key workloads. The dense
 `VARCHAR` and build-heavy follow-up numbers in that README were refreshed on
-April 9, 2026; the long `bench.sql` and `bench_scaling.sql` native baselines
-did not complete cleanly on this host during that rerun, so their tables there
-remain the previous full snapshot:
+April 10, 2026. On this host, the long monolithic `bench.sql` and
+`bench_scaling.sql` suites are now treated as convenience wrappers only: the
+current core/scaling snapshot in [benchmarks/README.md](./benchmarks/README.md)
+is built from split per-case files (`bench_core_*`, `bench_scaling_*`), with
+slow native-only cases run via `benchmarks/run_with_timeout.sh` and reported as
+explicit timeouts where appropriate. The current local snapshot was collected on
+an AMD Ryzen 9 3900X host (12 cores / 24 threads) with 62 GiB RAM running
+Ubuntu 22.04 / Linux 6.8:
 
 | Scenario | AGGJOIN | Native | Result |
 |----------|---------|--------|--------|
-| Direct grouped `SUM`, 100K keys | 0.710s | 9.120s | **12.8x faster** |
-| Direct grouped `SUM`, 1M keys | 1.784s | 9.775s | **5.5x faster** |
-| Segmented direct grouped `SUM`, 3M keys | 3.188s | 10.226s | **3.2x faster** |
-| Segmented direct grouped `SUM`, 5M keys | 5.003s | 11.672s | **2.3x faster** |
-| Zipf-skewed grouped `SUM`, 100K keys | 0.464s | 8.335s | **18.0x faster** |
-| High-blowup grouped `SUM`, 10K keys | 0.245s | 7.839s | **32.0x faster** |
-| Multi-agg `SUM+MIN+MAX+AVG`, 1M keys | 3.317s | 24.802s | **7.5x faster** |
-| Dense `VARCHAR` grouped `SUM`, 1K keys / 100K rows | 0.008s | 0.178s | **22.3x faster** |
-| Dense `VARCHAR` grouped `SUM+MIN+MAX`, 1K keys / 100K rows | 0.015s | 0.264s | **17.6x faster** |
+| Direct grouped `SUM`, 100K keys | 0.246s | 13.750s | **55.9x faster** |
+| Direct grouped `SUM`, 1M keys | 0.334s | 1.948s | **5.8x faster** |
+| Grouped `SUM`, 3M keys | 0.412s | 1.076s | **2.6x faster** |
+| Zipf-skewed grouped `SUM`, 100K keys | 0.170s | `>60s` timed out | **>=352x** |
+| High-blowup grouped `SUM`, 10K keys | 0.085s | 253.094s | **2977x faster** |
+| Multi-agg `SUM+MIN+MAX+AVG`, 1M keys | 0.566s | 3.877s | **6.9x faster** |
+| Dense `VARCHAR` grouped `SUM`, 1K keys / 100K rows | 0.009s | 0.182s | **20.2x faster** |
+| Dense `VARCHAR` grouped `SUM+MIN+MAX`, 1K keys / 100K rows | 0.012s | 0.280s | **23.3x faster** |
+
+If you are rerunning the top-line suites locally, prefer the split files in
+[benchmarks/](./benchmarks/) on constrained hosts. They let you run AGGJOIN and
+native sides independently and make slow native cases fail as explicit
+timeouts instead of blocking the entire suite.
+
+For a public evaluation, the benchmark README is the main source of truth:
+
+- benchmark files are split by family
+- long native cases can be run independently or under timeout
+- host specs for the published local numbers are recorded there
 
 Current limitations worth knowing:
 - sparse workloads are still only near parity
@@ -84,19 +154,54 @@ Current limitations worth knowing:
   intentionally left to native DuckDB by the planner gate
 - build-heavy non-numeric build-side `MIN/MAX` is now partially covered by the
   same native build-preaggregation lowering on narrow balanced grouped/ungrouped
-  shapes, while broader build-side aggregate mixes still mostly fall back to native
+  shapes, while broader build-side aggregate mixes still mostly fall back to native;
+  a later follow-up also added a narrow composite-key grouped-by-subset case for
+  build-side `AVG + DATE MIN/MAX`
 - the same native lowering now also covers narrow mixed build-side numeric +
   non-numeric aggregate sets, such as grouped `SUM + VARCHAR MIN/MAX` and
   ungrouped `SUM + DATE MIN/MAX`
 - a second narrow native lowering now also covers grouped and ungrouped mixed
   probe-side + build-side aggregate sets, for example probe `SUM` plus build
   `SUM + VARCHAR/DATE MIN/MAX`, and grouped probe/build `AVG` variants on the
-  same narrow single-key balanced shape; a later follow-up also widened the
-  grouped single-key mixed lowering to a probe-heavy asymmetric envelope, while
-  still leaving build-heavy asymmetric shapes native-first
-- that same mixed probe/build lowering now also has a narrow grouped composite-key
-  extension for full-key `GROUP BY` shapes
+  same narrow single-key balanced shape; a follow-up benchmark also confirmed
+  that the same rewrite already covers probe-side `DATE/VARCHAR MIN/MAX` plus
+  build-side `SUM` on that same narrow balanced single-key envelope; a later
+  widening kept probe-heavy asymmetric mixed grouped shapes while still leaving
+  build-heavy asymmetric shapes native-first
+- that same mixed probe/build lowering now also has narrow grouped composite-key
+  extensions for both full-key `GROUP BY` shapes and ordered subset-of-key
+  grouped shapes, and now also covers the ungrouped balanced composite-key case;
+  a follow-up benchmark also confirmed that the same composite family already
+  covers probe-side `DATE/VARCHAR MIN/MAX` plus build-side `SUM`; the current
+  asymmetric composite envelope also covers both richer mixed
+  `AVG + AVG + DATE MIN/MAX`, probe-side `VARCHAR MIN/MAX` plus
+  build-side `AVG + DATE MIN/MAX`, and probe-side nonnumeric `MIN/MAX` plus
+  build-side `SUM`, including full-key, subset-key, and ungrouped composite
+  envelopes; the adjacent single-key pure-nonnumeric case only clearly wins on
+  the grouped probe-heavy side and otherwise stays near native parity
 - the operator is still blocking, so it does not improve `LIMIT` latency
+
+## Design lessons
+
+This repo is useful beyond the raw speedups because it documents which
+optimization ideas actually held up.
+
+Main lessons so far:
+
+- **planner-side native lowerings paid out more reliably than deeper executor
+  complexity**
+- **the profitable region is often real but narrow**, so gating matters as much
+  as implementation
+- **many negative results were still valuable** because they showed where a
+  seemingly plausible rewrite or runtime path flattened out
+- **specialized aggregate-over-join optimization is not obviously too
+  expensive**; the hard part is semantics and cost confidence, not raw planner
+  overhead
+
+That is why the codebase now includes both:
+
+- benchmark-backed kept rewrite families
+- documented reverted attempts in [CLAUDE.md](./CLAUDE.md)
 
 ### Planner tracing
 
@@ -129,7 +234,16 @@ git clone --depth 1 --branch v1.5.1 https://github.com/duckdb/duckdb.git duckdb
 make                    # Release build (~5min first time, compiles DuckDB from source)
 make debug              # Debug build
 make test               # Build + run tests
+make smoke              # Build + split sqllogictests + benchmark smoke harness
 make clean              # Remove build artifacts
+```
+
+The smoke harness runs the split sqllogictest suite plus a few representative
+benchmark cases with timeouts. It is meant to catch regressions in the main
+execution modes cheaply, without rerunning the full benchmark matrix:
+
+```bash
+./scripts/run_regression_smoke.sh ./build/Release
 ```
 
 The Makefile handles all cmake configuration including:
@@ -265,12 +379,22 @@ GROUP BY r.x;
 ```bash
 make test
 # Or manually:
-cd build/Release
-./test/unittest "/path/to/duckdb_aggjoin/test/sql/aggjoin.test"
+./scripts/run_sqllogictests.sh
 ```
 
-24 assertions covering SUM, COUNT, MIN, MAX, AVG, GROUP BY, multi-table joins,
-CTEs with frequency propagation, and empty result sets.
+The sqllogictest suite is split across `test/sql/aggjoin_*.test` by theme
+instead of one monolithic file. The current suite covers basic correctness,
+collision/guard paths, single-key mixed shapes, composite shapes, and
+VARCHAR-key paths.
+
+For a cheap regression check:
+
+```bash
+make smoke
+```
+
+That runs the split sqllogictests plus a few representative benchmark smoke
+cases under timeout.
 
 ## DuckDB version compatibility
 
@@ -284,14 +408,9 @@ The `AGGJOIN_GETDATA` macro selects the correct method.
 
 ## Architecture
 
-```
-src/aggjoin_extension.cpp       Extension entry point (~30 lines, registers optimizer)
-src/aggjoin_optimizer.cpp       Optimizer + PhysicalAggJoin (~1700 lines)
-src/include/aggjoin_extension.hpp  Extension class header
-test/sql/aggjoin.test           DuckDB sqllogictest tests
-Makefile                        Build helper (handles cmake variable naming)
-CMakeLists.txt                  Extension build config
-```
+The extension is now split by layer rather than keeping optimizer, runtime, and
+emit logic in one translation unit. See [ARCHITECTURE.md](./ARCHITECTURE.md)
+for the full module map.
 
 ### Pipeline model
 
@@ -329,6 +448,9 @@ PhysicalAggJoin uses DuckDB's `CachingPhysicalOperator` + Sink pipeline:
   re-probing the build HT in Phase 3 build-side aggregate accumulation.
 - **Open-addressing HT**: Power-of-2, 70% load, linear probing with `__builtin_prefetch`
   (hash mode fallback).
+- **Native planner lowerings**: Narrow planner-side rewrites now cover several
+  weak shapes better than direct AGGJOIN execution, including build-side,
+  mixed probe/build, and grouped/ungrouped 3-way final-bag chains.
 
 ### What was tried
 
@@ -342,6 +464,7 @@ PhysicalAggJoin uses DuckDB's `CachingPhysicalOperator` + Sink pipeline:
 | PK/FK fast path (all_bc_one) | 3.9x faster for PK/FK joins | **Kept** |
 | Typed group storage | 24-40% faster hash mode (no Value boxing) | **Kept** |
 | Ungrouped scalar path | O(1) emit instead of O(krange) | **Kept** |
+| Native final-bag preagg rewrite | 1.5-2.6x faster than native on grouped/ungrouped 3-way chains | **Kept** |
 | Software prefetch (direct mode) | +8% slower (arrays in L3) | **Reverted** |
 | Parallel probe (thread-local HTs) | Crashed (OperatorState lifetime) | **Reverted** |
 | SIMD accumulation | Not attempted (memory-bound scatter) | **Skipped** |

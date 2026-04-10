@@ -1,0 +1,102 @@
+# name: test/sql/aggjoin_varchar.test
+# description: VARCHAR-key and fallback coverage for AggJoin
+# group: [aggjoin]
+
+require aggjoin
+
+statement ok
+CREATE TABLE r_vkey (x VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO r_vkey VALUES ('a', 10.0), ('a', 20.0), ('b', 30.0), ('c', 40.0);
+
+statement ok
+CREATE TABLE s_vkey (x VARCHAR);
+
+statement ok
+INSERT INTO s_vkey VALUES ('a'), ('a'), ('b'), ('c'), ('c');
+
+query I
+SELECT CAST(SUM(r_vkey.val) AS INTEGER) FROM r_vkey JOIN s_vkey ON r_vkey.x = s_vkey.x;
+----
+170
+
+query II rowsort
+SELECT r_vkey.x, CAST(SUM(r_vkey.val) AS INTEGER)
+FROM r_vkey JOIN s_vkey ON r_vkey.x = s_vkey.x
+GROUP BY r_vkey.x;
+----
+a	60
+b	30
+c	80
+
+query II
+SELECT CAST(MIN(r_vkey.val) AS INTEGER), CAST(MAX(r_vkey.val) AS INTEGER)
+FROM r_vkey JOIN s_vkey ON r_vkey.x = s_vkey.x;
+----
+10	40
+
+query III rowsort
+SELECT r_vkey.x, CAST(MIN(r_vkey.val) AS INTEGER), CAST(MAX(r_vkey.val) AS INTEGER)
+FROM r_vkey JOIN s_vkey ON r_vkey.x = s_vkey.x
+GROUP BY r_vkey.x;
+----
+a	10	20
+b	30	30
+c	40	40
+
+query II rowsort
+SELECT r_vkey.x, COUNT(*)
+FROM r_vkey JOIN s_vkey ON r_vkey.x = s_vkey.x
+GROUP BY r_vkey.x;
+----
+a	4
+b	1
+c	2
+
+query II rowsort
+SELECT r_vkey.x, CAST(AVG(r_vkey.val) AS INTEGER)
+FROM r_vkey JOIN s_vkey ON r_vkey.x = s_vkey.x
+GROUP BY r_vkey.x;
+----
+a	15
+b	30
+c	40
+
+statement ok
+CREATE TABLE events (user_id INT, event_date DATE);
+
+statement ok
+INSERT INTO events VALUES (1, '2020-01-15'), (1, '2020-06-20'), (2, '2021-03-10');
+
+statement ok
+CREATE TABLE users (id INT);
+
+statement ok
+INSERT INTO users VALUES (1), (2);
+
+query II
+SELECT MIN(events.event_date), MAX(events.event_date)
+FROM events JOIN users ON events.user_id = users.id;
+----
+2020-01-15	2021-03-10
+
+statement ok
+CREATE TABLE r_mix (x INT, val DOUBLE, name VARCHAR);
+
+statement ok
+INSERT INTO r_mix VALUES (1, 10.0, 'charlie'), (2, 20.0, 'alice');
+
+statement ok
+CREATE TABLE s_mix (x INT);
+
+statement ok
+INSERT INTO s_mix VALUES (1), (2), (1);
+
+query III rowsort
+SELECT s_mix.x, CAST(SUM(r_mix.val) AS INTEGER), MIN(r_mix.name)
+FROM r_mix JOIN s_mix ON r_mix.x = s_mix.x
+GROUP BY s_mix.x;
+----
+1	20	charlie
+2	20	alice

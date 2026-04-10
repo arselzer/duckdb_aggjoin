@@ -1,0 +1,376 @@
+# name: test/sql/aggjoin_composite.test
+# description: Composite-key AggJoin coverage
+# group: [aggjoin]
+
+require aggjoin
+
+statement ok
+CREATE TABLE fact_comp_mix (k1 INT, k2 INT, rv DOUBLE);
+
+statement ok
+INSERT INTO fact_comp_mix VALUES
+    (1, 10, 1.0),
+    (1, 10, 3.0),
+    (1, 20, 5.0),
+    (2, 10, 7.0);
+
+statement ok
+CREATE TABLE dim_comp_mix (k1 INT, k2 INT, sv DOUBLE, d DATE);
+
+statement ok
+INSERT INTO dim_comp_mix VALUES
+    (1, 10, 10.0, '2020-01-01'),
+    (1, 10, 20.0, '2020-01-03'),
+    (1, 20, 30.0, '2020-02-01'),
+    (2, 10, 40.0, '2020-03-01');
+
+query IIIIII rowsort
+SELECT fact_comp_mix.k1,
+       fact_comp_mix.k2,
+       CAST(AVG(fact_comp_mix.rv) * 10 AS INTEGER),
+       CAST(AVG(dim_comp_mix.sv) AS INTEGER),
+       MIN(dim_comp_mix.d),
+       MAX(dim_comp_mix.d)
+FROM fact_comp_mix
+JOIN dim_comp_mix
+  ON fact_comp_mix.k1 = dim_comp_mix.k1
+ AND fact_comp_mix.k2 = dim_comp_mix.k2
+GROUP BY fact_comp_mix.k1, fact_comp_mix.k2;
+----
+1	10	20	15	2020-01-01	2020-01-03
+1	20	50	30	2020-02-01	2020-02-01
+2	10	70	40	2020-03-01	2020-03-01
+
+statement ok
+CREATE TABLE fact_comp_richer_mix (k1 INT, k2 INT, rv DOUBLE, rd DATE);
+
+statement ok
+INSERT INTO fact_comp_richer_mix VALUES
+    (1, 10, 1.0, '2020-01-01'),
+    (1, 10, 3.0, '2020-01-03'),
+    (1, 20, 5.0, '2020-02-01'),
+    (2, 10, 7.0, '2020-03-01');
+
+statement ok
+CREATE TABLE dim_comp_richer_mix (k1 INT, k2 INT, sv DOUBLE, sd DATE);
+
+statement ok
+INSERT INTO dim_comp_richer_mix VALUES
+    (1, 10, 10.0, '2021-01-01'),
+    (1, 10, 20.0, '2021-01-03'),
+    (1, 20, 30.0, '2021-02-01'),
+    (2, 10, 40.0, '2021-03-01');
+
+query IIIIIIII rowsort
+SELECT fact_comp_richer_mix.k1,
+       fact_comp_richer_mix.k2,
+       CAST(AVG(fact_comp_richer_mix.rv) * 10 AS INTEGER),
+       MIN(fact_comp_richer_mix.rd),
+       MAX(fact_comp_richer_mix.rd),
+       CAST(AVG(dim_comp_richer_mix.sv) AS INTEGER),
+       MIN(dim_comp_richer_mix.sd),
+       MAX(dim_comp_richer_mix.sd)
+FROM fact_comp_richer_mix
+JOIN dim_comp_richer_mix
+  ON fact_comp_richer_mix.k1 = dim_comp_richer_mix.k1
+ AND fact_comp_richer_mix.k2 = dim_comp_richer_mix.k2
+GROUP BY fact_comp_richer_mix.k1, fact_comp_richer_mix.k2;
+----
+1	10	20	2020-01-01	2020-01-03	15	2021-01-01	2021-01-03
+1	20	50	2020-02-01	2020-02-01	30	2021-02-01	2021-02-01
+2	10	70	2020-03-01	2020-03-01	40	2021-03-01	2021-03-01
+
+statement ok
+CREATE TABLE fact_comp_asym_richer_mix (k1 INT, k2 INT, rv DOUBLE, rd DATE);
+
+statement ok
+INSERT INTO fact_comp_asym_richer_mix VALUES
+    (1, 10, 1.0, '2020-01-01'),
+    (1, 10, 3.0, '2020-01-03'),
+    (1, 20, 5.0, '2020-02-01'),
+    (2, 10, 7.0, '2020-03-01');
+
+statement ok
+CREATE TABLE dim_comp_asym_richer_mix (k1 INT, k2 INT, sv DOUBLE, sd DATE);
+
+statement ok
+INSERT INTO dim_comp_asym_richer_mix VALUES
+    (1, 10, 10.0, '2021-01-01'),
+    (1, 10, 20.0, '2021-01-03'),
+    (1, 20, 30.0, '2021-02-01'),
+    (2, 10, 40.0, '2021-03-01');
+
+query IIIIIIII rowsort
+SELECT fact_comp_asym_richer_mix.k1,
+       fact_comp_asym_richer_mix.k2,
+       CAST(AVG(fact_comp_asym_richer_mix.rv) * 10 AS INTEGER),
+       MIN(fact_comp_asym_richer_mix.rd),
+       MAX(fact_comp_asym_richer_mix.rd),
+       CAST(AVG(dim_comp_asym_richer_mix.sv) AS INTEGER),
+       MIN(dim_comp_asym_richer_mix.sd),
+       MAX(dim_comp_asym_richer_mix.sd)
+FROM fact_comp_asym_richer_mix
+JOIN dim_comp_asym_richer_mix
+  ON fact_comp_asym_richer_mix.k1 = dim_comp_asym_richer_mix.k1
+ AND fact_comp_asym_richer_mix.k2 = dim_comp_asym_richer_mix.k2
+GROUP BY fact_comp_asym_richer_mix.k1, fact_comp_asym_richer_mix.k2;
+----
+1	10	20	2020-01-01	2020-01-03	15	2021-01-01	2021-01-03
+1	20	50	2020-02-01	2020-02-01	30	2021-02-01	2021-02-01
+2	10	70	2020-03-01	2020-03-01	40	2021-03-01	2021-03-01
+
+query IIIIIII rowsort
+SELECT fact_comp_asym_richer_mix.k1,
+       CAST(AVG(fact_comp_asym_richer_mix.rv) * 10 AS INTEGER),
+       MIN(fact_comp_asym_richer_mix.rd),
+       MAX(fact_comp_asym_richer_mix.rd),
+       CAST(AVG(dim_comp_asym_richer_mix.sv) AS INTEGER),
+       MIN(dim_comp_asym_richer_mix.sd),
+       MAX(dim_comp_asym_richer_mix.sd)
+FROM fact_comp_asym_richer_mix
+JOIN dim_comp_asym_richer_mix
+  ON fact_comp_asym_richer_mix.k1 = dim_comp_asym_richer_mix.k1
+ AND fact_comp_asym_richer_mix.k2 = dim_comp_asym_richer_mix.k2
+GROUP BY fact_comp_asym_richer_mix.k1;
+----
+1	26	2020-01-01	2020-02-01	18	2021-01-01	2021-02-01
+2	70	2020-03-01	2020-03-01	40	2021-03-01	2021-03-01
+
+query IIIIII
+SELECT CAST(AVG(fact_comp_asym_richer_mix.rv) * 10 AS INTEGER),
+       MIN(fact_comp_asym_richer_mix.rd),
+       MAX(fact_comp_asym_richer_mix.rd),
+       CAST(AVG(dim_comp_asym_richer_mix.sv) AS INTEGER),
+       MIN(dim_comp_asym_richer_mix.sd),
+       MAX(dim_comp_asym_richer_mix.sd)
+FROM fact_comp_asym_richer_mix
+JOIN dim_comp_asym_richer_mix
+  ON fact_comp_asym_richer_mix.k1 = dim_comp_asym_richer_mix.k1
+ AND fact_comp_asym_richer_mix.k2 = dim_comp_asym_richer_mix.k2;
+----
+33	2020-01-01	2020-03-01	22	2021-01-01	2021-03-01
+
+statement ok
+CREATE TABLE fact_comp_asym_probe_str_mix (k1 INT, k2 INT, label VARCHAR);
+
+statement ok
+INSERT INTO fact_comp_asym_probe_str_mix VALUES
+    (1, 10, 'b_last'),
+    (1, 10, 'a_first'),
+    (1, 20, 'c_only'),
+    (2, 10, 'd_only');
+
+statement ok
+CREATE TABLE dim_comp_asym_probe_str_mix (k1 INT, k2 INT, sv DOUBLE, sd DATE);
+
+statement ok
+INSERT INTO dim_comp_asym_probe_str_mix VALUES
+    (1, 10, 10.0, '2021-01-01'),
+    (1, 10, 20.0, '2021-01-03'),
+    (1, 20, 30.0, '2021-02-01'),
+    (2, 10, 40.0, '2021-03-01');
+
+query IIIIIII rowsort
+SELECT fact_comp_asym_probe_str_mix.k1,
+       fact_comp_asym_probe_str_mix.k2,
+       MIN(fact_comp_asym_probe_str_mix.label),
+       MAX(fact_comp_asym_probe_str_mix.label),
+       CAST(AVG(dim_comp_asym_probe_str_mix.sv) AS INTEGER),
+       MIN(dim_comp_asym_probe_str_mix.sd),
+       MAX(dim_comp_asym_probe_str_mix.sd)
+FROM fact_comp_asym_probe_str_mix
+JOIN dim_comp_asym_probe_str_mix
+  ON fact_comp_asym_probe_str_mix.k1 = dim_comp_asym_probe_str_mix.k1
+ AND fact_comp_asym_probe_str_mix.k2 = dim_comp_asym_probe_str_mix.k2
+GROUP BY fact_comp_asym_probe_str_mix.k1, fact_comp_asym_probe_str_mix.k2;
+----
+1	10	a_first	b_last	15	2021-01-01	2021-01-03
+1	20	c_only	c_only	30	2021-02-01	2021-02-01
+2	10	d_only	d_only	40	2021-03-01	2021-03-01
+
+query IIIIII rowsort
+SELECT fact_comp_asym_probe_str_mix.k1,
+       MIN(fact_comp_asym_probe_str_mix.label),
+       MAX(fact_comp_asym_probe_str_mix.label),
+       CAST(AVG(dim_comp_asym_probe_str_mix.sv) AS INTEGER),
+       MIN(dim_comp_asym_probe_str_mix.sd),
+       MAX(dim_comp_asym_probe_str_mix.sd)
+FROM fact_comp_asym_probe_str_mix
+JOIN dim_comp_asym_probe_str_mix
+  ON fact_comp_asym_probe_str_mix.k1 = dim_comp_asym_probe_str_mix.k1
+ AND fact_comp_asym_probe_str_mix.k2 = dim_comp_asym_probe_str_mix.k2
+GROUP BY fact_comp_asym_probe_str_mix.k1;
+----
+1	a_first	c_only	18	2021-01-01	2021-02-01
+2	d_only	d_only	40	2021-03-01	2021-03-01
+
+query IIIII
+SELECT MIN(fact_comp_asym_probe_str_mix.label),
+       MAX(fact_comp_asym_probe_str_mix.label),
+       CAST(AVG(dim_comp_asym_probe_str_mix.sv) AS INTEGER),
+       MIN(dim_comp_asym_probe_str_mix.sd),
+       MAX(dim_comp_asym_probe_str_mix.sd)
+FROM fact_comp_asym_probe_str_mix
+JOIN dim_comp_asym_probe_str_mix
+  ON fact_comp_asym_probe_str_mix.k1 = dim_comp_asym_probe_str_mix.k1
+ AND fact_comp_asym_probe_str_mix.k2 = dim_comp_asym_probe_str_mix.k2;
+----
+a_first	d_only	22	2021-01-01	2021-03-01
+
+statement ok
+CREATE TABLE fact_comp_subset_mix (k1 INT, k2 INT, rv DOUBLE);
+
+statement ok
+INSERT INTO fact_comp_subset_mix VALUES
+    (1, 10, 1.0),
+    (1, 10, 3.0),
+    (1, 20, 5.0),
+    (2, 10, 7.0);
+
+statement ok
+CREATE TABLE dim_comp_subset_mix (k1 INT, k2 INT, sv DOUBLE, d DATE);
+
+statement ok
+INSERT INTO dim_comp_subset_mix VALUES
+    (1, 10, 10.0, '2020-01-01'),
+    (1, 10, 20.0, '2020-01-03'),
+    (1, 20, 30.0, '2020-02-01'),
+    (2, 10, 40.0, '2020-03-01');
+
+query IIIII rowsort
+SELECT fact_comp_subset_mix.k1,
+       CAST(SUM(fact_comp_subset_mix.rv) AS INTEGER),
+       CAST(SUM(dim_comp_subset_mix.sv) AS INTEGER),
+       MIN(dim_comp_subset_mix.d),
+       MAX(dim_comp_subset_mix.d)
+FROM fact_comp_subset_mix
+JOIN dim_comp_subset_mix
+  ON fact_comp_subset_mix.k1 = dim_comp_subset_mix.k1
+ AND fact_comp_subset_mix.k2 = dim_comp_subset_mix.k2
+GROUP BY fact_comp_subset_mix.k1;
+----
+1	13	90	2020-01-01	2020-02-01
+2	7	40	2020-03-01	2020-03-01
+
+query IIII
+SELECT CAST(AVG(fact_comp_subset_mix.rv) AS INTEGER),
+       CAST(AVG(dim_comp_subset_mix.sv) AS INTEGER),
+       MIN(dim_comp_subset_mix.d),
+       MAX(dim_comp_subset_mix.d)
+FROM fact_comp_subset_mix
+JOIN dim_comp_subset_mix
+  ON fact_comp_subset_mix.k1 = dim_comp_subset_mix.k1
+ AND fact_comp_subset_mix.k2 = dim_comp_subset_mix.k2;
+----
+3	22	2020-01-01	2020-03-01
+
+statement ok
+CREATE TABLE fact_comp_probe_nnm (k1 INT, k2 INT, d DATE, label VARCHAR);
+
+statement ok
+INSERT INTO fact_comp_probe_nnm VALUES
+    (1, 10, '2020-01-01', 'b_last'),
+    (1, 10, '2020-01-03', 'a_first'),
+    (1, 20, '2020-02-01', 'c_only'),
+    (2, 10, '2020-03-01', 'd_only');
+
+statement ok
+CREATE TABLE dim_comp_probe_nnm (k1 INT, k2 INT, sv DOUBLE);
+
+statement ok
+INSERT INTO dim_comp_probe_nnm VALUES
+    (1, 10, 10.0),
+    (1, 10, 20.0),
+    (1, 20, 30.0),
+    (2, 10, 40.0);
+
+query IIIII rowsort
+SELECT fact_comp_probe_nnm.k1,
+       fact_comp_probe_nnm.k2,
+       MIN(fact_comp_probe_nnm.d),
+       MAX(fact_comp_probe_nnm.d),
+       CAST(SUM(dim_comp_probe_nnm.sv) AS INTEGER)
+FROM fact_comp_probe_nnm
+JOIN dim_comp_probe_nnm
+  ON fact_comp_probe_nnm.k1 = dim_comp_probe_nnm.k1
+ AND fact_comp_probe_nnm.k2 = dim_comp_probe_nnm.k2
+GROUP BY fact_comp_probe_nnm.k1, fact_comp_probe_nnm.k2;
+----
+1	10	2020-01-01	2020-01-03	60
+1	20	2020-02-01	2020-02-01	30
+2	10	2020-03-01	2020-03-01	40
+
+query IIII rowsort
+SELECT fact_comp_probe_nnm.k1,
+       MIN(fact_comp_probe_nnm.d),
+       MAX(fact_comp_probe_nnm.d),
+       CAST(SUM(dim_comp_probe_nnm.sv) AS INTEGER)
+FROM fact_comp_probe_nnm
+JOIN dim_comp_probe_nnm
+  ON fact_comp_probe_nnm.k1 = dim_comp_probe_nnm.k1
+ AND fact_comp_probe_nnm.k2 = dim_comp_probe_nnm.k2
+GROUP BY fact_comp_probe_nnm.k1;
+----
+1	2020-01-01	2020-02-01	90
+2	2020-03-01	2020-03-01	40
+
+query III
+SELECT MIN(fact_comp_probe_nnm.d),
+       MAX(fact_comp_probe_nnm.d),
+       CAST(SUM(dim_comp_probe_nnm.sv) AS INTEGER)
+FROM fact_comp_probe_nnm
+JOIN dim_comp_probe_nnm
+  ON fact_comp_probe_nnm.k1 = dim_comp_probe_nnm.k1
+ AND fact_comp_probe_nnm.k2 = dim_comp_probe_nnm.k2;
+----
+2020-01-01	2020-03-01	130
+
+query IIIII rowsort
+SELECT fact_comp_probe_nnm.k1,
+       fact_comp_probe_nnm.k2,
+       MIN(fact_comp_probe_nnm.label),
+       MAX(fact_comp_probe_nnm.label),
+       CAST(SUM(dim_comp_probe_nnm.sv) AS INTEGER)
+FROM fact_comp_probe_nnm
+JOIN dim_comp_probe_nnm
+  ON fact_comp_probe_nnm.k1 = dim_comp_probe_nnm.k1
+ AND fact_comp_probe_nnm.k2 = dim_comp_probe_nnm.k2
+GROUP BY fact_comp_probe_nnm.k1, fact_comp_probe_nnm.k2;
+----
+1	10	a_first	b_last	60
+1	20	c_only	c_only	30
+2	10	d_only	d_only	40
+
+statement ok
+CREATE TABLE fact_comp_build_subset (k1 INT, k2 INT);
+
+statement ok
+INSERT INTO fact_comp_build_subset VALUES
+    (1, 10),
+    (1, 10),
+    (1, 20),
+    (2, 10);
+
+statement ok
+CREATE TABLE dim_comp_build_subset (k1 INT, k2 INT, sv DOUBLE, d DATE);
+
+statement ok
+INSERT INTO dim_comp_build_subset VALUES
+    (1, 10, 10.0, '2020-01-01'),
+    (1, 10, 20.0, '2020-01-03'),
+    (1, 20, 30.0, '2020-02-01'),
+    (2, 10, 40.0, '2020-03-01');
+
+query IIII rowsort
+SELECT fact_comp_build_subset.k1,
+       CAST(AVG(dim_comp_build_subset.sv) AS INTEGER),
+       MIN(dim_comp_build_subset.d),
+       MAX(dim_comp_build_subset.d)
+FROM fact_comp_build_subset
+JOIN dim_comp_build_subset
+  ON fact_comp_build_subset.k1 = dim_comp_build_subset.k1
+ AND fact_comp_build_subset.k2 = dim_comp_build_subset.k2
+GROUP BY fact_comp_build_subset.k1;
+----
+1	18	2020-01-01	2020-02-01
+2	40	2020-03-01	2020-03-01

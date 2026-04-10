@@ -19,6 +19,7 @@ namespace duckdb {
 // Forward declaration from aggjoin_optimizer.cpp
 void RegisterAggJoinOptimizer(DatabaseInstance &db, bool ignore_disable_static = false);
 void SetAggJoinTestHashBits(int64_t bits);
+void SetAggJoinTestHTCapacity(int64_t capacity);
 
 static void AggjoinSetTestHashBitsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
     UnaryExecutor::Execute<int64_t, int64_t>(args.data[0], result, args.size(), [&](int64_t bits) {
@@ -27,10 +28,20 @@ static void AggjoinSetTestHashBitsFunction(DataChunk &args, ExpressionState &sta
     });
 }
 
+static void AggjoinSetTestHTCapacityFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    UnaryExecutor::Execute<int64_t, int64_t>(args.data[0], result, args.size(), [&](int64_t capacity) {
+        SetAggJoinTestHTCapacity(capacity);
+        return capacity;
+    });
+}
+
 static void RegisterAggJoinTestFunctions(ExtensionLoader &loader) {
     loader.RegisterFunction(
         ScalarFunction("aggjoin_set_test_hash_bits", {LogicalType::BIGINT}, LogicalType::BIGINT,
                        AggjoinSetTestHashBitsFunction));
+    loader.RegisterFunction(
+        ScalarFunction("aggjoin_set_test_ht_capacity", {LogicalType::BIGINT}, LogicalType::BIGINT,
+                       AggjoinSetTestHTCapacityFunction));
 }
 
 void AggjoinExtension::Load(ExtensionLoader &loader) {

@@ -1,0 +1,124 @@
+# name: test/sql/aggjoin_guards.test
+# description: Collision, overflow, and guard coverage for AggJoin
+# group: [aggjoin]
+
+require aggjoin
+
+query I
+SELECT aggjoin_set_test_hash_bits(0);
+----
+0
+
+statement ok
+CREATE TABLE r_coll (x DOUBLE, val DOUBLE);
+
+statement ok
+INSERT INTO r_coll VALUES (1.5, 10.0), (2.5, 20.0);
+
+statement ok
+CREATE TABLE s_coll (x DOUBLE, grp INT);
+
+statement ok
+INSERT INTO s_coll VALUES (1.5, 100), (2.5, 200);
+
+query II rowsort
+SELECT s_coll.grp, CAST(SUM(r_coll.val) AS INTEGER)
+FROM r_coll JOIN s_coll ON r_coll.x = s_coll.x
+GROUP BY s_coll.grp;
+----
+100	10
+200	20
+
+statement ok
+CREATE TABLE r_comp (a INT, b INT, val DOUBLE);
+
+statement ok
+INSERT INTO r_comp VALUES (1, 10, 100.0), (2, 20, 200.0);
+
+statement ok
+CREATE TABLE s_comp (a INT, b INT, grp INT);
+
+statement ok
+INSERT INTO s_comp VALUES (1, 10, 1), (2, 20, 2);
+
+query II rowsort
+SELECT s_comp.grp, CAST(SUM(r_comp.val) AS INTEGER)
+FROM r_comp JOIN s_comp ON r_comp.a = s_comp.a AND r_comp.b = s_comp.b
+GROUP BY s_comp.grp;
+----
+1	100
+2	200
+
+query I
+SELECT aggjoin_set_test_hash_bits(-1);
+----
+-1
+
+statement ok
+CREATE TABLE r_huge (x HUGEINT, val DOUBLE);
+
+statement ok
+INSERT INTO r_huge VALUES (9223372036854775808::HUGEINT, 10.0), (9223372036854775809::HUGEINT, 20.0);
+
+statement ok
+CREATE TABLE s_huge (x HUGEINT, grp VARCHAR);
+
+statement ok
+INSERT INTO s_huge VALUES (9223372036854775808::HUGEINT, 'A'), (9223372036854775809::HUGEINT, 'B');
+
+query TI rowsort
+SELECT s_huge.grp, CAST(SUM(r_huge.val) AS INTEGER)
+FROM r_huge JOIN s_huge ON r_huge.x = s_huge.x
+GROUP BY s_huge.grp;
+----
+A	10
+B	20
+
+statement ok
+CREATE TABLE r_ubig (x UBIGINT, val DOUBLE);
+
+statement ok
+INSERT INTO r_ubig VALUES (9223372036854775808::UBIGINT, 10.0), (9223372036854775809::UBIGINT, 20.0);
+
+statement ok
+CREATE TABLE s_ubig (x UBIGINT, grp VARCHAR);
+
+statement ok
+INSERT INTO s_ubig VALUES (9223372036854775808::UBIGINT, 'A'), (9223372036854775809::UBIGINT, 'B');
+
+query TI rowsort
+SELECT s_ubig.grp, CAST(SUM(r_ubig.val) AS INTEGER)
+FROM r_ubig JOIN s_ubig ON r_ubig.x = s_ubig.x
+GROUP BY s_ubig.grp;
+----
+A	10
+B	20
+
+statement ok
+CREATE TABLE r_cap (x DOUBLE, val DOUBLE);
+
+statement ok
+INSERT INTO r_cap SELECT i::DOUBLE, 1.0 FROM generate_series(1, 20) t(i);
+
+statement ok
+CREATE TABLE s_cap (x DOUBLE, grp INT);
+
+statement ok
+INSERT INTO s_cap SELECT i::DOUBLE, i FROM generate_series(1, 20) t(i);
+
+query I
+SELECT aggjoin_set_test_ht_capacity(16);
+----
+16
+
+statement error
+SELECT s_cap.grp, CAST(SUM(r_cap.val) AS INTEGER)
+FROM r_cap JOIN s_cap ON r_cap.x = s_cap.x
+GROUP BY s_cap.grp;
+----
+capacity cap
+
+query I
+SELECT aggjoin_set_test_ht_capacity(-1);
+----
+-1

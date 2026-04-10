@@ -35,6 +35,10 @@ Recent trace matrix findings:
   build-side `MIN/MAX` class: balanced grouped `VARCHAR MIN/MAX` and ungrouped
   `DATE MIN/MAX` can now lower to fully native grouped-preagg subplans and beat
   the extension-disabled baseline on the focused follow-up benchmark
+- a later follow-up extended the same build-preagg family to a narrow
+  composite-key grouped-by-subset case for build-side `AVG + DATE MIN/MAX`;
+  on a focused `1M`-row benchmark grouped by `k1` over join key `(k1,k2)` it
+  improved from about `0.180s` native to `0.123s`
 - the same native build-preaggregation lowering also covers narrow mixed
   build-side numeric + non-numeric aggregate sets, including grouped
   `SUM + VARCHAR MIN/MAX` and ungrouped `SUM + DATE MIN/MAX`
@@ -48,10 +52,58 @@ Recent trace matrix findings:
   `SUM+VARCHAR MIN/MAX`, `0.047s` vs `0.138s` for the grouped `DATE` variant,
   `0.036s` vs `0.073s` for the ungrouped `DATE` variant, and `0.053s` vs
   `0.144s` for grouped probe/build `AVG + DATE MIN/MAX`
+- a later follow-up confirmed that the same native mixed-side rewrite already
+  covers probe-side nonnumeric `DATE/VARCHAR MIN/MAX` plus build-side `SUM` on
+  the same narrow balanced single-key grouped and ungrouped shapes, at roughly
+  `0.057s` vs `0.152s`, `0.046s` vs `0.143s`, and `0.029s` vs `0.052s`
 - the same native mixed-side rewrite was then extended one notch to a narrow
   grouped composite-key class where `GROUP BY` matches the full join key; on a
   focused `1M`-row `AVG + AVG + DATE MIN/MAX` benchmark it improved from about
   `0.510s` native to `0.332s`
+- a later widening kept narrow asymmetric composite mixed cases for
+  `AVG + AVG + DATE MIN/MAX`; the current kept envelope now covers full-key,
+  subset-key, and ungrouped composite shapes, with focused results around
+  `0.067s` vs `1.529s`, `0.035s` vs `0.492s`, and `0.017s` vs `0.245s` on the
+  small-probe / large-build side and similarly strong wins on the
+  large-probe / small-build side
+- a follow-up benchmark confirmed the same asymmetric composite mixed rewrite
+  already covers a richer case where both sides contribute `AVG` plus
+  nonnumeric `DATE MIN/MAX`; the kept envelope already includes full-key,
+  subset-key, and ungrouped composite shapes, so no extra optimizer widening
+  was needed there
+- another follow-up confirmed the same asymmetric composite mixed rewrite also
+  already covers probe-side `VARCHAR MIN/MAX` with build-side
+  `AVG + DATE MIN/MAX`, again across full-key, subset-key, and ungrouped
+  composite shapes without another optimizer change
+- the analogous single-key pure nonnumeric family is asymmetric: grouped
+  probe-heavy `VARCHAR MIN/MAX` + `DATE MIN/MAX` already wins strongly via the
+  existing native mixed-side rewrite, but grouped build-heavy and both
+  ungrouped variants stay near native parity, so there is no reason to widen
+  that family further either
+- the next adjacent asymmetric composite boundary did not hold: pure
+  nonnumeric-on-both-sides composite shapes like probe `VARCHAR MIN/MAX` plus
+  build `DATE MIN/MAX` stayed near native parity or slightly worse, so that
+  family should remain native-first rather than widening the rewrite again
+- a later follow-up extended that mixed-side family one notch further to a
+  narrow grouped composite-key case where `GROUP BY` is an ordered subset of
+  the join key rather than the full key; on a focused `1M`-row
+  `SUM + SUM + DATE MIN/MAX` benchmark grouped by `k1` over join key `(k1,k2)`
+  it improved from about `0.210s` native to `0.169s`
+- the same mixed-side family now also covers the ungrouped balanced
+  composite-key case; on a focused `1M`-row `AVG + AVG + DATE MIN/MAX`
+  benchmark over join key `(k1,k2)` it improved from about `0.182s` native to
+  `0.151s`
+- a later follow-up confirmed that the same composite mixed-side family already
+  covers probe-side nonnumeric `DATE/VARCHAR MIN/MAX` plus build-side `SUM` on
+  the balanced composite-key full-key, subset-key, and ungrouped shapes; the
+  focused benchmarks were extremely positive because the disabled-extension
+  native baselines were very slow on those exact shapes
+- a further widening kept narrow asymmetric composite cases for probe-side
+  nonnumeric `DATE MIN/MAX` plus build-side `SUM`; the current kept envelope
+  now covers full-key, subset-key, and ungrouped composite shapes, with focused
+  results around `0.030s` vs `0.846s`, `0.038s` vs `0.409s`, and `0.015s` vs
+  `0.231s` on the small-probe / large-build side and similarly strong wins on
+  the large-probe / small-build side
 - a later asymmetric follow-up showed the mixed-side rewrite should still stay
   native-first for build-heavy asymmetric single-key shapes (about `0.288s` vs
   `0.277s` on a `100K x 5M` `SUM + SUM + DATE MIN/MAX` case), but widening it
@@ -73,10 +125,16 @@ Recent trace matrix findings:
 - the grouped string-key path now also has a fused single-pass `build_slot_hash`
   kernel for common all-`DOUBLE` `SUM/COUNT/AVG/MIN/MAX` mixes, avoiding one
   full rescan of the matched probe rows per aggregate
+- a later structural follow-up did hold up for the heavier grouped `VARCHAR`
+  shapes: for grouped single-key `VARCHAR` mixes that include `MIN/MAX` and
+  stay within about `5K` build keys, finalize now materializes an exact
+  `string_t -> build slot` lookup table and probe reuses that slot directly
+  instead of rediscovering the matching bucket through the generic string-key
+  hash path
 - the dense direct `VARCHAR` benchmark (`bench_varchar_dense.sql`) is a real win:
   grouped `SUM` at `1K` keys / `100K` rows is about `22x` faster than the
-  same-binary native baseline, grouped `SUM+MIN+MAX` is about `18x` faster,
-  and ungrouped `SUM` is about `8x` faster too
+  same-binary native baseline, grouped `SUM+MIN+MAX` is now about `23x`
+  faster, and ungrouped `SUM` is still several times faster too
 - the new `VARCHAR` path should stay narrow: on a grouped `SUM+MIN+MAX` sweep
   over `100K` rows it is now clearly useful through about `5K` groups and
   remains near parity much farther out (`10K`, `20K`, even `50K`), rather than
@@ -99,6 +157,14 @@ Recent trace matrix findings:
   drifted from about `0.010s` to `0.012s`, `5K` grouped `SUM+MIN+MAX` from
   about `0.022s` to `0.024s`, and `10K` grouped `AVG` from about `0.047s` to
   `0.085s`)
+- a later phase-1 structural follow-up also tried a custom open-addressed
+  dense-id table plus compact per-id aggregate arrays for the same grouped
+  single-key `VARCHAR` `MIN/MAX` envelope, but that also failed to beat the
+  current committed semantic slot-lookup path: dense grouped `SUM+MIN+MAX`
+  drifted from about `0.012s` to `0.016s`, the `5K` grouped `SUM+MIN+MAX`
+  sweep from about `0.014s` to `0.023s`, while lighter grouped `AVG` at `10K`
+  stayed roughly flat around parity; so the next real broader-varlen step is
+  not another runtime-only dense-id table
 - a later packed/compressed-key follow-up was also benchmarked and reverted:
   it reused DuckDB `compress_string` metadata to hash and compare grouped
   single-key `VARCHAR` joins on fixed-width packed values before falling back
@@ -107,10 +173,76 @@ Recent trace matrix findings:
   about `0.022s` to `0.023s`, and `10K` grouped `AVG` from about `0.047s` to
   `0.082s`)
 - the practical implication is that the current committed grouped `VARCHAR`
-  path has likely captured the easy runtime win; the next credible step is no
-  longer another raw-string storage/hash micro-optimization, but either
-  planner/runtime integration with internal `compress_string` projections or a
-  true interned/compressed-key path
+  path has likely captured the easy runtime win outside this small denser
+  `MIN/MAX` envelope; the next credible step is no longer another raw-string
+  storage/hash micro-optimization, but either planner/runtime integration with
+  internal `compress_string` projections or a true interned/compressed-key path
+- a later upper-bound benchmark (`bench_varchar_surrogate_gap.sql`) compared
+  the current grouped `VARCHAR` `SUM+MIN+MAX` path against the exact same
+  workload on precomputed integer surrogate ids. That showed there is still
+  meaningful headroom for a true semantic-id varlen project: `1K` keys was
+  about `0.010s` on strings vs `0.006s` on integer ids, `5K` keys about
+  `0.015s` vs `0.009s`, and the `10K` near-parity boundary about `0.056s` vs
+  `0.021s`. So broader varlen support still looks worthwhile, but it will need
+  planner-to-runtime semantic ids rather than another runtime-only lookup tweak
+- a later explicit dictionary-lowering benchmark
+  (`bench_varchar_dictionary_gap.sql`) initially suggested that broader varlen
+  support might pay off around the old `10K` grouped boundary: building a
+  dictionary and encoding both sides was slower than the current narrow
+  `VARCHAR` path at `1K` keys (`0.025s` vs `0.010s`), slightly slower at `5K`
+  (`0.026s` vs `0.023s`), and on the old branch looked better by `10K`.
+  However, after widening the native-preagg band, that same benchmark no longer
+  wins: `10K` grouped `SUM+MIN+MAX` is now about `0.019s` on the current path
+  versus `0.029s` on the explicit dictionary lowering. So the earlier
+  dictionary-gap signal was mostly exposing an estimator hole in the existing
+  rewrite rather than proving that a new runtime dictionary path should replace
+  the current grouped `VARCHAR` strategy.
+- a later planner-side follow-up did hold up for exactly that wider grouped
+  boundary: probe-side grouped single-key `VARCHAR` numeric aggs can now
+  rewrite to the native build-preaggregation path in the current mid-fanout
+  estimator band. On the real sweep workload it keeps the dense `1K` to `5K`
+  cases on the older AGGJOIN path, rewrites the `10K` grouped
+  `SUM+MIN+MAX` case from about `0.056s` to `0.019s`, rewrites grouped
+  `MIN+MAX` at `10K` from about `0.059s` to `0.016s`, rewrites grouped `AVG`
+  at `10K` from about `0.046s` to `0.016s`, and still lets `20K+` grouped
+  shapes fall back to native through the existing variable-width gate
+- a later broader-varlen investigation found that the remaining grouped
+  `VARCHAR` gap was not a new semantic-id runtime path, but an estimator hole
+  in that same native-preagg rewrite. The current local sweep now keeps the
+  dense `1K` to `5K` cases on the raw-string AGGJOIN path, but rewrites the
+  heavier grouped `SUM+MIN+MAX` cases through a much wider band:
+  `10K` (`0.021s` vs `0.061s`), `20K` (`0.028s` vs `0.043s`), and `50K`
+  (`0.039s` vs `0.032s`, near native). A targeted `12K` boundary check moved
+  from about `0.058s` to `0.026s`, which confirmed that the old cutoff was
+  simply missing a good existing rewrite. The lighter grouped `AVG` path stayed
+  strong on the dense side through `5K` and still rewrites cleanly at `10K`
+  (`0.016s` vs `0.052s`); a targeted `20K` `AVG` check also improved from
+  about `0.039s` to `0.030s`. So the practical next step here is no longer
+  “another small varlen runtime tweak”; it is a larger semantic-id project, if
+  broader varlen coverage still matters.
+- a later broader-varlen follow-up did *not* hold up beyond that narrow `10K`
+  boundary once final string emit was included: explicit dictionary/id lowering
+  was slightly worse than the current path for grouped `SUM+MIN+MAX` at `20K`
+  (`0.049s` vs `0.045s`) and `50K` (`0.044s` vs `0.035s`), slightly worse for
+  grouped `AVG` at `20K` (`0.046s` vs `0.038s`), and only marginally better for
+  grouped `COUNT(*)` at `20K` (`0.029s` vs `0.037s`) where the current plan was
+  already near the disabled-extension baseline (`0.034s`). So the present
+  broader-varlen project does not have another good narrow patch right now.
+- a later phase-0 larger-row semantic-id matrix
+  (`bench_varchar_semantic_id_matrix.sql`) also failed to expose a real win
+  region beyond the current split strategy. On the current branch, grouped
+  `SUM+MIN+MAX` at `500K` rows / `10K` keys ran in about `0.032s` on the
+  current plan versus `0.036s` on the explicit dictionary lowering and
+  `0.247s` on same-binary native; at `1M` rows / `20K` keys the current plan
+  was about `0.052s` versus `0.069s` on the explicit dictionary lowering and
+  `0.304s` on native. Grouped `AVG` at `500K` rows / `10K` keys was about
+  `0.016s` current versus `0.034s` dictionary and `0.178s` native; grouped
+  `COUNT(*)` at `500K` rows / `20K` keys was about `0.024s` current versus
+  `0.036s` dictionary and `0.136s` native. So after widening the grouped
+  `VARCHAR` native-preagg band, the current branch no longer shows a clear
+  semantic-id win region even on the larger-row matrix. That pushes broader
+  semantic-id varlen work firmly into “larger redesign” territory rather than
+  another justified narrow patch.
 - the older quick bridge ideas were not enough by themselves: the real blocker
   was the `compress_string` / `decompress_string` projection chain, not just the
   planner gate
@@ -242,15 +374,22 @@ See `OPTIMIZATION_PLANS.md` for the prioritized plan:
 ## Architecture
 
 ```
-src/aggjoin_extension.cpp       Entry point — registers optimizer only (~30 lines)
-src/aggjoin_optimizer.cpp       Optimizer + PhysicalAggJoin (~1800 lines)
-src/include/aggjoin_extension.hpp   Extension class header
-test/sql/aggjoin.test           DuckDB sqllogictest tests (19 assertions)
+src/aggjoin_extension.cpp       Extension entry and test hooks
+src/aggjoin_optimizer.cpp       Thin optimizer entry/registration
+src/aggjoin_rewrites.cpp        Planner dispatch
+src/aggjoin_rewrite_build.cpp   Native build-preagg rewrite family
+src/aggjoin_rewrite_mixed.cpp   Native mixed-side rewrite family
+src/aggjoin_sink.cpp            Build-side sink/finalize
+src/aggjoin_source*.cpp         Probe-side execution families
+src/aggjoin_emit*.cpp           Result emission families
+test/sql/aggjoin_*.test         Split sqllogictest suite
 benchmarks/                     Reproducible benchmark scripts + results
 OPTIMIZATION_PLANS.md           Detailed plans for future optimizations
 ```
 
-### Key components in aggjoin_optimizer.cpp
+See `ARCHITECTURE.md` for the current module map and responsibilities.
+
+### Key components in the runtime layer
 
 | Component | Description |
 |-----------|-------------|
@@ -341,13 +480,19 @@ make test
 Or manually after building:
 
 ```bash
-cd build/Release
-./test/unittest "/absolute/path/to/duckdb_aggjoin/test/sql/aggjoin.test"
+./scripts/run_sqllogictests.sh
 ```
 
-51 assertions covering ungrouped SUM/COUNT/MIN/MAX/AVG, grouped SUM/AVG,
-multi-aggregate fusion (SUM+MIN+MAX), CTE freq pattern, 3-table joins,
-no-match edge case, NULL keys, multi-group per key, and build-side SUM/MIN/MAX.
+For a cheap regression sweep that also exercises a few representative benchmark
+modes with timeouts:
+
+```bash
+make smoke
+./scripts/run_regression_smoke.sh ./build/Release
+```
+
+The current split suite covers basic correctness, guards/collisions, single-key
+mixed shapes, composite shapes, and VARCHAR-key coverage.
 
 ## Performance benchmarks
 
@@ -413,72 +558,84 @@ Native DuckDB shows zero parallel scaling for aggregate-over-join
 
 ## Known limitations / future work
 
-- **Hash table key collisions**: Both `OpenHT` and `FlatResultHT` key off `hash_t`
-  only — no equality check on original column values. 64-bit hash collisions are
-  rare for normal data, but could still produce wrong results for adversarial inputs.
-  Fix: store original key values and compare on collision.
-- **Hash mode on non-integral keys**: Narrow planner gates now protect the simple
-  weak `DOUBLE`-key shape, but true custom-hash parity with native is still not
-  there if those gates are disabled.
-- **Build-side aggregate coverage**: Balanced grouped numeric
-  `SUM/COUNT/AVG/MIN/MAX` cases, plus ungrouped `SUM/COUNT/AVG`, now have a
-  native build-preaggregation rewrite, but broader build-side mixes and
-  non-numeric build-side `MIN/MAX` still mostly fall back to native.
-- **Mixed-mode non-numeric support**: The current simple admission-based design
-  is not good enough. If revisited, it should be a true sidecar execution path,
-  not a Value-heavy fallback over the existing AGGJOIN hash path.
-- **HUGEINT support**: `SUM(integer)` returns HUGEINT. Low priority (frequency
-  propagation uses DOUBLE).
-- **Parallel execution**: Pipeline lifecycle prevents clean thread-local state.
-  Not needed — fusion already beats multi-threaded native.
-- **Repeated execution crash**: Stale pipeline state between queries. Each
-  Yannakakis CTE runs a single AGGJOIN, so the primary use case works.
-  Tests structured to avoid triggering this (max ~10 queries per connection).
-- **WASM rebuild needed**: Deployed WASM (v1.4.3) lacks all improvements.
+- **Blocking operator / poor `LIMIT` latency**: This is now the clearest
+  remaining non-varlen limitation. `bench_latency.sql` still shows effectively
+  full-work latency for `LIMIT 1`, so any real improvement here is a larger
+  streaming/early-output project rather than another local planner tweak. A
+  first ordered-input `LIMIT 1` prototype was reverted: explicit `ORDER BY`
+  probe subqueries do survive under `AGGJOIN`, so early emit is feasible in
+  principle, but the large ordered shape that mattered was already taking the
+  native build-preagg rewrite and running around `0.07s` to `0.08s` versus
+  native around `0.20s` to `0.22s`, so the narrow ordered fast path did not
+  produce a better kept result.
+- **Broader semantic-key varlen support**: The dense grouped single-key
+  `VARCHAR` path and the narrow `10K` native-preagg boundary rewrite are both
+  good, but broader grouped/ungrouped/composite varlen support still needs a
+  true end-to-end semantic-id design. Runtime-only string map, packed-string,
+  and explicit dictionary follow-ups are mostly flat or worse beyond the kept
+  dense and `10K` envelopes.
+- **Mixed-side native-preagg family is near its useful boundary**: Single-key,
+  composite, subset-key, ungrouped, richer asymmetric, and pure-nonnumeric
+  boundaries are now broadly mapped. Further widening should only happen if a
+  new benchmark shows a clear gap.
+- **Build-side AGGJOIN-internal nonnumeric support**: The old Value-heavy
+  AGGJOIN path is still not worth reviving. Narrow balanced build-side and
+  mixed-side nonnumeric cases are now better handled by native preaggregation
+  rewrites instead.
+- **Generic planner scorer**: Still not promising with today’s planner-time
+  signals. Narrow gates plus selective native lowerings remain better than the
+  broader scorer attempts tried so far.
+- **WASM rebuild needed**: Deployed WASM (v1.4.3) still lacks the current local
+  improvements.
 
 ## Possible further improvements
 
-### High impact, novel approaches needed
+### High impact
 
-1. **Custom flat-array hash table**: Replace FlatResultHT with a hash table that stores
-   aggregates in flat `double[]` arrays (like direct mode) but uses hash-based slot
-   assignment instead of key-offset indexing. Combine OpenHT's slot lookup with direct
-   mode's contiguous accumulator layout. Would fix the >2M key cliff without the overhead
-   of DuckDB's GroupedAggregateHashTable. ~150 lines, medium complexity.
+1. **Streaming / partial-output AGGJOIN**
+   The main remaining non-varlen opportunity is a non-blocking execution path.
+   That would matter much more than another local throughput tweak on the
+   current benchmark set. The current `PhysicalAggJoin` is a sink+source
+   `CachingPhysicalOperator`, so DuckDB does not call `GetData` until the sink
+   phase has completed. More importantly, exact early output is not generally
+   possible for the current grouped shapes on an unsorted probe stream: to emit
+   a final group early, the operator would need to know no later probe rows for
+   that key still exist. So a real latency project likely needs either:
+   - a different physical operator shape than the current sink/source model
+   - or a narrower ordered-input/projected-key design where group completion can
+     be proven before full probe consumption
+   The first narrow ordered-input attempt confirmed that `ExecuteInternal`
+   could in principle be the emission point, but it was not worth keeping:
+   activation was tricky, and the main large ordered probe-side case was
+   already well served by the existing native build-preagg rewrite.
 
-2. **Optimizer-time bail-out**: At optimizer time, estimate key range from table statistics
-   (DuckDB's `n_distinct` from the catalog). If estimated range exceeds direct mode limit,
-   don't replace the plan — let native DuckDB handle it. Currently AGGJOIN always replaces
-   and discovers at runtime that direct mode doesn't fit. ~30 lines in WalkAndReplace.
+2. **True semantic-id varlen path**
+   If broader `VARCHAR` support is still a goal, the next real project is not
+   another raw-string micro-optimization. It is a planner-to-runtime semantic-id
+   design that keeps the current dense path for small grouped cases and uses ids
+   only where the wider grouped boundary benefits.
 
-### Medium impact, straightforward
+3. **New lowering families only after manual-rewrite benchmarks**
+   The recent wins all came from selective native lowerings. The right pattern
+   is still: benchmark a manual lowering, keep it only if it clearly beats both
+   the current plan and the disabled-extension baseline. The newest kept family
+   is the narrow native final-bag rewrite: `bench_final_bag.sql` and
+   `bench_final_bag_ungrouped.sql` now run the grouped mixed chain at about
+   `0.185s` vs native `0.470s`, the grouped numeric chain at about `0.154s`
+   vs native `0.400s`, the ungrouped mixed chain at about `0.156s` vs native
+   `0.228s`, and the ungrouped numeric chain at about `0.142s` vs native
+   `0.213s`, with planner trace confirming `native final-bag preagg`.
+   A later follow-up added `bench_final_bag_asymmetric.sql` and tightened the
+   ungrouped gate: final-bag still wins on grouped asymmetry and on the good
+   ungrouped numeric shape, but ungrouped asymmetric cases now bail more
+   aggressively when the matched head is too small for the downstream side.
 
-3. **Raise direct limit based on available memory**: Currently hardcoded `2M / num_aggs`.
-   Could query system memory or use DuckDB's `BufferManager` memory limit to set a
-   dynamic ceiling. At 64GB RAM, 10M keys × 4 aggs = 320MB is fine. ~10 lines.
+### Lower priority
 
-4. **Build-side aggregate values in build HT**: Store aggregate source column values
-   alongside frequency counts in `BuildEntry`. During probe, look up build-side values
-   from the HT. Enables `SELECT s.y, SUM(r.val) ... GROUP BY s.y` pattern. ~200 lines,
-   high correctness risk.
+4. **Parallel execution**
+   Still possible, but much less compelling than streaming or better varlen-key
+   support. Current fused single-thread performance is already strong on the
+   main workloads.
 
-5. **WASM extension rebuild**: Recompile with Emscripten 3.1.71 against matching DuckDB
-   source to deploy AVG fix, COUNT_STAR, ungrouped support, column-major layout, unsigned
-   key handling. No code changes needed — just build process.
-
-### Low impact / research
-
-6. **Conflict-free parallel accumulation**: Instead of thread-local HTs (which have
-   lifetime issues), use partitioned key ranges: thread T handles keys `[T*range/N,
-   (T+1)*range/N)`. No contention, no merge. Requires knowing key range at partition
-   time (available after Finalize). ~100 lines.
-
-7. **Adaptive layout**: Row-major for na≤2, column-major for na≥3. Currently always
-   column-major which is neutral at na≤2. Minor (~2%) improvement possible at na=2
-   for large key ranges where cache line sharing matters.
-
-8. **CompressedMaterialization bypass**: Run the optimizer before DuckDB's
-   CompressedMaterialization pass, or strip compress Projections before pattern matching.
-   Would enable AGGJOIN for more queries (currently some direct base-table queries bail
-   due to compressed column indices). DuckDB extension API may not allow optimizer
-   ordering control.
+5. **WASM extension rebuild**
+   Build process work rather than optimizer/runtime work.

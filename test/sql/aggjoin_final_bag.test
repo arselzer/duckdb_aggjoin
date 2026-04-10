@@ -1,0 +1,63 @@
+# name: test/sql/aggjoin_final_bag.test
+# description: Final-bag / multi-relation lowering coverage
+# group: [aggjoin]
+
+require aggjoin
+
+statement ok
+CREATE TABLE r_fb_test (x INT, rv DOUBLE);
+
+statement ok
+INSERT INTO r_fb_test VALUES
+    (1, 12.0),
+    (1, 18.0),
+    (2, 30.0);
+
+statement ok
+CREATE TABLE s_fb_test (x INT, y INT);
+
+statement ok
+INSERT INTO s_fb_test VALUES
+    (1, 100),
+    (1, 200),
+    (2, 100);
+
+statement ok
+CREATE TABLE t_fb_test (y INT, tv DOUBLE, d DATE);
+
+statement ok
+INSERT INTO t_fb_test VALUES
+    (100, 6.0, '2020-01-01'),
+    (100, 12.0, '2020-01-03'),
+    (200, 3.0, '2020-02-01');
+
+query IIIIIIII rowsort
+SELECT r_fb_test.x,
+       COUNT(*),
+       CAST(SUM(r_fb_test.rv) AS INTEGER),
+       CAST(AVG(r_fb_test.rv) AS INTEGER),
+       CAST(SUM(t_fb_test.tv) AS INTEGER),
+       CAST(AVG(t_fb_test.tv) AS INTEGER),
+       MIN(t_fb_test.d),
+       MAX(t_fb_test.d)
+FROM r_fb_test
+JOIN s_fb_test ON r_fb_test.x = s_fb_test.x
+JOIN t_fb_test ON s_fb_test.y = t_fb_test.y
+GROUP BY r_fb_test.x;
+----
+1	6	90	15	42	7	2020-01-01	2020-02-01
+2	2	60	30	18	9	2020-01-01	2020-01-03
+
+query IIIIIII
+SELECT COUNT(*),
+       CAST(SUM(r_fb_test.rv) AS INTEGER),
+       CAST(AVG(r_fb_test.rv) AS DECIMAL(10,2)),
+       CAST(SUM(t_fb_test.tv) AS INTEGER),
+       CAST(AVG(t_fb_test.tv) AS DECIMAL(10,2)),
+       MIN(t_fb_test.d),
+       MAX(t_fb_test.d)
+FROM r_fb_test
+JOIN s_fb_test ON r_fb_test.x = s_fb_test.x
+JOIN t_fb_test ON s_fb_test.y = t_fb_test.y;
+----
+8	150	18.75	60	7.50	2020-01-01	2020-02-01

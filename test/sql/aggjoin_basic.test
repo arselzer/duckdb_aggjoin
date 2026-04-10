@@ -1,0 +1,135 @@
+# name: test/sql/aggjoin_basic.test
+# description: Basic AggJoin correctness coverage
+# group: [aggjoin]
+
+require aggjoin
+
+statement ok
+CREATE TABLE r (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r VALUES (1, 10.0), (2, 20.0), (3, 30.0);
+
+statement ok
+CREATE TABLE s (x INT, y INT);
+
+statement ok
+INSERT INTO s VALUES (1, 100), (1, 200), (2, 100), (2, 300);
+
+statement ok
+CREATE TABLE t (y INT, label TEXT);
+
+statement ok
+INSERT INTO t VALUES (100, 'A'), (200, 'B'), (300, 'C');
+
+query I
+SELECT CAST(SUM(r.val) AS INTEGER) FROM r JOIN s ON r.x = s.x;
+----
+60
+
+query I
+SELECT COUNT(*) FROM r JOIN s ON r.x = s.x;
+----
+4
+
+query II
+SELECT CAST(MIN(r.val) AS INTEGER), CAST(MAX(r.val) AS INTEGER)
+FROM r JOIN s ON r.x = s.x;
+----
+10	20
+
+query I
+SELECT CAST(AVG(r.val) AS INTEGER) FROM r JOIN s ON r.x = s.x;
+----
+15
+
+query I
+SELECT COUNT(*) FROM r JOIN s ON r.x = s.x WHERE r.x = 99;
+----
+0
+
+statement ok
+CREATE TABLE r_empty (x INT, val DOUBLE);
+
+statement ok
+CREATE TABLE s_empty (x INT, grp INT);
+
+query I
+SELECT COUNT(*) FROM r_empty JOIN s_empty ON r_empty.x = s_empty.x;
+----
+0
+
+query I rowsort
+SELECT COUNT(*) FROM r_empty JOIN s_empty ON r_empty.x = s_empty.x GROUP BY s_empty.grp;
+----
+
+statement ok
+CREATE TABLE r_null (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r_null VALUES (1, 10.0), (NULL, 99.0), (2, 20.0);
+
+statement ok
+CREATE TABLE s_null (x INT);
+
+statement ok
+INSERT INTO s_null VALUES (1), (NULL), (2);
+
+query I
+SELECT CAST(SUM(r_null.val) AS INTEGER) FROM r_null JOIN s_null ON r_null.x = s_null.x;
+----
+30
+
+query I
+SELECT COUNT(*) FROM r_null JOIN s_null ON r_null.x = s_null.x;
+----
+2
+
+statement ok
+CREATE TABLE r_gnull (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r_gnull VALUES (1, 10.0), (1, 20.0), (2, 30.0);
+
+statement ok
+CREATE TABLE s_gnull (x INT, grp VARCHAR);
+
+statement ok
+INSERT INTO s_gnull VALUES (1, NULL), (1, 'A'), (2, NULL);
+
+query TI rowsort
+SELECT COALESCE(s_gnull.grp, '<null>'), CAST(SUM(r_gnull.val) AS INTEGER)
+FROM r_gnull JOIN s_gnull ON r_gnull.x = s_gnull.x
+GROUP BY s_gnull.grp;
+----
+<null>	60
+A	30
+
+statement ok
+CREATE TABLE r2 (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r2 VALUES (1, 10.0), (1, 20.0);
+
+statement ok
+CREATE TABLE s2 (x INT, grp TEXT);
+
+statement ok
+INSERT INTO s2 VALUES (1, 'A'), (1, 'B');
+
+query II rowsort
+SELECT s2.grp, CAST(SUM(r2.val) AS INTEGER)
+FROM r2 JOIN s2 ON r2.x = s2.x
+GROUP BY s2.grp;
+----
+A	30
+B	30
+
+query II rowsort
+SELECT t.label, CAST(SUM(r.val) AS INTEGER)
+FROM r JOIN s ON r.x = s.x JOIN t ON s.y = t.y
+GROUP BY t.label;
+----
+A	30
+B	10
+C	20

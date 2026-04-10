@@ -1,0 +1,289 @@
+# name: test/sql/aggjoin_single_key_mixed.test
+# description: Single-key build-side, mixed, and nonnumeric AggJoin coverage
+# group: [aggjoin]
+
+require aggjoin
+
+statement ok
+CREATE TABLE r_bs (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r_bs VALUES (1, 10.0), (1, 20.0), (2, 30.0);
+
+statement ok
+CREATE TABLE s_bs (x INT, y INT);
+
+statement ok
+INSERT INTO s_bs VALUES (1, 100), (1, 200), (2, 300);
+
+query II rowsort
+SELECT s_bs.y, CAST(SUM(r_bs.val) AS INTEGER)
+FROM r_bs JOIN s_bs ON r_bs.x = s_bs.x
+GROUP BY s_bs.y;
+----
+100	30
+200	30
+300	30
+
+query III rowsort
+SELECT s_bs.y, CAST(MIN(r_bs.val) AS INTEGER), CAST(MAX(r_bs.val) AS INTEGER)
+FROM r_bs JOIN s_bs ON r_bs.x = s_bs.x
+GROUP BY s_bs.y;
+----
+100	10	20
+200	10	20
+300	30	30
+
+statement ok
+CREATE TABLE r_str (x INT, name VARCHAR);
+
+statement ok
+INSERT INTO r_str VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob');
+
+statement ok
+CREATE TABLE s_str (x INT);
+
+statement ok
+INSERT INTO s_str VALUES (1), (2), (1);
+
+query II
+SELECT MIN(r_str.name), MAX(r_str.name) FROM r_str JOIN s_str ON r_str.x = s_str.x;
+----
+alice	charlie
+
+query II rowsort
+SELECT s_str.x, MIN(r_str.name) FROM r_str JOIN s_str ON r_str.x = s_str.x GROUP BY s_str.x;
+----
+1	charlie
+2	alice
+
+statement ok
+CREATE TABLE dim_str (id INT, label VARCHAR);
+
+statement ok
+INSERT INTO dim_str VALUES (1, 'zz_last'), (2, 'aa_first'), (3, 'mm_middle');
+
+statement ok
+CREATE TABLE fact_str (dim_id INT);
+
+statement ok
+INSERT INTO fact_str SELECT (i % 2) + 1 FROM generate_series(1, 100) t(i);
+
+query II
+SELECT MIN(dim_str.label), MAX(dim_str.label)
+FROM fact_str JOIN dim_str ON fact_str.dim_id = dim_str.id;
+----
+aa_first	zz_last
+
+statement ok
+CREATE TABLE dim_mix (id INT, val DOUBLE, label VARCHAR);
+
+statement ok
+INSERT INTO dim_mix VALUES
+    (1, 10.0, 'zz_last'),
+    (1, 20.0, 'aa_first'),
+    (2, 30.0, 'mm_middle');
+
+statement ok
+CREATE TABLE fact_mix (dim_id INT, grp INT);
+
+statement ok
+INSERT INTO fact_mix VALUES
+    (1, 100),
+    (1, 200),
+    (2, 300);
+
+query IIII rowsort
+SELECT fact_mix.grp, CAST(SUM(dim_mix.val) AS INTEGER), MIN(dim_mix.label), MAX(dim_mix.label)
+FROM fact_mix JOIN dim_mix ON fact_mix.dim_id = dim_mix.id
+GROUP BY fact_mix.grp;
+----
+100	30	aa_first	zz_last
+200	30	aa_first	zz_last
+300	30	mm_middle	mm_middle
+
+statement ok
+CREATE TABLE dim_mix_date (id INT, val DOUBLE, d DATE);
+
+statement ok
+INSERT INTO dim_mix_date VALUES
+    (1, 10.0, '2020-01-15'),
+    (1, 20.0, '2020-06-20'),
+    (2, 30.0, '2021-03-10');
+
+statement ok
+CREATE TABLE fact_mix_date (dim_id INT);
+
+statement ok
+INSERT INTO fact_mix_date VALUES (1), (2), (1);
+
+query III
+SELECT CAST(SUM(dim_mix_date.val) AS INTEGER), MIN(dim_mix_date.d), MAX(dim_mix_date.d)
+FROM fact_mix_date JOIN dim_mix_date ON fact_mix_date.dim_id = dim_mix_date.id;
+----
+90	2020-01-15	2021-03-10
+
+statement ok
+CREATE TABLE fact_side_mix (dim_id INT, grp INT, rv DOUBLE);
+
+statement ok
+INSERT INTO fact_side_mix VALUES
+    (1, 100, 1.0),
+    (1, 100, 2.0),
+    (1, 200, 3.0),
+    (2, 300, 4.0);
+
+statement ok
+CREATE TABLE dim_side_mix (id INT, sv DOUBLE, label VARCHAR);
+
+statement ok
+INSERT INTO dim_side_mix VALUES
+    (1, 10.0, 'b_last'),
+    (1, 20.0, 'a_first'),
+    (2, 30.0, 'c_only');
+
+query IIIII rowsort
+SELECT fact_side_mix.grp,
+       CAST(SUM(fact_side_mix.rv) AS INTEGER),
+       CAST(SUM(dim_side_mix.sv) AS INTEGER),
+       MIN(dim_side_mix.label),
+       MAX(dim_side_mix.label)
+FROM fact_side_mix
+JOIN dim_side_mix ON fact_side_mix.dim_id = dim_side_mix.id
+GROUP BY fact_side_mix.grp;
+----
+100	6	60	a_first	b_last
+200	6	30	a_first	b_last
+300	4	30	c_only	c_only
+
+query IIII
+SELECT CAST(SUM(fact_side_mix.rv) AS INTEGER),
+       CAST(SUM(dim_side_mix.sv) AS INTEGER),
+       MIN(dim_side_mix.label),
+       MAX(dim_side_mix.label)
+FROM fact_side_mix
+JOIN dim_side_mix ON fact_side_mix.dim_id = dim_side_mix.id;
+----
+16	120	a_first	c_only
+
+query IIIII rowsort
+SELECT fact_side_mix.grp,
+       CAST(AVG(fact_side_mix.rv) * 10 AS INTEGER),
+       CAST(AVG(dim_side_mix.sv) AS INTEGER),
+       MIN(dim_side_mix.label),
+       MAX(dim_side_mix.label)
+FROM fact_side_mix
+JOIN dim_side_mix ON fact_side_mix.dim_id = dim_side_mix.id
+GROUP BY fact_side_mix.grp;
+----
+100	15	15	a_first	b_last
+200	30	15	a_first	b_last
+300	40	30	c_only	c_only
+
+statement ok
+CREATE TABLE fact_probe_date_mix (dim_id INT, grp INT, d DATE);
+
+statement ok
+INSERT INTO fact_probe_date_mix VALUES
+    (1, 100, '2020-01-02'),
+    (1, 100, '2020-01-05'),
+    (1, 200, '2020-02-01'),
+    (2, 300, '2020-03-10');
+
+statement ok
+CREATE TABLE dim_probe_sum_mix (id INT, sv DOUBLE);
+
+statement ok
+INSERT INTO dim_probe_sum_mix VALUES
+    (1, 10.0),
+    (1, 20.0),
+    (2, 30.0);
+
+query IIII rowsort
+SELECT fact_probe_date_mix.grp,
+       MIN(fact_probe_date_mix.d),
+       MAX(fact_probe_date_mix.d),
+       CAST(SUM(dim_probe_sum_mix.sv) AS INTEGER)
+FROM fact_probe_date_mix
+JOIN dim_probe_sum_mix ON fact_probe_date_mix.dim_id = dim_probe_sum_mix.id
+GROUP BY fact_probe_date_mix.grp;
+----
+100	2020-01-02	2020-01-05	60
+200	2020-02-01	2020-02-01	30
+300	2020-03-10	2020-03-10	30
+
+query III
+SELECT MIN(fact_probe_date_mix.d),
+       MAX(fact_probe_date_mix.d),
+       CAST(SUM(dim_probe_sum_mix.sv) AS INTEGER)
+FROM fact_probe_date_mix
+JOIN dim_probe_sum_mix ON fact_probe_date_mix.dim_id = dim_probe_sum_mix.id;
+----
+2020-01-02	2020-03-10	120
+
+statement ok
+CREATE TABLE fact_probe_str_mix (dim_id INT, grp INT, label VARCHAR);
+
+statement ok
+INSERT INTO fact_probe_str_mix VALUES
+    (1, 100, 'b_last'),
+    (1, 100, 'a_first'),
+    (1, 200, 'c_only'),
+    (2, 300, 'd_only');
+
+query IIII rowsort
+SELECT fact_probe_str_mix.grp,
+       MIN(fact_probe_str_mix.label),
+       MAX(fact_probe_str_mix.label),
+       CAST(SUM(dim_probe_sum_mix.sv) AS INTEGER)
+FROM fact_probe_str_mix
+JOIN dim_probe_sum_mix ON fact_probe_str_mix.dim_id = dim_probe_sum_mix.id
+GROUP BY fact_probe_str_mix.grp;
+----
+100	a_first	b_last	60
+200	c_only	c_only	30
+300	d_only	d_only	30
+
+statement ok
+CREATE TABLE fact_single_pure_nonnumeric (k INT, label VARCHAR);
+
+statement ok
+INSERT INTO fact_single_pure_nonnumeric VALUES
+    (1, 'b_last'),
+    (1, 'a_first'),
+    (2, 'c_only'),
+    (3, 'd_only');
+
+statement ok
+CREATE TABLE dim_single_pure_nonnumeric (k INT, d DATE);
+
+statement ok
+INSERT INTO dim_single_pure_nonnumeric VALUES
+    (1, '2021-01-01'),
+    (1, '2021-01-03'),
+    (2, '2021-02-01'),
+    (3, '2021-03-01');
+
+query IIIII rowsort
+SELECT fact_single_pure_nonnumeric.k,
+       MIN(fact_single_pure_nonnumeric.label),
+       MAX(fact_single_pure_nonnumeric.label),
+       MIN(dim_single_pure_nonnumeric.d),
+       MAX(dim_single_pure_nonnumeric.d)
+FROM fact_single_pure_nonnumeric
+JOIN dim_single_pure_nonnumeric ON fact_single_pure_nonnumeric.k = dim_single_pure_nonnumeric.k
+GROUP BY fact_single_pure_nonnumeric.k;
+----
+1	a_first	b_last	2021-01-01	2021-01-03
+2	c_only	c_only	2021-02-01	2021-02-01
+3	d_only	d_only	2021-03-01	2021-03-01
+
+query IIII
+SELECT MIN(fact_single_pure_nonnumeric.label),
+       MAX(fact_single_pure_nonnumeric.label),
+       MIN(dim_single_pure_nonnumeric.d),
+       MAX(dim_single_pure_nonnumeric.d)
+FROM fact_single_pure_nonnumeric
+JOIN dim_single_pure_nonnumeric ON fact_single_pure_nonnumeric.k = dim_single_pure_nonnumeric.k;
+----
+a_first	d_only	2021-01-01	2021-03-01
