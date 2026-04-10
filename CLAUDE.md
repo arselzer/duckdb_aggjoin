@@ -12,6 +12,16 @@ Planner and runtime tracing can be enabled without a debug rebuild:
   (`path`, planner estimates, build/probe counts, prefilter skips, result groups)
 
 Recent trace matrix findings:
+- dataset-backed `dblp` follow-up benchmarks now cover the exact
+  `spark-eval` `dblp/path02.sql`, `path03.sql`, and `path04.sql` queries over
+  a cached Parquet edge list. On the real `com-dblp.ungraph.txt` graph, the
+  current branch runs them at about `0.093s` vs `0.144s`, `0.113s` vs
+  `1.473s`, and `0.243s` vs `32.186s` respectively
+- the longer-hop `dblp` investigation exposed a real nested-join correctness
+  bug: top-join key extraction was using raw `binding.column_index`, which is
+  unsafe once a join child is itself a join subtree. Resolving join keys
+  through child output bindings fixed both a tiny deterministic reproducer and
+  the real `dblp` `path04` count mismatch
 - the main numeric benchmark suites are now overwhelmingly exercising direct or
   segmented-direct paths, not the custom hash path
 - a focused non-integral single-key benchmark (`bench_hash_nonintegral.sql`)
@@ -459,7 +469,9 @@ When direct mode doesn't fire (non-integer keys, range > limit):
   Projection chain is not exposed cleanly enough to rewrite safely
 
 **Earlier repeated-execution crash**
-This was an earlier issue and is not part of the current profile anymore.
+This was an earlier issue and is not part of the current profile anymore. A
+same-connection stress rerun on the current branch completed cleanly for both
+repeated single-join AGGJOIN queries and repeated final-bag rewrite queries.
 
 ## DuckDB version compatibility
 

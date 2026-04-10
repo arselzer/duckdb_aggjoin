@@ -1,18 +1,13 @@
 # AggJoin Benchmarks
 
-Benchmarks for `PhysicalAggJoin` versus native DuckDB plans on DuckDB `v1.5.1`.
+Same-query benchmark results for `PhysicalAggJoin` and the newer native
+preaggregation rewrite families on DuckDB `v1.5.1`.
 
 The targeted follow-up tables below were refreshed locally on April 10, 2026,
 after the native build-preaggregation rewrite was extended to cover narrow
-balanced build-heavy nonnumeric, mixed build-side, and grouped mixed
-probe/build aggregate sets, and after the narrow single-key `VARCHAR` path was
-widened and optimized further. The long
-`bench.sql` and `bench_scaling.sql` native baselines still do not make sense to
-run monolithically on this host. The current core and scaling tables below were
-therefore rebuilt from the split `bench_core_*` / `bench_scaling_*` files:
-AGGJOIN sides were run serially, and slow native-only cases were bounded with
-the timeout runner. Cases that did not finish inside the cap are marked
-explicitly as timed out.
+balanced build-heavy nonnumeric, mixed build-side, grouped mixed probe/build
+aggregate sets, the final-bag family, and the widened single-key `VARCHAR`
+boundary.
 
 ## Setup
 
@@ -37,57 +32,21 @@ was taken on:
 
 ## Running benchmarks
 
+All commands below assume `build/Release/duckdb` was built by this repo's
+`make` target. That binary has `aggjoin` statically linked in, so benchmark SQL
+files do not need `LOAD aggjoin`.
+
+The historical shape-comparison studies were moved to
+[shape_comparisons/README.md](../shape_comparisons/README.md). This directory is
+now for true same-query benchmark families.
+
 ```bash
-build/Release/duckdb < benchmarks/bench.sql
-build/Release/duckdb < benchmarks/bench_core_direct_100k.sql
-build/Release/duckdb < benchmarks/bench_core_direct_100k_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_core_direct_100k_native.sql
-build/Release/duckdb < benchmarks/bench_core_direct_1m.sql
-build/Release/duckdb < benchmarks/bench_core_direct_1m_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_core_direct_1m_native.sql
-build/Release/duckdb < benchmarks/bench_core_hash_3m.sql
-build/Release/duckdb < benchmarks/bench_core_hash_3m_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_core_hash_3m_native.sql
-build/Release/duckdb < benchmarks/bench_core_zipf_100k.sql
-build/Release/duckdb < benchmarks/bench_core_zipf_100k_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_core_zipf_100k_native.sql
-build/Release/duckdb < benchmarks/bench_core_sparse.sql
-build/Release/duckdb < benchmarks/bench_core_sparse_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_core_sparse_native.sql
-build/Release/duckdb < benchmarks/bench_core_high_blowup.sql
-build/Release/duckdb < benchmarks/bench_core_high_blowup_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_core_high_blowup_native.sql
-build/Release/duckdb < benchmarks/bench_core_multiagg_1m.sql
-build/Release/duckdb < benchmarks/bench_core_multiagg_1m_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_core_multiagg_1m_native.sql
-build/Release/duckdb < benchmarks/bench_scaling.sql
-build/Release/duckdb < benchmarks/bench_scaling_1k.sql
-build/Release/duckdb < benchmarks/bench_scaling_1k_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_1k_native.sql
-build/Release/duckdb < benchmarks/bench_scaling_10k.sql
-build/Release/duckdb < benchmarks/bench_scaling_10k_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_10k_native.sql
-build/Release/duckdb < benchmarks/bench_scaling_100k.sql
-build/Release/duckdb < benchmarks/bench_scaling_100k_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_100k_native.sql
-build/Release/duckdb < benchmarks/bench_scaling_500k.sql
-build/Release/duckdb < benchmarks/bench_scaling_500k_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_500k_native.sql
-build/Release/duckdb < benchmarks/bench_scaling_1m.sql
-build/Release/duckdb < benchmarks/bench_scaling_1m_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_1m_native.sql
-build/Release/duckdb < benchmarks/bench_scaling_2m.sql
-build/Release/duckdb < benchmarks/bench_scaling_2m_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_2m_native.sql
-build/Release/duckdb < benchmarks/bench_scaling_3m.sql
-build/Release/duckdb < benchmarks/bench_scaling_3m_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_3m_native.sql
-build/Release/duckdb < benchmarks/bench_scaling_5m.sql
-build/Release/duckdb < benchmarks/bench_scaling_5m_aggjoin.sql
-build/Release/duckdb < benchmarks/bench_scaling_5m_native.sql
-build/Release/duckdb < benchmarks/bench_asymmetric.sql
 build/Release/duckdb < benchmarks/bench_cte_chain.sql
+scripts/prepare_dblp_parquet.sh
+build/Release/duckdb < benchmarks/bench_dblp_path02.sql
 build/Release/duckdb < benchmarks/bench_final_bag.sql
+build/Release/duckdb < benchmarks/bench_final_bag_ungrouped.sql
+build/Release/duckdb < benchmarks/bench_final_bag_asymmetric.sql
 build/Release/duckdb < benchmarks/bench_native_ht_composite.sql
 build/Release/duckdb < benchmarks/bench_build_side_path.sql
 build/Release/duckdb < benchmarks/bench_build_side_suite.sql
@@ -120,26 +79,15 @@ build/Release/duckdb < benchmarks/bench_varchar_keys.sql
 build/Release/duckdb < benchmarks/bench_correctness.sql
 ```
 
-On constrained hosts, use the timeout wrapper for slow native-only cases:
+On constrained hosts, use the timeout wrapper for long-running cases:
 
 ```bash
-benchmarks/run_with_timeout.sh benchmarks/bench_scaling_1k_native.sql 120
-benchmarks/run_with_timeout.sh benchmarks/bench_core_high_blowup_native.sql 300
+benchmarks/run_with_timeout.sh benchmarks/bench_final_bag.sql 120
+benchmarks/run_with_timeout.sh benchmarks/bench_build_side_suite.sql 120
 ```
 
 ## Methodology
 
-- `bench.sql`, `bench_scaling.sql`, and `bench_asymmetric.sql` benchmark the aggregate
-  query directly via `COPY (...) TO ...`; they no longer wrap the query in
-  `COUNT(*) FROM (...)`, which could benchmark the wrong plan shape.
-- `bench_core_*.sql` and `bench_scaling_*.sql` are exact per-case splits of the
-  long `bench.sql` and `bench_scaling.sql` suites. They are useful on hosts
-  where the monolithic native halves are too slow to finish cleanly in one run
-  or where the slowest native cases may be OOM-killed.
-- `bench_core_*_aggjoin.sql` / `bench_core_*_native.sql` and
-  `bench_scaling_*_aggjoin.sql` / `bench_scaling_*_native.sql` split those
-  cases one step further so each side can be run independently with its own
-  table setup and teardown.
 - `benchmarks/run_with_timeout.sh` is the recommended runner for long native-only
   split cases on constrained hosts. It distinguishes clean completion, timeout
   (`124`), and likely OOM/resource kill (`137`) in a consistent way.
@@ -147,8 +95,9 @@ benchmarks/run_with_timeout.sh benchmarks/bench_core_high_blowup_native.sql 300
   given split case serially rather than overlapping the same case in multiple
   processes. Otherwise DuckDB may fail fast with a file-lock error instead of a
   benchmark result.
-- For same-binary native baselines on targeted follow-up cases, the benchmark files
-  use `PRAGMA disabled_optimizers='extension'` around the comparison query.
+- These benchmark families are intended to be true same-query comparisons. The
+  comparison query is rerun in the same binary with
+  `PRAGMA disabled_optimizers='extension'` around the native baseline.
 - Most numeric single-key benchmark shapes now hit direct or segmented-direct
   paths. `bench_hash_nonintegral.sql` now tracks the current best non-integral
   single-key strategy; on the current build that query rewrites to a native
@@ -169,79 +118,61 @@ benchmarks/run_with_timeout.sh benchmarks/bench_core_high_blowup_native.sql 300
   future semantic-id grouped-`VARCHAR` project. It compares the current plan,
   same-binary native, and an explicit dictionary/id lowering on larger grouped
   `SUM+MIN+MAX`, `AVG`, and `COUNT(*)` shapes.
+- `bench_dblp_path02.sql`, `bench_dblp_path03.sql`, and
+  `bench_dblp_path04.sql` are dataset-backed benchmarks for the exact
+  `spark-eval` `dblp/path02.sql`, `path03.sql`, and `path04.sql` queries.
+  Stage the graph first with
+  `scripts/prepare_dblp_parquet.sh`, which downloads or copies the raw edge
+  list and caches it as `/tmp/aggjoin_dblp.parquet`.
 - `bench_varchar_keys.sql` still uses the older wrapper shape and is best treated as
   a smoke test, not a primary performance result.
 - The latest local run used the standard current build with planner gating enabled.
-  The targeted follow-up suites below completed cleanly. The long native halves
-  of `bench.sql` and `bench_scaling.sql` were interrupted on this environment,
-  so those two sections still show the previous full-run snapshot.
+  The targeted follow-up suites below completed cleanly.
 
-## Core suite
+Historical core/scaling/asymmetric shape studies now live in
+[shape_comparisons/README.md](../shape_comparisons/README.md). The rest of this
+README focuses on true same-query benchmark families.
 
-10M probe rows, single-key `SUM` unless noted otherwise.
+### dblp SNAP follow-up
 
-These numbers are the latest local split-run snapshot on this host. AGGJOIN
-cases were rerun serially via `bench_core_*_aggjoin.sql`; native cases were
-rerun via `bench_core_*_native.sql`, with the timeout wrapper used for the
-slowest stress cases.
+The `dblp` follow-up files use the exact `spark-eval` path queries:
 
-| # | Scenario | AGGJOIN | Native | Speedup |
-|---|----------|---------|--------|---------|
-| 1 | Direct mode, 100K keys | 0.246s | 13.750s | **55.9x** |
-| 2 | Direct mode, 1M keys | 0.334s | 1.948s | **5.8x** |
-| 3 | Hash mode, 3M keys | 0.412s | 1.076s | **2.6x** |
-| 4 | Zipf-skewed, 100K keys | 0.170s | `>60s` timed out | **>=352x** |
-| 5 | Sparse, 100K rows over 10M range | 0.025s | 0.025s | parity |
-| 6 | High blowup, 10K keys (1000x) | 0.085s | 253.094s | **2977x** |
-| 7 | Multi-agg `SUM+MIN+MAX+AVG`, 1M keys | 0.566s | 3.877s | **6.9x** |
+```sql
+-- path02
+select count(*)
+from dblp p1, dblp p2, dblp p3
+where p1.toNode = p2.fromNode
+  and p2.toNode = p3.fromNode
 
-## Scaling curve
+-- path03
+select count(*)
+from dblp p1, dblp p2, dblp p3, dblp p4
+where p1.toNode = p2.fromNode
+  and p2.toNode = p3.fromNode
+  and p3.toNode = p4.fromNode
 
-10M probe rows, probe-side `GROUP BY`.
+-- path04
+select count(*)
+from dblp p1, dblp p2, dblp p3, dblp p4, dblp p5
+where p1.toNode = p2.fromNode
+  and p2.toNode = p3.fromNode
+  and p3.toNode = p4.fromNode
+  and p4.toNode = p5.fromNode
+```
 
-This table is the latest local split-run snapshot on this host. AGGJOIN cases
-were rerun serially via `bench_scaling_*_aggjoin.sql`; native cases were rerun
-via `bench_scaling_*_native.sql` with a `45s` timeout cap. The smallest native
-group-count cases are runtime-bound enough on this host that they are more
-usefully reported as timed out than left in a monolithic hung run.
+These benchmarks intentionally keep the original shapes. On the real
+`com-dblp.ungraph.txt` graph staged to Parquet, the current build produces:
 
-| Keys | Mode | AGGJOIN | Native | Speedup |
-|------|------|---------|--------|---------|
-| 1K | Direct | 0.079s | `>45s` timed out | **>=569x** |
-| 10K | Direct | 0.081s | `>45s` timed out | **>=556x** |
-| 100K | Direct | 0.241s | 13.852s | **57.5x** |
-| 500K | Direct | 0.264s | 3.148s | **11.9x** |
-| 1M | Direct | 0.332s | 1.963s | **5.9x** |
-| 2M | Direct boundary | 0.354s | 1.178s | **3.3x** |
-| 3M | Segmented direct | 0.416s | 1.061s | **2.5x** |
-| 5M | Segmented direct | 0.576s | 0.919s | **1.6x** |
+| Query | Count | Direct query | Native baseline | Notes |
+|-------|-------|--------------|-----------------|-------|
+| `path02` | `67,520,431` | `0.093s` | `0.144s` | planner lowers to native mixed-side preagg |
+| `path03` | `835,509,083` | `0.113s` | `1.473s` | planner lowers to native mixed-side preagg |
+| `path04` | `12,025,691,265` | `0.243s` | `32.186s` | planner lowers to native mixed-side preagg |
 
-The biggest recent improvements are:
-
-- the old `1M -> 2M` cliff is largely gone, so the 2M-key case stays much closer
-  to the direct-mode region instead of dropping immediately into a much slower path
-- the simplest `GROUP BY join_key` shape now stays out of hash mode through the
-  3M and 5M-key cases via the segmented direct path
-- the segmented multi-aggregate path now cuts the existing `1M`-key
-  `SUM+MIN+MAX+AVG` benchmark from `6.7s` to `3.3s`; on a targeted `3M`-key
-  grouped multi-aggregate query it reaches near-native parity (`6.00s` vs `5.99s`)
-
-Other relevant follow-up optimizations now in the code:
-
-- hash-mode range prefilter scratch is reused across chunks and now supports
-  `INT8/16` and `UINT8/16` probe keys
-- a selective DuckDB native `GroupedAggregateHashTable` path is enabled for
-  composite grouping/join shapes using `SUM/MIN/MAX`
-- grouped direct-mode emit for large `GROUP BY join_key` cases now tracks active
-  matched keys instead of scanning the full key range at source time
-- several native/hash fallback paths now use typed extraction for more integer
-  widths instead of falling back to `GetValue()` boxing
-- the weak-shape planner gate now also uses estimated probe/build/group
-  cardinalities instead of only structural checks
-- grouped direct and segmented-direct emit no longer sort active keys before
-  returning batches
-- a narrow segmented multi-aggregate path is enabled for grouped probe-side
-  numeric `SUM/COUNT/AVG/MIN/MAX`
+An earlier nested-join key-extraction bug miscounted the longer-hop queries on
+small reproducer graphs and on `path04`; the current branch fixes that by
+resolving top-join keys through child output bindings rather than raw
+`binding.column_index`.
 
 ### Segmented multi-aggregate follow-up
 

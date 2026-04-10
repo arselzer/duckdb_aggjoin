@@ -27,6 +27,24 @@ static bool IsEquiJoin(LogicalOperator &op) {
     return !j.conditions.empty();
 }
 
+static bool ExtractBinding(Expression &expr, ColumnBinding &binding) {
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+        binding = expr.Cast<BoundColumnRefExpression>().binding;
+        return true;
+    }
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+        return ExtractBinding(*expr.Cast<BoundCastExpression>().child, binding);
+    }
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+        for (auto &child : expr.Cast<BoundFunctionExpression>().children) {
+            if (ExtractBinding(*child, binding)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool IsAggregate(LogicalOperator &op) {
     if(op.type!=LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) return false;
     auto &a=op.Cast<LogicalAggregate>();
@@ -289,32 +307,40 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         }
     }
 
-    // Extract join key column indices from join conditions.
-    // Left = original probe child, Right = original build child.
-    std::function<idx_t(Expression &)> getIdx = [&](Expression &e) -> idx_t {
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_REF)
-            return e.Cast<BoundReferenceExpression>().index;
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF)
-            return e.Cast<BoundColumnRefExpression>().binding.column_index;
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_CAST)
-            return getIdx(*e.Cast<BoundCastExpression>().child);
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-            for (auto &child : e.Cast<BoundFunctionExpression>().children) {
-                auto r = getIdx(*child);
-                if (r != DConstants::INVALID_INDEX) return r;
+    // Extract join key column indices from join conditions by resolving the
+    // child output binding, not binding.column_index. The latter is only safe
+    // for base-table children and breaks as soon as a join child is itself a
+    // nested join/project subtree.
+    auto left_child_bindings = join->children[0]->GetColumnBindings();
+    auto right_child_bindings = join->children[1]->GetColumnBindings();
+    auto find_binding_idx = [&](const vector<ColumnBinding> &bindings, const ColumnBinding &binding) -> idx_t {
+        for (idx_t i = 0; i < bindings.size(); i++) {
+            if (bindings[i] == binding) {
+                return i;
             }
         }
         return DConstants::INVALID_INDEX;
     };
+    auto resolve_join_child_idx = [&](Expression &expr, const vector<ColumnBinding> &child_bindings) -> idx_t {
+        if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+            auto idx = expr.Cast<BoundReferenceExpression>().index;
+            return idx < child_bindings.size() ? idx : DConstants::INVALID_INDEX;
+        }
+        ColumnBinding binding;
+        return ExtractBinding(expr, binding) ? find_binding_idx(child_bindings, binding)
+                                             : DConstants::INVALID_INDEX;
+    };
     for(auto &cond : join->conditions) {
-        auto li = getIdx(*cond.left), ri = getIdx(*cond.right);
+        auto li = resolve_join_child_idx(*cond.left, left_child_bindings);
+        auto ri = resolve_join_child_idx(*cond.right, right_child_bindings);
+        if (li == DConstants::INVALID_INDEX || ri == DConstants::INVALID_INDEX) return;
         if (need_swap) {
             // After swap: original left (probe) is now build, right is now probe
-            if (ri != DConstants::INVALID_INDEX) col.probe_key_cols.push_back(ri);
-            if (li != DConstants::INVALID_INDEX) col.build_key_cols.push_back(li);
+            col.probe_key_cols.push_back(ri);
+            col.build_key_cols.push_back(li);
         } else {
-            if (li != DConstants::INVALID_INDEX) col.probe_key_cols.push_back(li);
-            if (ri != DConstants::INVALID_INDEX) col.build_key_cols.push_back(ri);
+            col.probe_key_cols.push_back(li);
+            col.build_key_cols.push_back(ri);
         }
     }
 

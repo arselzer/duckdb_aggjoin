@@ -5,6 +5,59 @@ specialized AGGJOIN execution. It targets a narrow but important class of
 queries where planner-side preaggregation or a fused aggregate-over-join path
 can avoid paying for the full join result.
 
+## Introducing Example
+
+One concrete example is the exact `spark-eval` `dblp/path02.sql` query over the
+SNAP `com-dblp.ungraph.txt` graph staged to Parquet:
+
+```sql
+select count(*)
+from dblp p1, dblp p2, dblp p3
+where p1.toNode = p2.fromNode
+  and p2.toNode = p3.fromNode;
+```
+
+On the current build, the optimizer rewrites that query into a native
+mixed-side preaggregation plan rather than materializing the full 3-way join.
+The shape from `EXPLAIN` is:
+
+```text
+PROJECTION
+  UNGROUPED_AGGREGATE  sum(#0)
+    PROJECTION  "*"(#1, #3)
+      HASH_JOIN  #0 = #0
+        HASH_GROUP_BY  Groups: #0, Aggregates: count_star()
+          HASH_JOIN  toNode = fromNode
+            SEQ_SCAN dblp
+            SEQ_SCAN dblp
+        HASH_GROUP_BY  Groups: #0, Aggregates: count_star()
+          SEQ_SCAN dblp
+```
+
+With the extension disabled, DuckDB stays on the direct left-deep join plan:
+
+```text
+UNGROUPED_AGGREGATE  count_star()
+  HASH_JOIN  fromNode = toNode
+    HASH_JOIN  toNode = fromNode
+      SEQ_SCAN dblp
+      SEQ_SCAN dblp
+    SEQ_SCAN dblp
+```
+
+On the real `dblp` graph cached as Parquet on the local benchmark host:
+
+| Query | Count | Current plan | Native baseline |
+|-------|-------|--------------|-----------------|
+| `dblp/path02.sql` | `67,520,431` | `0.104s` | `0.162s` |
+| `dblp/path03.sql` | `835,509,083` | `0.113s` | `1.473s` |
+| `dblp/path04.sql` | `12,025,691,265` | `0.243s` | `32.186s` |
+
+So the point of the project is not “always use a custom operator.” It is to
+recognize narrow aggregate-over-join shapes like this and lower them to
+something cheaper than the default plan, while bailing out aggressively on the
+many nearby shapes that do not hold up.
+
 ## Overview
 
 The extension registers an **optimizer extension** that detects narrow
@@ -111,36 +164,29 @@ path.
 Current benchmark results are tracked in
 [benchmarks/README.md](./benchmarks/README.md). On DuckDB `v1.5.1`, 10M probe
 rows, the current build is strong on numeric single-key workloads. The dense
-`VARCHAR` and build-heavy follow-up numbers in that README were refreshed on
-April 10, 2026. On this host, the long monolithic `bench.sql` and
-`bench_scaling.sql` suites are now treated as convenience wrappers only: the
-current core/scaling snapshot in [benchmarks/README.md](./benchmarks/README.md)
-is built from split per-case files (`bench_core_*`, `bench_scaling_*`), with
-slow native-only cases run via `benchmarks/run_with_timeout.sh` and reported as
-explicit timeouts where appropriate. The current local snapshot was collected on
-an AMD Ryzen 9 3900X host (12 cores / 24 threads) with 62 GiB RAM running
-Ubuntu 22.04 / Linux 6.8:
+`VARCHAR`, build-heavy, and final-bag follow-up numbers in that README were
+refreshed on April 10, 2026. The current local same-query snapshot was
+collected on an AMD Ryzen 9 3900X host (12 cores / 24 threads) with 62 GiB RAM
+running Ubuntu 22.04 / Linux 6.8:
 
-| Scenario | AGGJOIN | Native | Result |
-|----------|---------|--------|--------|
-| Direct grouped `SUM`, 100K keys | 0.246s | 13.750s | **55.9x faster** |
-| Direct grouped `SUM`, 1M keys | 0.334s | 1.948s | **5.8x faster** |
-| Grouped `SUM`, 3M keys | 0.412s | 1.076s | **2.6x faster** |
-| Zipf-skewed grouped `SUM`, 100K keys | 0.170s | `>60s` timed out | **>=352x** |
-| High-blowup grouped `SUM`, 10K keys | 0.085s | 253.094s | **2977x faster** |
-| Multi-agg `SUM+MIN+MAX+AVG`, 1M keys | 0.566s | 3.877s | **6.9x faster** |
-| Dense `VARCHAR` grouped `SUM`, 1K keys / 100K rows | 0.009s | 0.182s | **20.2x faster** |
-| Dense `VARCHAR` grouped `SUM+MIN+MAX`, 1K keys / 100K rows | 0.012s | 0.280s | **23.3x faster** |
+| Scenario | Current plan | Same-query native baseline | Result |
+|----------|--------------|----------------------------|--------|
+| Grouped build-side `SUM+COUNT+AVG`, 100K keys / 1M rows | 0.160s | 0.293s | **1.8x faster** |
+| Grouped probe `SUM` + build `SUM + DATE MIN+MAX`, 100K keys / 1M rows | 0.063s | 0.160s | **2.5x faster** |
+| Final-bag grouped mixed chain, `100K x / 80K y`, `1M` rows each | 0.185s | 0.470s | **2.5x faster** |
+| Final-bag ungrouped numeric chain, `100K x / 80K y`, `1M` rows each | 0.142s | 0.213s | **1.5x faster** |
+| Dense `VARCHAR` grouped `SUM`, 1K keys / 100K rows | 0.009s | 0.183s | **20.3x faster** |
+| Dense `VARCHAR` grouped `SUM+MIN+MAX`, 1K keys / 100K rows | 0.015s | 0.265s | **17.7x faster** |
 
-If you are rerunning the top-line suites locally, prefer the split files in
-[benchmarks/](./benchmarks/) on constrained hosts. They let you run AGGJOIN and
-native sides independently and make slow native cases fail as explicit
-timeouts instead of blocking the entire suite.
+Historical probe-side vs build-side stress studies were moved to
+[shape_comparisons/README.md](./shape_comparisons/README.md). Those files are
+still useful for studying favorable vs unfavorable plan shapes, but they are
+not same-query extension-on vs extension-off baselines.
 
 For a public evaluation, the benchmark README is the main source of truth:
 
 - benchmark files are split by family
-- long native cases can be run independently or under timeout
+- historical shape-comparison studies are separated out
 - host specs for the published local numbers are recorded there
 
 Current limitations worth knowing:
@@ -487,8 +533,6 @@ PhysicalAggJoin uses DuckDB's `CachingPhysicalOperator` + Sink pipeline:
 - **Build-side aggregate inputs**: Operator can't access build-side values during
   streaming probe. Would require storing aggregate values in the build HT.
 - **HUGEINT**: `SUM(integer)` returns HUGEINT. Use DOUBLE columns or explicit CAST.
-- **Repeated execution**: Multiple AGGJOIN queries in same connection can crash.
-  Each Yannakakis CTE runs once, so unaffected.
 
 ## License
 

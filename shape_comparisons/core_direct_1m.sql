@@ -1,0 +1,17 @@
+-- Split shape-comparison case from shape_comparisons/core.sql
+-- 2. Direct mode: 1M keys, 10M rows (uniform)
+-- Run: build/Release/duckdb < shape_comparisons/core_direct_1m.sql
+
+.print === Direct mode: 1M keys, 10M rows, uniform ===
+.timer on
+
+.print --- Probe-side shape ---
+CREATE TABLE r2 AS SELECT i % 1000000 AS x, CAST(random()*100 AS DOUBLE) AS val FROM generate_series(1,10000000) t(i);
+CREATE TABLE s2 AS SELECT i % 1000000 AS x, i AS y FROM generate_series(1,10000000) t(i);
+COPY (SELECT r2.x, SUM(r2.val) FROM r2 JOIN s2 ON r2.x = s2.x GROUP BY r2.x) TO '/tmp/aggjoin_bench_2a.csv' (FORMAT CSV);
+
+.print --- Build-side comparison shape ---
+COPY (SELECT s2.y, SUM(r2.val) FROM r2 JOIN s2 ON r2.x = s2.x GROUP BY s2.y) TO '/tmp/aggjoin_bench_2b.csv' (FORMAT CSV);
+
+DROP TABLE r2;
+DROP TABLE s2;

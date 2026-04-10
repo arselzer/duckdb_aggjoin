@@ -122,3 +122,34 @@ query I
 SELECT aggjoin_set_test_ht_capacity(-1);
 ----
 -1
+
+statement ok
+CREATE TABLE dblp_path (fromNode INT, toNode INT);
+
+statement ok
+INSERT INTO dblp_path VALUES
+  (1, 2),
+  (1, 2),
+  (2, 3),
+  (2, 3),
+  (3, 4),
+  (4, 5);
+
+query I
+SELECT COUNT(*)
+FROM dblp_path p1, dblp_path p2, dblp_path p3, dblp_path p4
+WHERE p1.toNode = p2.fromNode
+  AND p2.toNode = p3.fromNode
+  AND p3.toNode = p4.fromNode;
+----
+4
+
+query I
+SELECT COUNT(*)
+FROM dblp_path p1, dblp_path p2, dblp_path p3, dblp_path p4, dblp_path p5
+WHERE p1.toNode = p2.fromNode
+  AND p2.toNode = p3.fromNode
+  AND p3.toNode = p4.fromNode
+  AND p4.toNode = p5.fromNode;
+----
+0

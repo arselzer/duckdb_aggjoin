@@ -19,8 +19,8 @@ echo "==> sqllogictests"
 "$ROOT_DIR/scripts/run_sqllogictests.sh" "$BUILD_DIR"
 
 declare -a BENCHMARKS=(
-  "benchmarks/bench_core_direct_100k_aggjoin.sql:20"
-  "benchmarks/bench_core_sparse_native.sql:20"
+  "shape_comparisons/core_direct_100k_probe_side.sql:20"
+  "shape_comparisons/core_sparse_build_side.sql:20"
   "benchmarks/bench_varchar_dense.sql:45"
   "benchmarks/bench_probe_build_mixed.sql:45"
 )
