@@ -1,0 +1,4 @@
+aggjoin.duckdb_extension
+.cache/
+duckdb
+build
