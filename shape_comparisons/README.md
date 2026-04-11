@@ -13,6 +13,11 @@ executor and understanding direct/segmented-direct/hash regime changes, but they
 often differ in `GROUP BY` key choice and output cardinality. They should not be
 presented as plain "same query with aggjoin on/off" benchmark numbers.
 
+The optimizer can do a limited planner-side probe/build swap for matched
+AGGJOIN shapes when all `GROUP BY` columns are on one side. That does not make
+these historical probe-side/build-side study files interchangeable with a true
+same-query on/off methodology.
+
 For true same-query benchmark results, see
 [benchmarks/README.md](../benchmarks/README.md).
 
@@ -71,8 +76,8 @@ benchmarks/run_with_timeout.sh shape_comparisons/core_high_blowup_build_side.sql
 
 These numbers are the latest local split-run snapshot on this host.
 
-| # | Scenario | Probe-side shape | Build-side comparison shape | Speedup |
-|---|----------|------------------|-----------------------------|---------|
+| # | Scenario | Probe-side shape | Build-side comparison shape | Probe-side / build-side ratio |
+|---|----------|------------------|-----------------------------|-------------------------------|
 | 1 | Direct mode, 100K keys | 0.246s | 13.750s | **55.9x** |
 | 2 | Direct mode, 1M keys | 0.334s | 1.948s | **5.8x** |
 | 3 | Hash mode, 3M keys | 0.412s | 1.076s | **2.6x** |
@@ -87,8 +92,8 @@ These numbers are the latest local split-run snapshot on this host.
 
 These numbers use the same shape-comparison methodology as the core suite.
 
-| Keys | Mode | Probe-side shape | Build-side comparison shape | Speedup |
-|------|------|------------------|-----------------------------|---------|
+| Keys | Mode | Probe-side shape | Build-side comparison shape | Probe-side / build-side ratio |
+|------|------|------------------|-----------------------------|-------------------------------|
 | 1K | Direct | 0.079s | `>45s` timed out | **>=569x** |
 | 10K | Direct | 0.081s | `>45s` timed out | **>=556x** |
 | 100K | Direct | 0.241s | 13.852s | **57.5x** |

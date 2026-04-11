@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${1:-$ROOT_DIR/build/Release}"
 DUCKDB_BIN="${DUCKDB_BIN:-$BUILD_DIR/duckdb}"
-OUT_PARQUET="${2:-/tmp/aggjoin_dblp.parquet}"
+OUT_PARQUET="${2:-$ROOT_DIR/benchmarks/data/dblp.parquet}"
 SRC_SPEC="${3:-https://raw.githubusercontent.com/arselzer/spark-eval/refs/heads/main/benchmark/snap/noheader/com-dblp.ungraph.txt}"
 
 if [[ ! -x "$DUCKDB_BIN" ]]; then

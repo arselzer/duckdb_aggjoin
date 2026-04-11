@@ -12,11 +12,30 @@ Planner and runtime tracing can be enabled without a debug rebuild:
   (`path`, planner estimates, build/probe counts, prefilter skips, result groups)
 
 Recent trace matrix findings:
+- manual rewrite-y-style frequency-propagation CTEs for `dblp` `path02`
+  through `path07` were benchmarked as a separate family. They produce the
+  exact expected counts, and by `path05` through `path07` they are materially
+  faster than the current raw-path optimizer rewrite on the real graph.
+  However, `AGGJOIN_TRACE=1` plus `EXPLAIN` showed that these staged CTEs
+  currently run as native `HASH_GROUP_BY` + `HASH_JOIN` pipelines with no
+  `AGGJOIN` node and near-parity enabled/disabled-extension timings. So the
+  gain is from the manual frequency-propagation rewrite itself, not from
+  post-rewrite AGGJOIN matching
 - dataset-backed `dblp` follow-up benchmarks now cover the exact
   `spark-eval` `dblp/path02.sql`, `path03.sql`, and `path04.sql` queries over
   a cached Parquet edge list. On the real `com-dblp.ungraph.txt` graph, the
   current branch runs them at about `0.093s` vs `0.144s`, `0.113s` vs
   `1.473s`, and `0.243s` vs `32.186s` respectively
+- a later longer-hop follow-up extended the same exact path family through
+  `path05`, `path06`, and `path07` as current-plan-only runs. On the real
+  cached graph those came in at about `0.891s`, `6.167s`, and `6.183s` with
+  counts `179,284,658,061`, `2,572,688,413,830`, and `34,421,433,323,534`
+  respectively; native baselines were not rerun there because they were
+  already beyond practical timeout budgets by `path05`
+- `path08` stayed on the same `native mixed-side preagg` rewrite family but
+  jumped to about `68.924s` with count `425,334,366,107,509`; trace showed
+  the change was not a strategy switch but a much larger grouped intermediate
+  estimate on one side (`~103.6M` vs `~32.9M` at `path07`)
 - the longer-hop `dblp` investigation exposed a real nested-join correctness
   bug: top-join key extraction was using raw `binding.column_index`, which is
   unsafe once a join child is itself a join subtree. Resolving join keys
@@ -334,6 +353,10 @@ The frontend sets `self.runtime.whereToLoad` on the worker to map extension
 names to URLs. `LOAD` triggers `whereToLoad("aggjoin")` → XMLHttpRequest →
 `dlopen`. Build with `-DWASM_LOADABLE_EXTENSIONS=1 -DBUILD_EXTENSIONS_ONLY=1`.
 
+**Critical ABI note**: the browser extension must be compiled against a DuckDB
+source checkout at the exact runtime tag (`v1.4.3` here). Patching the footer to
+`v1.4.3` is not sufficient if the object code was compiled against `v1.5.1`.
+
 **Extension metadata footer**: The `.duckdb_extension.wasm` file must have a
 512-byte footer matching the official format (8 × 32-byte fields in the first
 256 bytes, reversed by the parser):
@@ -590,6 +613,15 @@ Native DuckDB shows zero parallel scaling for aggregate-over-join
   composite, subset-key, ungrouped, richer asymmetric, and pure-nonnumeric
   boundaries are now broadly mapped. Further widening should only happen if a
   new benchmark shows a clear gap.
+- **Broader probe/build reorientation inside fused AGGJOIN is still deferred**:
+  The planner already does a limited `need_swap` normalization when all
+  `GROUP BY` columns are on one side. The only additional swap idea that still
+  looks plausible is a cost-based orientation choice for narrow single-key
+  fused shapes where `GROUP BY` is exactly the join key, or the aggregate is
+  ungrouped, and the build-side key range / distinct count could unlock direct
+  or segmented-direct mode. This should stay deferred until a benchmark shows
+  a real win; more generic side swapping is unlikely to pay off because the
+  operator and rewrite families remain intentionally asymmetric.
 - **Build-side AGGJOIN-internal nonnumeric support**: The old Value-heavy
   AGGJOIN path is still not worth reviving. Narrow balanced build-side and
   mixed-side nonnumeric cases are now better handled by native preaggregation
@@ -642,12 +674,22 @@ Native DuckDB shows zero parallel scaling for aggregate-over-join
    ungrouped numeric shape, but ungrouped asymmetric cases now bail more
    aggressively when the matched head is too small for the downstream side.
 
+4. **Benchmark-first orientation choice for narrow fused shapes**
+   If fused AGGJOIN orientation is revisited later, keep it narrow:
+   - single-key only
+   - grouped by the join key, or ungrouped
+   - compare current orientation against a swapped orientation only when the
+     swap would materially reduce build-side key range or build distinct count
+   The reason to test this at all is direct/segmented-direct eligibility in
+   the sink, which is driven by build-side footprint. This is not a general
+   “more swapping is better” direction.
+
 ### Lower priority
 
-4. **Parallel execution**
+5. **Parallel execution**
    Still possible, but much less compelling than streaming or better varlen-key
    support. Current fused single-thread performance is already strong on the
    main workloads.
 
-5. **WASM extension rebuild**
+6. **WASM extension rebuild**
    Build process work rather than optimizer/runtime work.

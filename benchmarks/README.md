@@ -44,6 +44,10 @@ now for true same-query benchmark families.
 build/Release/duckdb < benchmarks/bench_cte_chain.sql
 scripts/prepare_dblp_parquet.sh
 build/Release/duckdb < benchmarks/bench_dblp_path02.sql
+build/Release/duckdb < benchmarks/bench_dblp_path05.sql
+build/Release/duckdb < benchmarks/bench_dblp_path06.sql
+build/Release/duckdb < benchmarks/bench_dblp_path07.sql
+build/Release/duckdb < benchmarks/bench_dblp_path08.sql
 build/Release/duckdb < benchmarks/bench_final_bag.sql
 build/Release/duckdb < benchmarks/bench_final_bag_ungrouped.sql
 build/Release/duckdb < benchmarks/bench_final_bag_asymmetric.sql
@@ -121,9 +125,19 @@ benchmarks/run_with_timeout.sh benchmarks/bench_build_side_suite.sql 120
 - `bench_dblp_path02.sql`, `bench_dblp_path03.sql`, and
   `bench_dblp_path04.sql` are dataset-backed benchmarks for the exact
   `spark-eval` `dblp/path02.sql`, `path03.sql`, and `path04.sql` queries.
-  Stage the graph first with
-  `scripts/prepare_dblp_parquet.sh`, which downloads or copies the raw edge
-  list and caches it as `/tmp/aggjoin_dblp.parquet`.
+- `bench_dblp_path05.sql`, `bench_dblp_path06.sql`, and
+  `bench_dblp_path07.sql`, and `bench_dblp_path08.sql` extend the same path
+  family with current-plan-only runs for longer hop counts, where rerunning
+  the native baseline is no longer practical on this host.
+  These files read the vendored Parquet cache directly from
+  `benchmarks/data/dblp.parquet`.
+  Use `scripts/prepare_dblp_parquet.sh` only if you want to regenerate that
+  cache from a local raw edge list or URL.
+- `bench_dblp_freqprop_path02.sql` through `bench_dblp_freqprop_path07.sql`
+  benchmark manual rewrite-y-style frequency-propagation CTEs for the same
+  path family. These files compare the rewritten CTE SQL with the extension
+  enabled vs `PRAGMA disabled_optimizers='extension'` to measure whether
+  AGGJOIN helps after the manual rewrite has already been applied.
 - `bench_varchar_keys.sql` still uses the older wrapper shape and is best treated as
   a smoke test, not a primary performance result.
 - The latest local run used the standard current build with planner gating enabled.
@@ -132,6 +146,11 @@ benchmarks/run_with_timeout.sh benchmarks/bench_build_side_suite.sql 120
 Historical core/scaling/asymmetric shape studies now live in
 [shape_comparisons/README.md](../shape_comparisons/README.md). The rest of this
 README focuses on true same-query benchmark families.
+
+The optimizer can perform a limited probe/build swap for matched AGGJOIN
+shapes when all `GROUP BY` columns are on one side, but that does not turn the
+historical shape-comparison studies into same-query baselines. Those studies
+still often differ in grouping key choice and output cardinality.
 
 ### dblp SNAP follow-up
 
@@ -161,7 +180,9 @@ where p1.toNode = p2.fromNode
 ```
 
 These benchmarks intentionally keep the original shapes. On the real
-`com-dblp.ungraph.txt` graph staged to Parquet, the current build produces:
+`com-dblp.ungraph.txt` graph staged to Parquet, the current build produces the
+following same-query numbers through `path04`, and the current-plan-only
+scaling extensions can continue from there:
 
 | Query | Count | Direct query | Native baseline | Notes |
 |-------|-------|--------------|-----------------|-------|
@@ -173,6 +194,50 @@ An earlier nested-join key-extraction bug miscounted the longer-hop queries on
 small reproducer graphs and on `path04`; the current branch fixes that by
 resolving top-join keys through child output bindings rather than raw
 `binding.column_index`.
+
+### dblp longer-hop current-plan scaling
+
+For longer path lengths, the follow-up benchmark files keep the exact chain
+shapes but only rerun the current plan. Native baselines were not rerun here
+because they were already beyond practical local timeout budgets by `path05`.
+The planner stayed on the same `native mixed-side preagg` family throughout;
+the larger runtime jumps reflect larger grouped intermediate relations, not a
+rewrite-family change.
+
+| Query | Count | Current plan |
+|-------|-------|--------------|
+| `path05` | `179,284,658,061` | `0.891s` |
+| `path06` | `2,572,688,413,830` | `6.167s` |
+| `path07` | `34,421,433,323,534` | `6.183s` |
+| `path08` | `425,334,366,107,509` | `68.924s` |
+
+These longer-hop runs still stayed within a single-digit-second range on the
+current plan through `path07` even as the raw path counts grew by roughly two
+orders of magnitude from `path05` to `path07`. The next jump at `path08`
+coincides with one grouped side growing to roughly `103.6M` estimated rows in
+the same rewrite family.
+
+### dblp manual frequency-propagation CTEs
+
+The `bench_dblp_freqprop_path02.sql` through `bench_dblp_freqprop_path07.sql`
+files benchmark the manual rewrite-y-style frequency-propagation CTEs that
+stage grouped suffix summaries explicitly.
+
+On the real `dblp` graph, those rewritten CTEs are:
+
+| Query | Count | Rewritten CTE, ext on | Rewritten CTE, ext off | Notes |
+|-------|-------|-----------------------|------------------------|-------|
+| `path02` | `67,520,431` | `0.364s` | `0.352s` | exact match |
+| `path03` | `835,509,083` | `0.457s` | `0.354s` | exact match |
+| `path04` | `12,025,691,265` | `0.471s` | `0.346s` | exact match |
+| `path05` | `179,284,658,061` | `0.271s` | `0.267s` | exact match |
+| `path06` | `2,572,688,413,830` | `0.333s` | `0.319s` | exact match |
+| `path07` | `34,421,433,323,534` | `0.469s` | `0.469s` | exact match |
+
+`AGGJOIN_TRACE=1` plus `EXPLAIN` showed no AGGJOIN planner fire on these
+rewritten CTEs. They currently run as native `HASH_GROUP_BY` + `HASH_JOIN`
+pipelines, so the acceleration comes from the manual frequency-propagation
+rewrite itself rather than further AGGJOIN matching of the staged form.
 
 ### Segmented multi-aggregate follow-up
 

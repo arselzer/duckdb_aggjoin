@@ -5,6 +5,106 @@ specialized AGGJOIN execution. It targets a narrow but important class of
 queries where planner-side preaggregation or a fused aggregate-over-join path
 can avoid paying for the full join result.
 
+## Two Examples
+
+The extension accelerates different query families through different
+mechanisms. In some cases it emits the fused `PhysicalAggJoin` operator
+directly; in others it keeps the plan in native DuckDB operators and applies a
+planner-side rewrite.
+
+### Example 1: dense grouped `VARCHAR` join with `PhysicalAggJoin`
+
+A representative exact same-query fused-operator example is the dense grouped
+single-key `VARCHAR` case with `COUNT(*)`:
+
+```sql
+select r_vdense_c.x, count(*) as c
+from r_vdense_c join s_vdense_c on r_vdense_c.x = s_vdense_c.x
+group by r_vdense_c.x;
+```
+
+For a denser local `100`-key / `100K`-row setup:
+[`bench_varchar_dense.sql`](./benchmarks/bench_varchar_dense.sql):
+
+```sql
+create table r_vdense_c as
+select 'k' || lpad(cast(i % 100 as varchar), 3, '0') as x
+from generate_series(1, 100000) t(i);
+
+create table s_vdense_c as
+select 'k' || lpad(cast(i % 100 as varchar), 3, '0') as x
+from generate_series(1, 100000) t(i);
+```
+
+the plan becomes:
+
+```text
+AGGJOIN
+  SEQ_SCAN r_vdense_c
+  SEQ_SCAN s_vdense_c
+```
+
+In this shape, the optimizer replaces the aggregate-over-join with the fused
+operator. On the current local build, this exact same query gives:
+
+| Current plan | Native baseline | Result |
+|--------------|-----------------|--------|
+| `0.008s` | `1.316s` | **164.5x faster** |
+
+This example therefore illustrates a material `PhysicalAggJoin`-based
+improvement with exact agreement against the native baseline.
+
+### Example 2: `dblp` query with native rewrite acceleration
+
+The exact `spark-eval` `dblp/path02.sql` query is:
+
+```sql
+select count(*)
+from dblp p1, dblp p2, dblp p3
+where p1.toNode = p2.fromNode
+  and p2.toNode = p3.fromNode;
+```
+
+On the real `com-dblp.ungraph.txt` graph staged to Parquet, the extension does
+**not** use `PhysicalAggJoin` here. Instead it rewrites the query into a native
+mixed-side preaggregation plan. The rough `EXPLAIN` shape is:
+
+```text
+PROJECTION
+  UNGROUPED_AGGREGATE  sum(#0)
+    PROJECTION  "*"(#1, #3)
+      HASH_JOIN
+        HASH_GROUP_BY  count_star()
+          HASH_JOIN
+            SEQ_SCAN dblp
+            SEQ_SCAN dblp
+        HASH_GROUP_BY  count_star()
+          SEQ_SCAN dblp
+```
+
+With the extension disabled, DuckDB stays on the more direct left-deep join:
+
+```text
+UNGROUPED_AGGREGATE  count_star()
+  HASH_JOIN
+    HASH_JOIN
+      SEQ_SCAN dblp
+      SEQ_SCAN dblp
+    SEQ_SCAN dblp
+```
+
+Representative local results on the cached `dblp` Parquet graph:
+
+| Query | Count | Current plan | Native baseline | Result |
+|-------|-------|--------------|-----------------|--------|
+| `dblp/path02.sql` | `67,520,431` | `0.104s` | `0.162s` | **1.6x faster** |
+| `dblp/path03.sql` | `835,509,083` | `0.113s` | `1.473s` | **13.0x faster** |
+| `dblp/path04.sql` | `12,025,691,265` | `0.243s` | `32.186s` | **132.5x faster** |
+| `dblp/path05.sql` | `179,284,658,061` | `0.392s` | `120s+` | **>=306.1x faster** |
+
+This example demonstrates extension-driven acceleration through a **planner
+rewrite**, not through `PhysicalAggJoin`.
+
 ## Overview
 
 The extension registers an **optimizer extension** that detects narrow
@@ -19,7 +119,7 @@ SQL changes are needed.
 
 ## Status
 
-This project should be read as a **benchmark-backed research/engineering
+This project is best viewed as a **benchmark-backed research/engineering
 prototype**, not as a general-purpose replacement for DuckDB planning.
 
 What that means in practice:
@@ -31,18 +131,19 @@ What that means in practice:
 - it contains both positive and negative results, and those negative results
   are part of the design story rather than something hidden
 
-The current public story is therefore:
+In its current form:
 
-- **implemented today**: fused AGGJOIN execution for strong dense single-join
+- **implemented today**: fused AGGJOIN execution for selected dense single-join
   cases, plus several native preaggregation rewrite families
 - **intentionally narrow**: many variable-width, composite, asymmetric, and
   weak-latency cases stay native-first
-- **worth trying**: if your workload has aggregate-over-join shapes similar to
-  the benchmark matrix in [benchmarks/README.md](./benchmarks/README.md)
+- **appropriate for evaluation**: workloads with aggregate-over-join shapes
+  similar to the benchmark matrix in
+  [benchmarks/README.md](./benchmarks/README.md)
 
 ## What It Accelerates
 
-The repo is strongest on:
+The current implementation is strongest on:
 
 - grouped and ungrouped aggregate-over-single-join shapes with `SUM/COUNT/AVG`
   and selected `MIN/MAX`
@@ -128,7 +229,12 @@ running Ubuntu 22.04 / Linux 6.8:
 Historical probe-side vs build-side stress studies were moved to
 [shape_comparisons/README.md](./shape_comparisons/README.md). Those files are
 still useful for studying favorable vs unfavorable plan shapes, but they are
-not same-query extension-on vs extension-off baselines.
+not same-query extension-on vs extension-off baselines. The optimizer does have
+a limited probe/build swap for matched AGGJOIN shapes when all `GROUP BY`
+columns sit on one side, but that is just a normalization step inside the
+matched rewrite envelope. It does not make the historical probe-side and
+build-side study queries equivalent benchmark formulations, and many of those
+studies still differ in grouping key choice and output cardinality.
 
 For a public evaluation, the benchmark README is the main source of truth:
 
@@ -136,7 +242,10 @@ For a public evaluation, the benchmark README is the main source of truth:
 - historical shape-comparison studies are separated out
 - host specs for the published local numbers are recorded there
 
-Current limitations worth knowing:
+The public performance claims in this README use only true same-query
+extension-on vs extension-off results.
+
+Current limitations:
 - sparse workloads are still only near parity
 - composite-key and most variable-width key workloads are also near parity, and
   often intentionally left to native DuckDB by the planner gate
@@ -173,6 +282,71 @@ Current limitations worth knowing:
   envelopes; the adjacent single-key pure-nonnumeric case only clearly wins on
   the grouped probe-heavy side and otherwise stays near native parity
 - the operator is still blocking, so it does not improve `LIMIT` latency
+
+## Comparison to Yannakakis-Style Rewriting
+
+For longer `dblp` paths, a manual frequency-propagation rewrite is often more
+important than anything the extension can add afterward. The comparison below
+uses a normalized `COUNT(*)` seed stage so the staged rewrite remains exact in
+DuckDB. A representative stage looks like this:
+
+```sql
+with _yw_cte_1 as (
+  select p6.fromnode, p6.tonode, count(*)::hugeint as _freq
+  from dblp p6
+  join dblp p7 on p6.tonode = p7.fromnode
+  group by p6.fromnode, p6.tonode
+),
+_yw_cte_2 as (
+  select p5.fromnode, p5.tonode, sum(_yw_cte_1_agg._freq) as _freq
+  from dblp p5
+  join (
+    select fromnode, sum(_freq) as _freq
+    from _yw_cte_1
+    group by fromnode
+  ) _yw_cte_1_agg on p5.tonode = _yw_cte_1_agg.fromnode
+  group by p5.fromnode, p5.tonode
+)
+...
+select cast(coalesce(sum(_freq), 0) as hugeint) as count_star
+from _yw_cte_6;
+```
+
+On the raw path queries, the extension can still be very effective. But once
+the query has already been rewritten into a staged grouped-summary pipeline,
+DuckDB's native `HASH_GROUP_BY` + `HASH_JOIN` execution is already very
+competitive:
+
+| Query | Raw query current plan | Raw query native baseline | Manual frequency-propagation CTE |
+|-------|------------------------|---------------------------|----------------------------------|
+| `dblp/path01` | `0.032s` | `0.068s` | `0.026s` |
+| `dblp/path02` | `0.095s` | `0.140s` | `0.131s` |
+| `dblp/path03` | `0.113s` | `1.463s` | `0.162s` |
+| `dblp/path04` | `0.257s` | `31.664s` | `0.212s` |
+| `dblp/path05` | `0.376s` | `120s+` | `0.244s` |
+
+This crossover is the important result:
+
+- on shorter paths, the current raw-query optimization is already as good as or
+  better than the manual rewrite
+- by `path04`, the manual rewrite is slightly ahead of the current raw plan and
+  far ahead of the native baseline
+- by `path05`, the manual rewrite is clearly the best option among the three
+
+The important boundary case is that the extension does **not** currently turn
+these staged CTEs into `PhysicalAggJoin`. Some shorter stages can still pick
+up native preaggregation rewrites, but the longer staged pipelines remain
+native `HASH_GROUP_BY` + `HASH_JOIN` plans, and enabled/disabled runs on the
+rewritten CTEs stay near parity. For example:
+
+| Query | Rewritten CTE, extension enabled | Rewritten CTE, extension disabled |
+|-------|----------------------------------|-----------------------------------|
+| normalized `dblp/path06` CTE | `0.343s` | `0.302s` |
+| normalized `dblp/path07` CTE | `0.457s` | `0.447s` |
+
+So the staged rewrite itself is valuable, but matching the rewritten form is a
+lower-priority optimization than deriving that rewrite from the raw query in
+the first place.
 
 ## Design lessons
 
@@ -302,9 +476,9 @@ cd /tmp && git clone https://github.com/emscripten-core/emsdk.git
 cd emsdk && ./emsdk install 3.1.71 && ./emsdk activate 3.1.71
 source emsdk_env.sh
 
-# 2. Clone DuckDB source (v1.5.1 source works for building extensions against v1.4.3)
+# 2. Clone DuckDB source matching the browser ABI
 cd duckdb_aggjoin
-git clone --depth 1 --branch v1.5.1 https://github.com/duckdb/duckdb.git duckdb
+git clone --depth 1 --branch v1.4.3 https://github.com/duckdb/duckdb.git duckdb-wasm
 ```
 
 The `make wasm` target runs `scripts/build_wasm.sh` which:
@@ -313,6 +487,10 @@ The `make wasm` target runs `scripts/build_wasm.sh` which:
 3. Builds with `emmake`
 4. Patches the metadata footer (via `scripts/patch_metadata.py`)
 5. Copies to `frontend/public/duckdb/extensions/v1.4.3/wasm_eh/`
+
+The browser build now defaults to `duckdb-wasm/` and refuses to compile if the
+checked-out DuckDB tag does not exactly match `DUCKDB_VERSION`. Metadata patching
+alone does not make a `v1.5.1` binary loadable in a `v1.4.3` DuckDB-WASM runtime.
 
 **Why Emscripten 3.1.71?** The `@duckdb/duckdb-wasm@1.32.0` npm package was built
 with Emscripten 3.1.71, which legalizes i64 to i32 pairs. Newer versions use native
@@ -469,7 +647,10 @@ PhysicalAggJoin uses DuckDB's `CachingPhysicalOperator` + Sink pipeline:
 1. `resolveJoinCol()` — traces column bindings through DuckDB's pruned join output
 2. `TraceProjectionChain()` — maps indices through intermediate Projections (including compress)
 3. `IsAggregate()` — validates function compatibility (SUM/COUNT/COUNT_STAR/MIN/MAX/AVG)
-4. Auto-swaps probe/build sides when GROUP BY columns are on the wrong side
+4. Can do a limited planner-side probe/build swap when all `GROUP BY` columns are
+   on one side; this keeps matched AGGJOIN shapes in the operator's preferred
+   orientation, but it is not a generic claim that probe-side and build-side
+   study queries are interchangeable
 5. `StripDecompressProjections()` — removes spurious decompress functions after replacement
 
 ### Known limitations

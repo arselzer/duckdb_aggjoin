@@ -1,7 +1,9 @@
 .DEFAULT_GOAL := all
 
-# DuckDB source directory (gitignored, clone with: git clone --depth 1 --branch v1.5.1 https://github.com/duckdb/duckdb.git duckdb)
+# Native DuckDB source directory (gitignored, clone with: git clone --depth 1 --branch v1.5.1 https://github.com/duckdb/duckdb.git duckdb)
 DUCKDB_DIR ?= duckdb
+# Browser/WASM DuckDB source directory (must match DUCKDB_VERSION / DuckDB-WASM ABI)
+WASM_DUCKDB_DIR ?= duckdb-wasm
 EXT_NAME := aggjoin
 DUCKDB_VERSION ?= v1.4.3
 
@@ -44,11 +46,11 @@ smoke: all
 # Builds a loadable .duckdb_extension.wasm, patches metadata, deploys to frontend.
 
 wasm:
-	DUCKDB_DIR="$(CURDIR)/$(DUCKDB_DIR)" DUCKDB_VERSION="$(DUCKDB_VERSION)" \
+	DUCKDB_DIR="$(CURDIR)/$(WASM_DUCKDB_DIR)" DUCKDB_VERSION="$(DUCKDB_VERSION)" \
 	  ./scripts/build_wasm.sh
 
 wasm-build-only:
-	DUCKDB_DIR="$(CURDIR)/$(DUCKDB_DIR)" DUCKDB_VERSION="$(DUCKDB_VERSION)" \
+	DUCKDB_DIR="$(CURDIR)/$(WASM_DUCKDB_DIR)" DUCKDB_VERSION="$(DUCKDB_VERSION)" \
 	  ./scripts/build_wasm.sh --build-only
 
 # --- Cleanup ---

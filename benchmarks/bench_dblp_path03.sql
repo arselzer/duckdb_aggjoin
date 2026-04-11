@@ -1,7 +1,7 @@
 -- Benchmark: dblp SNAP path03 query from spark-eval
--- Requires: scripts/prepare_dblp_parquet.sh
+-- Uses: benchmarks/data/dblp.parquet by default
 -- Run:
---   scripts/prepare_dblp_parquet.sh
+--   scripts/prepare_dblp_parquet.sh        # only if regenerating the cache
 --   build/Release/duckdb < benchmarks/bench_dblp_path03.sql
 --
 -- Uses the exact spark-eval dblp query shape:
@@ -15,7 +15,7 @@
 DROP TABLE IF EXISTS dblp;
 CREATE TABLE dblp AS
 SELECT fromNode, toNode
-FROM read_parquet('/tmp/aggjoin_dblp.parquet');
+FROM read_parquet('benchmarks/data/dblp.parquet');
 
 .print === dblp path03, exact spark-eval query on cached parquet ===
 .print --- Direct query shape (planner decides) ---
