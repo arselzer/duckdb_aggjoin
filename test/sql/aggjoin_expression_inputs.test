@@ -1,0 +1,83 @@
+# name: test/sql/aggjoin_expression_inputs.test
+# description: Regression coverage for aggregate-input shapes the fused
+#              PhysicalAggJoin operator can't handle. The planner must bail
+#              and let native DuckDB execute these correctly. A prior bug
+#              silently demoted non-column aggregate inputs to no-input
+#              and produced 0; these tests pin that bug closed.
+#
+# group: [aggjoin]
+
+require aggjoin
+
+statement ok
+CREATE TABLE r (x INT, a INT, b INT, name TEXT);
+
+statement ok
+INSERT INTO r VALUES (1, 10, 2, 'alpha'), (2, 20, 3, 'beta'), (3, 30, 4, 'gamma');
+
+statement ok
+CREATE TABLE s (x INT);
+
+# Join multiplicities: r.x=1 joins 2 s rows, r.x=2 joins 1, r.x=3 joins 1 — 4 total
+statement ok
+INSERT INTO s VALUES (1), (1), (2), (3);
+
+# ── Arithmetic expression inputs ──
+
+# SUM(a + b) over 4 join rows: (10+2)*2 + (20+3) + (30+4) = 24 + 23 + 34 = 81
+query I
+SELECT CAST(SUM(r.a + r.b) AS INTEGER) FROM r JOIN s ON r.x = s.x;
+----
+81
+
+# SUM(a * b) — exact shape of the STATS-q6 bug: (10*2)*2 + (20*3) + (30*4) = 40 + 60 + 120 = 220
+query I
+SELECT CAST(SUM(r.a * r.b) AS INTEGER) FROM r JOIN s ON r.x = s.x;
+----
+220
+
+# Grouped version of SUM(a*b): per-x totals
+query II
+SELECT r.x, CAST(SUM(r.a * r.b) AS INTEGER) FROM r JOIN s ON r.x = s.x GROUP BY r.x ORDER BY r.x;
+----
+1	40
+2	60
+3	120
+
+# ── CAST-wrapped input (known-documented bug in CLAUDE.md) ──
+
+query I
+SELECT CAST(SUM(CAST(r.a AS DOUBLE)) AS INTEGER) FROM r JOIN s ON r.x = s.x;
+----
+70
+
+# ── DISTINCT aggregate ──
+
+# 3 distinct a values (10, 20, 30) across 4 join rows
+query I
+SELECT COUNT(DISTINCT r.a) FROM r JOIN s ON r.x = s.x;
+----
+3
+
+# ── FILTER clause ──
+
+# Only r.b > 2 rows contribute: x=2 (a=20) + x=3 (a=30) = 50
+query I
+SELECT CAST(COALESCE(SUM(r.a) FILTER (WHERE r.b > 2), 0) AS INTEGER) FROM r JOIN s ON r.x = s.x;
+----
+50
+
+# ── Function-wrapped input (non-numeric) ──
+
+# MIN over LENGTH('alpha')=5 (×2), LENGTH('beta')=4, LENGTH('gamma')=5 → 4
+query I
+SELECT MIN(LENGTH(r.name)) FROM r JOIN s ON r.x = s.x;
+----
+4
+
+# ── Multi-arg aggregate (CORR has 2 children) ──
+
+query I
+SELECT CAST(ROUND(CORR(r.a, r.b) * 1000) AS INTEGER) FROM r JOIN s ON r.x = s.x;
+----
+1000

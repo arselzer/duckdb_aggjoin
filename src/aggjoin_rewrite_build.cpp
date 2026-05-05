@@ -108,18 +108,7 @@ bool TryRewriteNativeBuildPreagg(ClientContext &context, Optimizer &optimizer, u
     vector<NativeBuildAggInfo> native_aggs;
     native_aggs.reserve(agg.expressions.size());
     auto resolve_binding = [&](Expression &e) -> idx_t {
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_REF) {
-            return e.Cast<BoundReferenceExpression>().index;
-        }
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-            auto &binding = e.Cast<BoundColumnRefExpression>().binding;
-            for (idx_t i = 0; i < child_bindings.size(); i++) {
-                if (child_bindings[i] == binding) {
-                    return i;
-                }
-            }
-        }
-        return DConstants::INVALID_INDEX;
+        return ResolveChildBinding(e, child_bindings);
     };
     for (idx_t a = 0; a < agg.expressions.size(); a++) {
         auto &ba = agg.expressions[a]->Cast<BoundAggregateExpression>();

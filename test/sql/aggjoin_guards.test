@@ -1,6 +1,12 @@
 # name: test/sql/aggjoin_guards.test
 # description: Collision, overflow, and guard coverage for AggJoin
 # group: [aggjoin]
+# differential: skip
+#   This file exercises AGGJOIN-specific hooks (aggjoin_set_test_ht_capacity)
+#   and synthetic-capacity error paths that only exist when the extension is
+#   firing. Under native DuckDB the capacity cap doesn't apply, so
+#   `statement error` assertions in this file would incorrectly fail under
+#   scripts/run_differential.sh. That runner skips files with this marker.
 
 require aggjoin
 

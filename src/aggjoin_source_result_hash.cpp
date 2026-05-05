@@ -340,6 +340,11 @@ OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, Execut
             continue;
         }
 
+        // Invariant: reaching here means probe-side, non-COUNT-star, non-on_build. The aggregate
+        // MUST have a valid probe-side input column. An INVALID ai here means the planner
+        // admitted a shape it couldn't execute (e.g. SUM(a*b), SUM(CAST(x))). Debug-assert to
+        // catch planner regressions; release keeps the defensive continue below.
+        D_ASSERT(ai != DConstants::INVALID_INDEX && ai < input.ColumnCount());
         if (ai == DConstants::INVALID_INDEX || ai >= input.ColumnCount()) continue;
 
         auto ptype = input.data[ai].GetType().InternalType();

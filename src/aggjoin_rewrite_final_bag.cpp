@@ -209,18 +209,7 @@ bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer
     auto child_bindings = agg_child.GetColumnBindings();
     auto top_join_bindings = join.GetColumnBindings();
     auto resolve_binding = [&](Expression &e) -> idx_t {
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_REF) {
-            return e.Cast<BoundReferenceExpression>().index;
-        }
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-            auto &binding = e.Cast<BoundColumnRefExpression>().binding;
-            for (idx_t i = 0; i < child_bindings.size(); i++) {
-                if (child_bindings[i] == binding) {
-                    return i;
-                }
-            }
-        }
-        return DConstants::INVALID_INDEX;
+        return ResolveChildBinding(e, child_bindings);
     };
 
     CompressInfo group_compress;

@@ -146,22 +146,11 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
     AggJoinColInfo col;
     col.probe_col_count = probe_cols;
 
-    // Resolve BoundColumnRefExpression to physical position in the child's output.
-    // At post-optimize, group/aggregate expressions are BoundColumnRefExpression
-    // with (table_index, column_index). We need to find the POSITION in the child
-    // operator's GetColumnBindings() that matches this binding.
+    // Resolve group/aggregate expressions to their position in the agg_child's
+    // output bindings. See ResolveChildBinding in aggjoin_optimizer_shared.hpp.
     auto child_bindings = agg_child.GetColumnBindings();
     auto resolveBinding = [&](Expression &e) -> idx_t {
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_REF) {
-            return e.Cast<BoundReferenceExpression>().index;
-        }
-        if (e.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-            auto &binding = e.Cast<BoundColumnRefExpression>().binding;
-            for (idx_t i = 0; i < child_bindings.size(); i++) {
-                if (child_bindings[i] == binding) return i;
-            }
-        }
-        return DConstants::INVALID_INDEX;
+        return ResolveChildBinding(e, child_bindings);
     };
 
     // First pass: resolve all group and agg columns to (is_probe, scan_idx) pairs.
@@ -197,24 +186,64 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         auto fn = StringUtil::Upper(ba.function.name);
         // Normalize COUNT_STAR → COUNT for uniform handling
         if (fn == "COUNT_STAR") fn = "COUNT";
+        // The fused operator can only handle a single direct column ref per
+        // aggregate. Bail on DISTINCT/FILTER/ORDER BY and on multi-arg or
+        // expression-wrapped inputs (e.g. SUM(a*b), SUM(CAST(x AS DOUBLE))) —
+        // otherwise the runtime silently treats them as no-input aggregates
+        // and produces 0. Native handles these correctly.
+        if (ba.IsDistinct() || ba.filter || ba.order_bys) {
+            if (AggJoinTraceEnabled()) {
+                fprintf(stderr, "[AGGJOIN] bail: aggregate %s has DISTINCT/FILTER/ORDER BY\n", fn.c_str());
+            }
+            return;
+        }
+        if (ba.children.size() > 1) {
+            if (AggJoinTraceEnabled()) {
+                fprintf(stderr, "[AGGJOIN] bail: aggregate %s has %zu arguments (only 0 or 1 supported)\n",
+                        fn.c_str(), ba.children.size());
+            }
+            return;
+        }
+        if (!ba.children.empty()) {
+            auto cls = ba.children[0]->GetExpressionClass();
+            if (cls != ExpressionClass::BOUND_REF && cls != ExpressionClass::BOUND_COLUMN_REF) {
+                if (AggJoinTraceEnabled()) {
+                    fprintf(stderr,
+                            "[AGGJOIN] bail: aggregate %s input is not a direct column ref\n",
+                            fn.c_str());
+                }
+                return;
+            }
+        }
         col.agg_funcs.push_back(fn);
         bool is_numeric = true;
         if (!ba.children.empty() && !ba.children[0]->return_type.IsNumeric()) {
             is_numeric = false; // VARCHAR, DATE, etc.
         }
         col.agg_is_numeric.push_back(is_numeric);
-        idx_t agg_child_idx = DConstants::INVALID_INDEX;
-        if (!ba.children.empty()) {
-            agg_child_idx = resolveBinding(*ba.children[0]);
-        }
-        if (agg_child_idx == DConstants::INVALID_INDEX) {
-            resolved_aggs.push_back({true, DConstants::INVALID_INDEX, {}}); // COUNT(*)
+        if (ba.children.empty()) {
+            // True COUNT(*): no input column, runtime counts rows.
+            resolved_aggs.push_back({true, DConstants::INVALID_INDEX, {}});
             continue;
+        }
+        auto agg_child_idx = resolveBinding(*ba.children[0]);
+        if (agg_child_idx == DConstants::INVALID_INDEX) {
+            // Column ref didn't resolve through the agg's child bindings.
+            // The runtime can't read it, so bail rather than silently produce 0.
+            if (AggJoinTraceEnabled()) {
+                fprintf(stderr,
+                        "[AGGJOIN] bail: aggregate %s input column did not resolve\n", fn.c_str());
+            }
+            return;
         }
         auto join_idx = TraceProjectionChain(agg_child, agg_child_idx);
         if (join_idx == DConstants::INVALID_INDEX || join_idx >= join_bindings.size()) {
-            resolved_aggs.push_back({true, DConstants::INVALID_INDEX, {}});
-            continue;
+            if (AggJoinTraceEnabled()) {
+                fprintf(stderr,
+                        "[AGGJOIN] bail: aggregate %s input did not trace through projection chain\n",
+                        fn.c_str());
+            }
+            return;
         }
         auto &b = join_bindings[join_idx];
         bool is_p = false; idx_t si = DConstants::INVALID_INDEX;

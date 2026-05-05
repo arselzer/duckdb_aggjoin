@@ -33,6 +33,11 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         auto &f = col.agg_funcs[a];
         auto ai = col.agg_input_cols[a];
         if (f == "COUNT" && ai == DConstants::INVALID_INDEX) continue;
+        // Invariant: any non-COUNT aggregate reaching here must have a valid probe-side input column.
+        // A violation means the planner admitted a shape it shouldn't have (e.g. SUM(a*b) with
+        // INVALID input — the STATS-q6 bug class). Debug-assert to catch planner regressions early;
+        // release keeps the defensive continue below so wrong results never ship.
+        D_ASSERT(ai != DConstants::INVALID_INDEX && ai < input.ColumnCount());
         if (ai == DConstants::INVALID_INDEX || ai >= input.ColumnCount()) continue;
         if (f == "MIN" || f == "MAX") continue;
         if (input.data[ai].GetType().InternalType() != PhysicalType::DOUBLE) {

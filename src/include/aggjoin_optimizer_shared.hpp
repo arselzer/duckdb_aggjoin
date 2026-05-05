@@ -3,9 +3,30 @@
 #include "duckdb.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 
 namespace duckdb {
+
+// Resolve a group/aggregate-child expression to its position in the immediate
+// child operator's output bindings. Handles the two cases DuckDB actually
+// emits at post-optimize: BoundReferenceExpression (direct index) and
+// BoundColumnRefExpression (binding lookup). Returns INVALID_INDEX for
+// anything else — callers MUST bail rather than treat INVALID as COUNT(*),
+// or they'll silently produce 0 for SUM(a*b), SUM(CAST(x)), etc.
+static inline idx_t ResolveChildBinding(Expression &e, const vector<ColumnBinding> &child_bindings) {
+    if (e.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+        return e.Cast<BoundReferenceExpression>().index;
+    }
+    if (e.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+        auto &binding = e.Cast<BoundColumnRefExpression>().binding;
+        for (idx_t i = 0; i < child_bindings.size(); i++) {
+            if (child_bindings[i] == binding) return i;
+        }
+    }
+    return DConstants::INVALID_INDEX;
+}
 
 class PhysicalPlanGenerator;
 class ColumnBindingResolver;

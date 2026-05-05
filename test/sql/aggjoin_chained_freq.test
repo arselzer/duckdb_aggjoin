@@ -1,0 +1,95 @@
+# name: test/sql/aggjoin_chained_freq.test
+# description: Regression test for the STATS-q6 wrong-result bug documented in
+#              docs/engineering/duckdb-wasm-aggjoin-optimizer-bug.md.
+#
+#              The shape: a shared materialized table carries a `_freq` column
+#              emitted as `CAST(COUNT(*) AS DOUBLE)`, and an outer CTE does a
+#              second SUM-over-join against it. Both aggregations are join-
+#              local; the outer aggregate is also filtered.
+#
+#              Root cause: the fused AGGJOIN operator can only read a single
+#              direct column input per aggregate. For `SUM(_yw_shared.score *
+#              _yw_shared._freq)` the child[0] is a multiply expression, not a
+#              column ref, so the planner silently treated it as a no-input
+#              aggregate and the runtime produced 0. Fixed by bailing out of
+#              the rewrite when an aggregate's argument is anything other than
+#              a direct column ref (also DISTINCT/FILTER/ORDER BY).
+#
+# group: [aggjoin]
+
+require aggjoin
+
+statement ok
+CREATE TABLE users (id INTEGER, upvotes INTEGER);
+
+statement ok
+INSERT INTO users VALUES
+  (1, 50), (2, 150), (3, 200), (4, 10), (5, 500), (6, 120), (7, 80);
+
+statement ok
+CREATE TABLE posts (id INTEGER, owneruserid INTEGER, score INTEGER);
+
+statement ok
+INSERT INTO posts VALUES
+  (100, 2, 5), (101, 2, 8), (102, 3, 7), (103, 5, 12), (104, 6, 3);
+
+statement ok
+CREATE TABLE votes (postid INTEGER, votetypeid INTEGER);
+
+statement ok
+INSERT INTO votes VALUES
+  (100, 2), (100, 2), (100, 1),
+  (101, 2),
+  (102, 2), (102, 2),
+  (103, 2),
+  (104, 1);
+
+# Baseline: the unrewritten query the rewriter's output should match.
+query III
+SELECT u.id, COUNT(*) AS post_count, SUM(p.score) AS total_score
+FROM users u, posts p, votes v
+WHERE u.id = p.owneruserid
+  AND p.id = v.postid
+  AND v.votetypeid = 2
+  AND u.upvotes >= 100
+GROUP BY u.id
+ORDER BY u.id;
+----
+2	3	18
+3	2	14
+5	1	12
+
+# Rewrite-y equivalent: a shared _freq temp, an outer SUM-over-join CTE, and
+# a final aggregate. This is the exact shape the STATS-q6 bug hit.
+statement ok
+CREATE TEMP TABLE _yw_shared AS
+SELECT
+  p.id,
+  p.owneruserid,
+  p.score,
+  v.votetypeid,
+  CAST(COUNT(*) AS DOUBLE) AS _freq
+FROM posts AS p, votes AS v
+WHERE p.id = v.postid
+GROUP BY p.id, p.owneruserid, p.score, v.votetypeid;
+
+query III
+WITH _yw_cte AS (
+  SELECT u.id,
+         SUM(_yw_shared._freq) AS _freq,
+         SUM(_yw_shared.score * _yw_shared._freq) AS _agg_1
+  FROM users AS u
+  JOIN _yw_shared ON u.id = _yw_shared.owneruserid
+  WHERE (_yw_shared.votetypeid = 2) AND (u.upvotes >= 100)
+  GROUP BY u.id
+)
+SELECT id,
+       CAST(COALESCE(SUM(_freq), 0) AS INTEGER) AS post_count,
+       CAST(COALESCE(SUM(_agg_1), 0) AS INTEGER) AS total_score
+FROM _yw_cte
+GROUP BY id
+ORDER BY id;
+----
+2	3	18
+3	2	14
+5	1	12

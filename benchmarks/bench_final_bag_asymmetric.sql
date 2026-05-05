@@ -3,6 +3,38 @@
 
 .timer on
 
+-- Correctness check macro: every triplet's three plan CSVs (a=AGGJOIN direct,
+-- b=native, c=AGGJOIN manual tail decomp) MUST produce matching signatures
+-- (row count + rounded column-1 + rounded column-2 sums). A FAIL verdict means
+-- the fast plan is silently producing wrong results — exactly the class of bug
+-- that fix a7c6cd8 / 69b0fac closed on the STATS-q6 shape.
+CREATE OR REPLACE MACRO check_bench_triplet(prefix) AS TABLE (
+  WITH sigs AS (
+    SELECT 'a (AGGJOIN direct)' AS p,
+           CAST(COUNT(*) AS BIGINT) AS r,
+           CAST(ROUND(SUM(column0::DOUBLE)) AS BIGINT) AS s1,
+           CAST(ROUND(SUM(column1::DOUBLE)) AS BIGINT) AS s2
+    FROM read_csv_auto(prefix || 'a.csv', header=false, skip=1)
+    UNION ALL
+    SELECT 'b (native)',
+           CAST(COUNT(*) AS BIGINT),
+           CAST(ROUND(SUM(column0::DOUBLE)) AS BIGINT),
+           CAST(ROUND(SUM(column1::DOUBLE)) AS BIGINT)
+    FROM read_csv_auto(prefix || 'b.csv', header=false, skip=1)
+    UNION ALL
+    SELECT 'c (AGGJOIN manual tail decomp)',
+           CAST(COUNT(*) AS BIGINT),
+           CAST(ROUND(SUM(column0::DOUBLE)) AS BIGINT),
+           CAST(ROUND(SUM(column1::DOUBLE)) AS BIGINT)
+    FROM read_csv_auto(prefix || 'c.csv', header=false, skip=1)
+  )
+  SELECT p AS plan, r AS rows, s1 AS sig_col1, s2 AS sig_col2,
+         CASE WHEN (SELECT COUNT(DISTINCT (r, s1, s2)) FROM sigs) = 1
+              THEN 'PASS' ELSE 'FAIL' END AS verdict
+  FROM sigs
+  ORDER BY p
+);
+
 .print === Final-bag mixed chain, grouped, small head / large bridge+tail ===
 CREATE TABLE r_fba1 AS
 SELECT i % 100000 AS x,
@@ -69,6 +101,9 @@ COPY (
     JOIN st ON r_fba1.x = st.x
     GROUP BY r_fba1.x
 ) TO '/tmp/aggjoin_final_bag_a1c.csv' (FORMAT CSV);
+
+.print --- Correctness check (asymmetric bench 1) ---
+SELECT * FROM check_bench_triplet('/tmp/aggjoin_final_bag_a1');
 
 DROP TABLE r_fba1;
 DROP TABLE s_fba1;
@@ -142,6 +177,9 @@ COPY (
     GROUP BY r_fba2.x
 ) TO '/tmp/aggjoin_final_bag_a2c.csv' (FORMAT CSV);
 
+.print --- Correctness check (asymmetric bench 2) ---
+SELECT * FROM check_bench_triplet('/tmp/aggjoin_final_bag_a2');
+
 DROP TABLE r_fba2;
 DROP TABLE s_fba2;
 DROP TABLE t_fba2;
@@ -210,6 +248,9 @@ COPY (
     JOIN st ON r_x.x = st.x
 ) TO '/tmp/aggjoin_final_bag_a3c.csv' (FORMAT CSV);
 
+.print --- Correctness check (asymmetric bench 3) ---
+SELECT * FROM check_bench_triplet('/tmp/aggjoin_final_bag_a3');
+
 DROP TABLE r_fba3;
 DROP TABLE s_fba3;
 DROP TABLE t_fba3;
@@ -277,6 +318,9 @@ COPY (
     FROM r_x
     JOIN st ON r_x.x = st.x
 ) TO '/tmp/aggjoin_final_bag_a4c.csv' (FORMAT CSV);
+
+.print --- Correctness check (asymmetric bench 4) ---
+SELECT * FROM check_bench_triplet('/tmp/aggjoin_final_bag_a4');
 
 DROP TABLE r_fba4;
 DROP TABLE s_fba4;
