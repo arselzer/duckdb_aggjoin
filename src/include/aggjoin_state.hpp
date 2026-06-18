@@ -31,6 +31,7 @@ struct AggJoinSinkState : public GlobalSinkState {
     // ── Direct mode: flat arrays indexed by integer key ──
     // Eliminates ALL hash table lookups when keys are dense integers.
     bool direct_mode = false;
+    bool direct_build_without_ht = false; // Build side populated build_counts directly from planned stats range.
     int64_t key_min = 0;        // Min key value (offset for array indexing)
     idx_t key_range = 0;        // key_max - key_min + 1
     vector<idx_t> build_counts; // [key - key_min] → frequency count (0 = no match)

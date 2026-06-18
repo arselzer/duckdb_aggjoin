@@ -1,0 +1,65 @@
+# name: test/sql/aggjoin_planned_direct.test
+# description: Planned direct mode can skip the build hash table when statistics
+#              provide a compact integer key range. The source and emit paths
+#              must still process probe rows even though build_ht is empty.
+# group: [aggjoin]
+# differential: skip
+#   Uses aggjoin_last_rewrite() fire-assertions.
+
+require aggjoin
+
+statement ok
+CREATE TABLE pd_build AS
+SELECT CAST((i % 25) - 10 AS SMALLINT) AS k
+FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE pd_probe AS
+SELECT CAST((i % 25) - 10 AS SMALLINT) AS k, 1.0::DOUBLE AS x
+FROM range(50000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT CAST(SUM(pd_probe.x) AS BIGINT)
+FROM pd_probe JOIN pd_build ON pd_probe.k = pd_build.k;
+----
+10000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM pd_probe JOIN pd_build ON pd_probe.k = pd_build.k;
+----
+10000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query III rowsort
+SELECT CAST(pd_probe.k AS INTEGER), COUNT(*), CAST(SUM(pd_probe.x) AS BIGINT)
+FROM pd_probe JOIN pd_build ON pd_probe.k = pd_build.k
+GROUP BY pd_probe.k
+HAVING pd_probe.k IN (-10, 0, 14);
+----
+-10	400000	400000
+0	400000	400000
+14	400000	400000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused

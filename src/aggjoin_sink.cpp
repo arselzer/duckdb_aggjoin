@@ -50,6 +50,103 @@
 #include "aggjoin_state.hpp"
 
 namespace duckdb {
+
+static bool TryInitializePlannedDirectMode(AggJoinSinkState &state, const AggJoinColInfo &col) {
+    if (!col.planned_direct_mode || col.planned_direct_key_range == 0) {
+        return false;
+    }
+    for (idx_t a = 0; a < col.agg_on_build.size(); a++) {
+        if (col.agg_on_build[a]) {
+            return false;
+        }
+    }
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if ((col.agg_funcs[a] == "MIN" || col.agg_funcs[a] == "MAX") &&
+            a < col.agg_is_numeric.size() && !col.agg_is_numeric[a]) {
+            return false;
+        }
+    }
+
+    auto range = col.planned_direct_key_range;
+    state.direct_mode = true;
+    state.direct_build_without_ht = true;
+    state.key_min = col.planned_direct_key_min;
+    state.key_range = range;
+    state.num_aggs = col.agg_funcs.size();
+    state.build_counts.assign(range, 0);
+    state.direct_sums.assign(range * state.num_aggs, 0.0);
+    state.all_bc_one = true;
+
+    for (auto &f : col.agg_funcs) {
+        if (f == "MIN" || f == "MAX") state.has_min_max = true;
+        if (f == "AVG") state.has_avg = true;
+        if (f == "SUM") state.has_sum = true;
+    }
+    if (state.has_min_max) {
+        state.direct_mins.assign(range * state.num_aggs, std::numeric_limits<double>::max());
+        state.direct_maxs.assign(range * state.num_aggs, std::numeric_limits<double>::lowest());
+    }
+    if (state.has_min_max || state.has_sum) {
+        state.direct_has.assign(range * state.num_aggs, 0);
+    }
+    if (state.has_avg) {
+        state.direct_counts.assign(range * state.num_aggs, 0.0);
+    }
+    if (col.group_cols.empty()) {
+        auto na = col.agg_funcs.size();
+        state.ungrouped_sum.assign(na, 0.0);
+        state.ungrouped_count.assign(na, 0.0);
+        state.ungrouped_min.assign(na, std::numeric_limits<double>::max());
+        state.ungrouped_max.assign(na, std::numeric_limits<double>::lowest());
+        state.ungrouped_has.assign(na, 0);
+    } else if (col.group_cols.size() == 1 && col.group_cols[0] == col.probe_key_cols[0]) {
+        state.group_is_key = true;
+        state.track_active_keys = true;
+        state.direct_key_seen.assign(range, 0);
+        state.direct_active_keys.reserve(std::min<idx_t>(range, col.build_estimate ? col.build_estimate : range));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static void PopulatePlannedDirectBuildCounts(AggJoinSinkState &sink, DataChunk &chunk, idx_t key_col) {
+    auto n = chunk.size();
+    auto ptype = chunk.data[key_col].GetType().InternalType();
+    auto *validity = FlatVector::Validity(chunk.data[key_col]).GetData();
+    auto kmin = sink.key_min;
+    auto range = sink.key_range;
+#define AGGJOIN_DIRECT_BUILD_COUNTS(KTYPE)                                                               \
+    {                                                                                                    \
+        auto *keys = FlatVector::GetData<KTYPE>(chunk.data[key_col]);                                    \
+        for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue;                            \
+            auto raw_key = (int64_t)keys[r];                                                             \
+            __int128 offset_wide = (__int128)raw_key - (__int128)kmin;                                  \
+            if (offset_wide < 0 || offset_wide >= (__int128)range) {                                    \
+                throw InternalException("AGGJOIN planned direct build key outside statistics range");    \
+            }                                                                                            \
+            auto offset = (idx_t)offset_wide;                                                            \
+            auto &count = sink.build_counts[offset];                                                     \
+            count++;                                                                                     \
+            if (count != 1) sink.all_bc_one = false;                                                     \
+            sink.build_rows_kept++;                                                                      \
+        }                                                                                                \
+    }
+    switch (ptype) {
+    case PhysicalType::INT8: AGGJOIN_DIRECT_BUILD_COUNTS(int8_t); break;
+    case PhysicalType::INT16: AGGJOIN_DIRECT_BUILD_COUNTS(int16_t); break;
+    case PhysicalType::INT32: AGGJOIN_DIRECT_BUILD_COUNTS(int32_t); break;
+    case PhysicalType::INT64: AGGJOIN_DIRECT_BUILD_COUNTS(int64_t); break;
+    case PhysicalType::UINT8: AGGJOIN_DIRECT_BUILD_COUNTS(uint8_t); break;
+    case PhysicalType::UINT16: AGGJOIN_DIRECT_BUILD_COUNTS(uint16_t); break;
+    case PhysicalType::UINT32: AGGJOIN_DIRECT_BUILD_COUNTS(uint32_t); break;
+    default:
+        throw InternalException("AGGJOIN planned direct build received non-integral key type");
+    }
+#undef AGGJOIN_DIRECT_BUILD_COUNTS
+}
+
 unique_ptr<GlobalSinkState> PhysicalAggJoin::GetGlobalSinkState(ClientContext &ctx) const {
     auto state = make_uniq<AggJoinSinkState>();
     bool has_build_aggs = false;
@@ -92,6 +189,7 @@ unique_ptr<GlobalSinkState> PhysicalAggJoin::GetGlobalSinkState(ClientContext &c
         state->agg_ht = make_uniq<GroupedAggregateHashTable>(ctx, BufferAllocator::Get(ctx), group_types,
                                                              payload_types, bindings);
     }
+    TryInitializePlannedDirectMode(*state, col);
     return std::move(state);
 }
 
@@ -109,6 +207,10 @@ SinkResultType PhysicalAggJoin::Sink(ExecutionContext &ctx, DataChunk &chunk, Op
                 if (bci != DConstants::INVALID_INDEX && bci < chunk.ColumnCount())
                     chunk.data[bci].Flatten(n);
             }
+        }
+        if (sink.direct_build_without_ht) {
+            PopulatePlannedDirectBuildCounts(sink, chunk, col.build_key_cols[0]);
+            return SinkResultType::NEED_MORE_INPUT;
         }
         Vector hv(LogicalType::HASH, n); hv.Flatten(n);
         VectorOperations::Hash(chunk.data[col.build_key_cols[0]], hv, n);
@@ -185,6 +287,9 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                                            OperatorSinkFinalizeInput &input) const {
         auto &sink = input.global_state.Cast<AggJoinSinkState>();
         sink.finalized = true;
+        if (sink.direct_build_without_ht) {
+            return SinkFinalizeType::READY;
+        }
 
         // Detect if direct/segmented mode is possible: single signed-offset-safe
         // integer build key with small range that fits in a flat array.

@@ -57,7 +57,7 @@ SourceResultType PhysicalAggJoin::AGGJOIN_GETDATA(ExecutionContext &ctx, DataChu
     }
     auto &sink = sink_state->Cast<AggJoinSinkState>();
 
-    if (sink.build_ht.mask == 0) {
+    if (!sink.direct_build_without_ht && sink.build_ht.mask == 0) {
         if (col.group_cols.empty()) {
             auto &src0 = input.global_state.Cast<AggJoinSourceState>();
             if (!src0.initialized) {
@@ -91,7 +91,8 @@ SourceResultType PhysicalAggJoin::AGGJOIN_GETDATA(ExecutionContext &ctx, DataChu
                             : "hash";
         idx_t result_groups = 0;
         if (col.group_cols.empty()) {
-            result_groups = sink.build_ht.mask ? 1 : 0;
+            result_groups = (sink.direct_mode || sink.segmented_direct_mode ||
+                             sink.segmented_multi_direct_mode || sink.build_ht.mask) ? 1 : 0;
         } else if (sink.segmented_multi_direct_mode || sink.segmented_direct_mode) {
             result_groups = sink.segmented_active_keys.size();
         } else if (sink.direct_mode) {

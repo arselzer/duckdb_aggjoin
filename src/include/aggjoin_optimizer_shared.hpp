@@ -78,6 +78,9 @@ struct AggJoinColInfo {
     idx_t probe_estimate = 0;
     idx_t build_estimate = 0;
     idx_t group_estimate = 0;
+    bool planned_direct_mode = false;
+    int64_t planned_direct_key_min = 0;
+    idx_t planned_direct_key_range = 0;
     vector<CompressInfo> group_compress;
 };
 

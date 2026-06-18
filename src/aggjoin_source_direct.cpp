@@ -96,7 +96,8 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
     auto *maxs = has_minmax ? sink.direct_maxs.data() : nullptr;
     auto *has_arr = sink.direct_has.empty() ? nullptr : sink.direct_has.data();
 
-    auto is_int_key = (ptype == PhysicalType::INT32 || ptype == PhysicalType::INT64 ||
+    auto is_int_key = (ptype == PhysicalType::INT8 || ptype == PhysicalType::INT16 ||
+                       ptype == PhysicalType::INT32 || ptype == PhysicalType::INT64 ||
                        ptype == PhysicalType::UINT32 || ptype == PhysicalType::UINT64 ||
                        ptype == PhysicalType::UINT16 || ptype == PhysicalType::UINT8);
     if (col.group_cols.empty() && all_sum_count_double && is_int_key && !sink.ungrouped_sum.empty()) {
@@ -165,6 +166,8 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         }                                                                                                \
     }
         switch (ptype) {
+        case PhysicalType::INT8: UNGROUPED_EXTRACT(int8_t); break;
+        case PhysicalType::INT16: UNGROUPED_EXTRACT(int16_t); break;
         case PhysicalType::INT32: UNGROUPED_EXTRACT(int32_t); break;
         case PhysicalType::INT64: UNGROUPED_EXTRACT(int64_t); break;
         case PhysicalType::UINT32: UNGROUPED_EXTRACT(uint32_t); break;
@@ -280,6 +283,8 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         }                                                                                                \
     }
         switch (ptype) {
+        case PhysicalType::INT8: EXTRACT_KEYS(int8_t); break;
+        case PhysicalType::INT16: EXTRACT_KEYS(int16_t); break;
         case PhysicalType::INT32: EXTRACT_KEYS(int32_t); break;
         case PhysicalType::INT64: EXTRACT_KEYS(int64_t); break;
         case PhysicalType::UINT32: EXTRACT_KEYS(uint32_t); break;

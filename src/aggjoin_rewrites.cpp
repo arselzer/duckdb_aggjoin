@@ -13,7 +13,12 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+
+#include <limits>
 
 namespace duckdb {
 // Optimizer: post-optimize with Projection chain tracing
@@ -50,6 +55,128 @@ static bool ExtractBinding(Expression &expr, ColumnBinding &binding) {
                 return true;
             }
         }
+    }
+    return false;
+}
+
+static bool ExtractStatsBinding(Expression &expr, ColumnBinding &binding) {
+    auto cls = expr.GetExpressionClass();
+    if (cls == ExpressionClass::BOUND_COLUMN_REF) {
+        binding = expr.Cast<BoundColumnRefExpression>().binding;
+        return true;
+    }
+    if (cls == ExpressionClass::BOUND_CAST) {
+        return ExtractStatsBinding(*expr.Cast<BoundCastExpression>().child, binding);
+    }
+    return false;
+}
+
+static bool IsDirectPlannableInteger(PhysicalType type) {
+    switch (type) {
+    case PhysicalType::INT8:
+    case PhysicalType::INT16:
+    case PhysicalType::INT32:
+    case PhysicalType::INT64:
+    case PhysicalType::UINT8:
+    case PhysicalType::UINT16:
+    case PhysicalType::UINT32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool StatsValueToInt64(const Value &value, int64_t &out) {
+    if (value.IsNull()) {
+        return false;
+    }
+    switch (value.type().InternalType()) {
+    case PhysicalType::INT8:
+        out = value.GetValue<int8_t>();
+        return true;
+    case PhysicalType::INT16:
+        out = value.GetValue<int16_t>();
+        return true;
+    case PhysicalType::INT32:
+        out = value.GetValue<int32_t>();
+        return true;
+    case PhysicalType::INT64:
+        out = value.GetValue<int64_t>();
+        return true;
+    case PhysicalType::UINT8:
+        out = value.GetValue<uint8_t>();
+        return true;
+    case PhysicalType::UINT16:
+        out = value.GetValue<uint16_t>();
+        return true;
+    case PhysicalType::UINT32:
+        out = value.GetValue<uint32_t>();
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool TryGetIntegerKeyMinMaxFromStats(ClientContext &context, LogicalOperator &op, ColumnBinding binding,
+                                            int64_t &min_out, int64_t &max_out) {
+    LogicalOperator *cur = &op;
+    while (cur) {
+        if (cur->type == LogicalOperatorType::LOGICAL_GET) {
+            auto &get = cur->Cast<LogicalGet>();
+            if (binding.table_index != get.table_index) {
+                return false;
+            }
+            auto &col_ids = get.GetColumnIds();
+            if (binding.column_index >= col_ids.size()) {
+                return false;
+            }
+            auto col_idx = col_ids[binding.column_index];
+            unique_ptr<BaseStatistics> stats;
+#if __has_include("duckdb/main/extension_callback_manager.hpp")
+            if (get.function.statistics_extended) {
+                TableFunctionGetStatisticsInput input(get.bind_data.get(), col_idx);
+                stats = get.function.statistics_extended(context, input);
+            } else if (get.function.statistics) {
+                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
+            } else {
+                return false;
+            }
+#else
+            if (get.function.statistics) {
+                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
+            } else {
+                return false;
+            }
+#endif
+            if (!stats || !NumericStats::HasMinMax(*stats)) {
+                return false;
+            }
+            int64_t min_value, max_value;
+            if (!StatsValueToInt64(NumericStats::Min(*stats), min_value) ||
+                !StatsValueToInt64(NumericStats::Max(*stats), max_value) ||
+                max_value < min_value) {
+                return false;
+            }
+            min_out = min_value;
+            max_out = max_value;
+            return true;
+        }
+        if (cur->type == LogicalOperatorType::LOGICAL_PROJECTION && cur->children.size() == 1) {
+            auto &proj = cur->Cast<LogicalProjection>();
+            if (binding.table_index != proj.table_index || binding.column_index >= proj.expressions.size()) {
+                return false;
+            }
+            if (!ExtractStatsBinding(*proj.expressions[binding.column_index], binding)) {
+                return false;
+            }
+            cur = cur->children[0].get();
+            continue;
+        }
+        if (cur->children.size() == 1) {
+            cur = cur->children[0].get();
+            continue;
+        }
+        return false;
     }
     return false;
 }
@@ -531,6 +658,63 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         bool direct_like_shape = !has_varlen_key && !has_non_integral_key &&
                                  col.probe_key_cols.size() == 1 &&
                                  (col.group_cols.empty() || group_matches_join_key);
+        if (direct_like_shape && !composite_shape && build_agg_count == 0 && !has_nonnumeric_minmax) {
+            auto &probe_child = *(need_swap ? join->children[1] : join->children[0]);
+            auto &build_child = *(need_swap ? join->children[0] : join->children[1]);
+            auto probe_key_idx = col.probe_key_cols[0];
+            auto build_key_idx = col.build_key_cols[0];
+            if (probe_key_idx < probe_types.size() && build_key_idx < build_types.size() &&
+                IsDirectPlannableInteger(probe_types[probe_key_idx].InternalType()) &&
+                IsDirectPlannableInteger(build_types[build_key_idx].InternalType())) {
+                auto probe_plan_bindings = probe_child.GetColumnBindings();
+                auto build_plan_bindings = build_child.GetColumnBindings();
+                int64_t build_key_min = 0;
+                int64_t build_key_max = 0;
+                if (probe_key_idx < probe_plan_bindings.size() &&
+                    build_key_idx < build_plan_bindings.size() &&
+                    TryGetIntegerKeyMinMaxFromStats(context, build_child,
+                                                    build_plan_bindings[build_key_idx],
+                                                    build_key_min, build_key_max)) {
+                    __int128 range_wide = (__int128)build_key_max - (__int128)build_key_min + 1;
+                    if (range_wide > 0 &&
+                        range_wide <= (__int128)std::numeric_limits<idx_t>::max()) {
+                        auto planned_range = (idx_t)range_wide;
+                        auto na_total = (idx_t)col.agg_funcs.size();
+                        bool would_have_minmax = false;
+                        bool would_have_avg = false;
+                        for (idx_t a = 0; a < na_total; a++) {
+                            if (col.agg_funcs[a] == "MIN" || col.agg_funcs[a] == "MAX") would_have_minmax = true;
+                            if (col.agg_funcs[a] == "AVG") would_have_avg = true;
+                        }
+                        idx_t bytes_per_key = sizeof(idx_t) + sizeof(double) * na_total +
+                                             (would_have_minmax ? (sizeof(double) * 2 + sizeof(uint8_t)) * na_total : 0) +
+                                             (would_have_avg ? sizeof(double) * na_total : 0);
+                        idx_t max_working_set = (col.group_cols.empty() || group_matches_join_key)
+                                                    ? 32 * 1024 * 1024
+                                                    : 16 * 1024 * 1024;
+                        if (group_matches_join_key && !col.group_cols.empty() && na_total == 1 &&
+                            !would_have_minmax && !would_have_avg) {
+                            max_working_set = 48 * 1024 * 1024;
+                        }
+                        idx_t direct_limit = bytes_per_key > 0 ? max_working_set / bytes_per_key : 2000000;
+                        if (direct_limit < 100000) direct_limit = 100000;
+                        if (direct_limit > 8000000) direct_limit = 8000000;
+                        if (planned_range <= direct_limit) {
+                            col.planned_direct_mode = true;
+                            col.planned_direct_key_min = build_key_min;
+                            col.planned_direct_key_range = planned_range;
+                            if (AggJoinTraceEnabled()) {
+                                fprintf(stderr,
+                                        "[AGGJOIN] planned direct build: key_min=%lld range=%llu limit=%llu\n",
+                                        (long long)build_key_min,
+                                        (unsigned long long)planned_range,
+                                        (unsigned long long)direct_limit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         bool large_inputs = probe_est >= 100000 && build_est >= 100000;
         bool huge_inputs = probe_est >= 500000 && build_est >= 500000;
         bool group_known = group_est > 0;

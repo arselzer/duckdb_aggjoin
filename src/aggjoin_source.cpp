@@ -8,7 +8,7 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                                                     GlobalOperatorState &gstate, OperatorState &state) const {
         if (!sink_state) { chunk.SetCardinality(0); return OperatorResultType::NEED_MORE_INPUT; }
         auto &sink = sink_state->Cast<AggJoinSinkState>();
-        if (!sink.finalized || sink.build_ht.mask == 0) {
+        if (!sink.finalized || (!sink.direct_build_without_ht && sink.build_ht.mask == 0)) {
             chunk.SetCardinality(0);
             return OperatorResultType::NEED_MORE_INPUT;
         }
