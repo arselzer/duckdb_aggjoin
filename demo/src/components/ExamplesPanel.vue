@@ -20,7 +20,6 @@ const emit = defineEmits<{ load: [Example] }>()
           <span class="title">{{ ex.title }}</span>
           <span class="tag" :class="ex.kind === 'operator' ? 'amber' : 'cyan'">{{ KIND_LABEL[ex.kind] }}</span>
         </div>
-        <p class="blurb">{{ ex.blurb }}</p>
         <p v-if="ex.dataset" class="ds mono">⤓ bundled dataset · {{ ex.dataset.sizeLabel }}</p>
       </li>
     </ul>
@@ -46,6 +45,5 @@ ul { list-style: none; margin: 0; padding: 10px; display: grid; gap: 8px; }
 .card.busy { pointer-events: none; opacity: 0.6; }
 .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .title { font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; color: var(--text); }
-.blurb { margin: 7px 0 0; font-size: 11.5px; line-height: 1.5; color: var(--text-dim); }
 .ds { margin: 8px 0 0; font-size: 10px; letter-spacing: 0.04em; color: var(--amber); opacity: 0.85; }
 </style>

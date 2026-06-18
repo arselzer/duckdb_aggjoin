@@ -11,7 +11,6 @@ defineProps<{
     <div class="brand">
       <div class="wordmark">
         <h1>AGGJOIN</h1>
-        <p class="sub">aggregate-over-join · in your browser</p>
       </div>
     </div>
 
@@ -47,13 +46,6 @@ defineProps<{
   letter-spacing: 0.12em;
   line-height: 1;
   color: var(--blue);
-}
-.sub {
-  margin: 5px 0 0;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  color: var(--text-faint);
 }
 .status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ghlink:hover { color: var(--amber); border-color: var(--amber-line); }
