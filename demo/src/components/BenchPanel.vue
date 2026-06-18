@@ -21,6 +21,7 @@ const faster = computed(() => (props.bench?.speedup ?? 0) >= 1.05)
 const slower = computed(() => !!props.bench && props.bench.speedup < 0.95)
 
 const planLines = computed(() => (props.bench?.plan ? props.bench.plan.split('\n') : []))
+const nativePlanLines = computed(() => (props.bench?.nativePlan ? props.bench.nativePlan.split('\n') : []))
 
 const rewriteLabel = computed(() => {
   const marker = props.bench?.rewrite
@@ -77,18 +78,33 @@ const rewriteLabel = computed(() => {
         </div>
       </div>
 
-      <div v-if="planLines.length" class="plan">
-        <div class="plan-head">
-          <span class="eyebrow">physical plan · aggjoin on</span>
-          <span v-if="bench.planHasAggjoin" class="tag amber">AGGJOIN node</span>
-        </div>
-        <pre class="mono"><code><span
-          v-for="(ln, i) in planLines"
-          :key="i"
-          class="pln"
-          :class="{ hot: /AGGJOIN/i.test(ln) }"
-        >{{ ln }}
+      <div v-if="planLines.length || nativePlanLines.length" class="plans">
+        <div class="plan-pane">
+          <div class="plan-head">
+            <span class="eyebrow">optimized plan</span>
+            <span v-if="bench.planHasAggjoin" class="tag amber">AGGJOIN node</span>
+          </div>
+          <pre class="mono"><code><span
+            v-for="(ln, i) in planLines"
+            :key="i"
+            class="pln"
+            :class="{ hot: /AGGJOIN/i.test(ln) }"
+          >{{ ln }}
 </span></code></pre>
+        </div>
+
+        <div v-if="nativePlanLines.length" class="plan-pane">
+          <div class="plan-head">
+            <span class="eyebrow">native baseline plan</span>
+            <span class="tag slate">extension off</span>
+          </div>
+          <pre class="mono"><code><span
+            v-for="(ln, i) in nativePlanLines"
+            :key="i"
+            class="pln"
+          >{{ ln }}
+</span></code></pre>
+        </div>
       </div>
     </template>
   </section>
@@ -142,9 +158,15 @@ const rewriteLabel = computed(() => {
 .fill.slate { background: repeating-linear-gradient(45deg, var(--slate) 0 8px, #54616b 8px 16px); }
 .val { text-align: right; font-size: 12px; color: var(--text); font-weight: 500; }
 
-.plan { border-top: 1px solid var(--line); }
+.plans {
+  border-top: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.plan-pane { min-width: 0; }
+.plan-pane + .plan-pane { border-left: 1px solid var(--line); }
 .plan-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px 8px; }
-.plan pre {
+.plan-pane pre {
   margin: 0; padding: 4px 16px 18px; max-height: clamp(440px, 58vh, 720px); overflow: auto;
   font-size: 11.5px; line-height: 1.55; color: var(--text-dim);
 }
@@ -162,5 +184,7 @@ const rewriteLabel = computed(() => {
   .bars { padding: 6px 16px 18px; }
   .row { grid-template-columns: 78px 1fr 66px; gap: 8px; }
   .plan-head { align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+  .plans { grid-template-columns: 1fr; }
+  .plan-pane + .plan-pane { border-left: 0; border-top: 1px solid var(--line); }
 }
 </style>

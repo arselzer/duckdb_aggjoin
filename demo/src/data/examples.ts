@@ -54,19 +54,49 @@ CREATE OR REPLACE TABLE fact AS
 FROM fact JOIN dim ON fact.x = dim.x;`,
   },
   {
-    id: 'grouped-sum',
-    title: 'Grouped SUM by join key',
+    id: 'high-fanout-count',
+    title: '100M-row fanout COUNT',
     kind: 'operator',
     blurb:
-      'The bread-and-butter shape: SUM grouped by the join key. Look for the AGGJOIN node replacing the HASH_GROUP_BY ▸ HASH_JOIN pair.',
-    setup: `CREATE OR REPLACE TABLE keys AS
-  SELECT i AS x FROM range(150000) t(i);
-CREATE OR REPLACE TABLE rows_t AS
-  SELECT (i % 150000) AS x, (i % 500)::DOUBLE AS v
-  FROM range(1500000) t(i);`,
-    query: `SELECT rows_t.x, SUM(rows_t.v) AS s, MIN(rows_t.v) AS lo, MAX(rows_t.v) AS hi
-FROM rows_t JOIN keys ON rows_t.x = keys.x
-GROUP BY rows_t.x;`,
+      'A compact 250-key join expands to 100M rows. The fused operator computes the final count from key frequencies instead of walking the product.',
+    setup: `CREATE OR REPLACE TABLE hf_r AS
+  SELECT (i % 250)::INTEGER AS k FROM range(500000) t(i);
+CREATE OR REPLACE TABLE hf_s AS
+  SELECT (i % 250)::INTEGER AS k FROM range(50000) t(i);`,
+    query: `SELECT COUNT(*) AS join_rows
+FROM hf_r JOIN hf_s ON hf_r.k = hf_s.k;`,
+  },
+  {
+    id: 'banded-count',
+    title: 'Grouped COUNT by band',
+    kind: 'operator',
+    blurb:
+      'A 72M-row fanout grouped into twelve output bands. The optimized plan aggregates at the key level before rolling up to the visible groups.',
+    setup: `CREATE OR REPLACE TABLE band_r AS
+  SELECT (i % 1200)::INTEGER AS k, (i % 12)::INTEGER AS band
+  FROM range(720000) t(i);
+CREATE OR REPLACE TABLE band_s AS
+  SELECT (i % 1200)::INTEGER AS k FROM range(120000) t(i);`,
+    query: `SELECT band_r.band, COUNT(*) AS n
+FROM band_r JOIN band_s ON band_r.k = band_s.k
+GROUP BY band_r.band
+ORDER BY band_r.band;`,
+  },
+  {
+    id: 'chain-aggregate-suite',
+    title: 'Chain aggregate suite',
+    kind: 'cascade',
+    blurb:
+      'SUM, AVG, MIN, and MAX over a 10M-row three-table chain. The cascade computes exact aggregate state while avoiding the expanded join.',
+    setup: `CREATE OR REPLACE TABLE ca AS
+  SELECT i AS k, (i % 97)::DOUBLE AS v FROM range(100000) t(i);
+CREATE OR REPLACE TABLE cb AS
+  SELECT i AS k, (i % 1000)::INTEGER AS j FROM range(100000) t(i);
+CREATE OR REPLACE TABLE cc AS
+  SELECT (i % 1000)::INTEGER AS j FROM range(100000) t(i);`,
+    query: `SELECT SUM(ca.v) AS s, AVG(ca.v) AS a, MIN(ca.v) AS lo, MAX(ca.v) AS hi
+FROM ca, cb, cc
+WHERE ca.k = cb.k AND cb.j = cc.j;`,
   },
   {
     id: 'dblp-graph',

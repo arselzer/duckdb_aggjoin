@@ -142,6 +142,15 @@ function useTable(name: string) {
   activeExampleId.value = null
   runOnce()
 }
+
+function newQuery() {
+  sql.value = '-- write a new aggregate-over-join query\nSELECT 1;'
+  activeExampleId.value = null
+  bench.value = null
+  result.value = null
+  error.value = null
+}
+
 async function dropTable(name: string) {
   await engine.dropTable(name)
   await refreshTables()
@@ -178,7 +187,7 @@ async function dropTable(name: string) {
       </aside>
 
       <div class="main">
-        <SqlPanel v-model="sql" :busy="busy" :ready="ready" @benchmark="runBenchmark" />
+        <SqlPanel v-model="sql" :busy="busy" :ready="ready" @benchmark="runBenchmark" @new-query="newQuery" />
         <BenchPanel :bench="bench" :busy="busy" />
         <ResultsTable :result="result" :error="error" />
       </div>

@@ -41,6 +41,7 @@ export interface BenchResult {
   rewrite: string
   result: QueryResult
   plan: string
+  nativePlan: string
   planHasAggjoin: boolean
   nativeRowCount: number
   rowsMatch: boolean
@@ -181,6 +182,16 @@ export class AggJoinEngine {
     return { ms: best, rowCount }
   }
 
+  private async explain(sql: string): Promise<string> {
+    const ex = await this.c().query(`EXPLAIN ${sql}`)
+    return ex
+      .toArray()
+      .map((r: any) => (r.toJSON ? r.toJSON() : r))
+      .map((o: any) => o.explain_value ?? '')
+      .join('\n')
+      .trim()
+  }
+
   /** Run `sql` with aggjoin on, then native; report both + the plan. */
   async benchmark(sql: string, runs = 3): Promise<BenchResult> {
     const clean = sql.trim().replace(/;\s*$/, '')
@@ -196,13 +207,7 @@ export class AggJoinEngine {
     // EXPLAIN (optimizer still on) — show the physical plan.
     let plan = ''
     try {
-      const ex = await this.c().query(`EXPLAIN ${clean}`)
-      plan = ex
-        .toArray()
-        .map((r: any) => (r.toJSON ? r.toJSON() : r))
-        .map((o: any) => o.explain_value ?? '')
-        .join('\n')
-        .trim()
+      plan = await this.explain(clean)
     } catch { /* EXPLAIN can fail on some statements; non-fatal */ }
 
     let rewrite = ''
@@ -214,7 +219,11 @@ export class AggJoinEngine {
     // --- native (aggjoin OFF) ---
     await this.setOptimizer(false)
     let nat: { ms: number; rowCount: number }
+    let nativePlan = ''
     try {
+      try {
+        nativePlan = await this.explain(clean)
+      } catch { /* non-fatal */ }
       nat = await this.measureAdaptive(clean, runs)
     } finally {
       await this.setOptimizer(true) // always restore
@@ -228,6 +237,7 @@ export class AggJoinEngine {
       rewrite,
       result: display,
       plan,
+      nativePlan,
       planHasAggjoin: /AGGJOIN/i.test(plan),
       nativeRowCount: nat.rowCount,
       rowsMatch: nat.rowCount === display.rowCount,
