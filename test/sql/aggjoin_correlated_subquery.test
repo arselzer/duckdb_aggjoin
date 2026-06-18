@@ -1,0 +1,55 @@
+# name: test/sql/aggjoin_correlated_subquery.test
+# description: aggjoin must DECLINE aggregates whose input subtree contains a
+#   correlated-subquery decorrelation (DELIM_JOIN / DELIM_GET / DEPENDENT_JOIN).
+#   Firing there drops the correlation and returns wrong results -- the validation
+#   that found this hit TPC-H q02 (dropped all rows -> 0) and q17 (~100x inflated:
+#   the subquery AVG was computed over the wrong relation, so the outer
+#   `l_quantity < AVG` filter passed everything). The fix is a conservative gate in
+#   WalkAndReplace (SubtreeHasDelim) that bails every aggjoin rewrite for such an
+#   aggregate. This test reproduces the q17 SHAPE on small synthetic data: the
+#   wrong-value only manifests at large scale (the subquery join must cross the
+#   operator's gate), but the fire-marker assertion locks in the bail at any scale
+#   -- removing the guard makes the operator fire ('fused') here again.
+# group: [aggjoin]
+# differential: skip
+#   Uses aggjoin_last_rewrite() fire-assertions (meaningless with the optimizer off).
+
+require aggjoin
+
+statement ok
+CREATE TABLE p(pk INT, brand INT);
+
+statement ok
+INSERT INTO p SELECT i, 1 FROM range(20000) t(i);
+
+statement ok
+CREATE TABLE l(pk INT, qty INT, price INT);
+
+# Each pk gets 10 rows: the first batch (i < 20000) has the LOW qty=1, the other 9
+# have qty=10; price=100 throughout. avg(qty) per pk = 9.1, so 0.2*avg = 1.82, and
+# only the qty=1 row passes `qty < 0.2*avg`. Correct filtered SUM = 20000 * 100 =
+# 2,000,000; the filter-dropped (buggy) SUM would be 20000 * 10 * 100 = 20,000,000.
+statement ok
+INSERT INTO l SELECT i % 20000, CASE WHEN i < 20000 THEN 1 ELSE 10 END, 100 FROM range(200000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+# Correct (filtered) result -- the correlated-subquery filter must be honoured.
+query I
+SELECT sum(l.price) FROM l, p
+WHERE p.pk = l.pk AND p.brand = 1
+  AND l.qty < (SELECT 0.2 * avg(l2.qty) FROM l l2 WHERE l2.pk = p.pk);
+----
+2000000
+
+# No aggjoin rewrite may fire on a correlated-subquery aggregate: the operator used
+# to fire 'fused' here (and silently mis-handles the DELIM_GET at scale). The guard
+# makes every rewrite decline -> marker is no longer 'fused'. (Asserting != 'fused'
+# rather than a specific value: the planner gate may independently decline this
+# small fixture; what this locks in is that the operator never fires through the
+# delim. Before the fix the marker was 'fused' here.)
+query T
+SELECT aggjoin_last_rewrite() != 'fused';
+----
+true

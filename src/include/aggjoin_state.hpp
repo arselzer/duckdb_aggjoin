@@ -40,8 +40,11 @@ struct AggJoinSinkState : public GlobalSinkState {
     // Direct mode MIN/MAX: flat arrays indexed by key offset
     vector<double> direct_mins; // [key_offset * num_aggs + agg]
     vector<double> direct_maxs;
-    vector<uint8_t> direct_has; // [key_offset * num_aggs + agg] — whether min/max initialized
+    // [agg * key_range + key_offset] — MIN/MAX initialized, or (for SUM) a
+    // non-NULL input value was seen. SUM over an all-NULL group must emit NULL.
+    vector<uint8_t> direct_has;
     bool has_min_max = false;   // Whether any aggregate is MIN or MAX
+    bool has_sum = false;       // Whether any aggregate is SUM (needs direct_has)
     idx_t num_aggs = 0;
     bool track_active_keys = false;          // Track matched key offsets for grouped direct emit
     vector<uint8_t> direct_key_seen;         // [key_offset] → whether key was seen on probe side
@@ -55,7 +58,9 @@ struct AggJoinSinkState : public GlobalSinkState {
     vector<unsafe_vector<uint32_t>> segmented_build_counts; // [segment][local_key]
     vector<unsafe_vector<double>> segmented_sums;           // [segment][local_key]
     vector<unsafe_vector<double>> segmented_avg_counts;     // [segment][local_key] for AVG
+    vector<unsafe_vector<uint8_t>> segmented_sum_has;       // [segment][local_key] non-NULL seen (SUM)
     vector<unsafe_vector<double>> segmented_multi_accums;   // [segment][local_key * accum_slots + slot]
+    vector<unsafe_vector<uint8_t>> segmented_multi_accum_has; // [segment][local_key * accum_slots + slot] non-NULL seen (SUM)
     vector<unsafe_vector<double>> segmented_multi_avg_counts; // [segment][local_key * avg_slots + slot]
     vector<unsafe_vector<double>> segmented_multi_mins;     // [segment][local_key * min_slots + slot]
     vector<unsafe_vector<double>> segmented_multi_maxs;     // [segment][local_key * max_slots + slot]
@@ -97,7 +102,10 @@ struct AggJoinSinkState : public GlobalSinkState {
     mutable vector<double> ungrouped_count; // [agg] running count (AVG denominator)
     mutable vector<double> ungrouped_min;   // [agg] running MIN
     mutable vector<double> ungrouped_max;   // [agg] running MAX
-    mutable vector<uint8_t> ungrouped_has;  // [agg] whether MIN/MAX initialized
+    mutable vector<uint8_t> ungrouped_has;  // [agg] MIN/MAX initialized / SUM non-NULL seen
+    // Set when the slow-path probe loops accumulated an ungrouped aggregate
+    // into the per-key arrays; emit folds them into the scalars above once.
+    mutable bool ungrouped_per_key = false;
 
     // ── Build-slot hash mode: accumulators keyed directly by build_ht bucket ──
     vector<double> build_slot_sums;

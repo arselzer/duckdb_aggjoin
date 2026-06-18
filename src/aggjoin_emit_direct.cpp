@@ -77,9 +77,15 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                 if (f == "AVG") {
                     auto sum = sink.segmented_multi_accums[seg][local * sink.segmented_accum_slots + sink.segmented_accum_index[a]];
                     auto count = sink.segmented_multi_avg_counts[seg][local * sink.segmented_avg_slots + sink.segmented_avg_index[a]];
-                    auto v = count > 0 ? sum / count : 0.0;
-                    if (dst) dst[i] = v;
-                    else chunk.data[out_idx].SetValue(i, Value::DOUBLE(v));
+                    if (count <= 0) {
+                        // AVG over a group whose inputs were all NULL is NULL.
+                        if (dst) validity.SetInvalid(i);
+                        else chunk.data[out_idx].SetValue(i, Value());
+                    } else if (dst) {
+                        dst[i] = sum / count;
+                    } else {
+                        chunk.data[out_idx].SetValue(i, Value::DOUBLE(sum / count));
+                    }
                 } else if (f == "MIN") {
                     auto slot = local * sink.segmented_min_slots + sink.segmented_min_index[a];
                     if (sink.segmented_multi_min_has[seg][slot]) {
@@ -95,9 +101,16 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                         validity.SetInvalid(i);
                     }
                 } else {
-                    auto sum = sink.segmented_multi_accums[seg][local * sink.segmented_accum_slots + sink.segmented_accum_index[a]];
-                    if (out_type == PhysicalType::INT64) chunk.data[out_idx].SetValue(i, Value::BIGINT((int64_t)sum));
-                    else dst[i] = sum;
+                    auto slot_idx = local * sink.segmented_accum_slots + sink.segmented_accum_index[a];
+                    auto sum = sink.segmented_multi_accums[seg][slot_idx];
+                    if (f == "SUM" && !sink.segmented_multi_accum_has[seg][slot_idx]) {
+                        // SUM over a group whose inputs were all NULL is NULL.
+                        validity.SetInvalid(i);
+                    } else if (out_type == PhysicalType::INT64) {
+                        chunk.data[out_idx].SetValue(i, Value::BIGINT((int64_t)sum));
+                    } else {
+                        dst[i] = sum;
+                    }
                 }
             }
         }
@@ -115,7 +128,9 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                 if (sink.segmented_direct_mode) {
                     src.direct_keys = sink.segmented_active_keys;
                 } else if (sink.group_is_key) {
-                    if (!sink.direct_active_keys.empty()) {
+                    if (sink.track_active_keys) {
+                        // Probe-matched keys only: build keys with zero probe
+                        // matches are not inner-join groups (phantom rows).
                         src.direct_keys = sink.direct_active_keys;
                     } else {
                         for (idx_t k = 0; k < sink.key_range; k++) {
@@ -136,11 +151,41 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                 return true;
             }
             auto na = col.agg_funcs.size();
+            if (sink.ungrouped_per_key) {
+                // The slow-path probe loops accumulate ungrouped aggregates per
+                // key; fold the per-key arrays into the scalar accumulators once.
+                sink.ungrouped_per_key = false;
+                auto kr = sink.key_range;
+                for (idx_t a = 0; a < na; a++) {
+                    auto &f = col.agg_funcs[a];
+                    for (idx_t k = 0; k < kr; k++) {
+                        if (f == "MIN" || f == "MAX") {
+                            if (sink.direct_has.empty() || !sink.direct_has[a * kr + k]) continue;
+                            double mv = (f == "MIN") ? sink.direct_mins[a * kr + k] : sink.direct_maxs[a * kr + k];
+                            if (!sink.ungrouped_has[a] ||
+                                (f == "MIN" ? mv < sink.ungrouped_min[a] : mv > sink.ungrouped_max[a])) {
+                                if (f == "MIN") sink.ungrouped_min[a] = mv;
+                                else sink.ungrouped_max[a] = mv;
+                            }
+                            sink.ungrouped_has[a] = 1;
+                        } else {
+                            sink.ungrouped_sum[a] += sink.direct_sums[a * kr + k];
+                            if (f == "AVG" && !sink.direct_counts.empty()) {
+                                sink.ungrouped_count[a] += sink.direct_counts[a * kr + k];
+                            }
+                            if (f == "SUM" && !sink.direct_has.empty() && sink.direct_has[a * kr + k]) {
+                                sink.ungrouped_has[a] = 1;
+                            }
+                        }
+                    }
+                }
+            }
             for (idx_t a = 0; a < na; a++) {
                 auto &f = col.agg_funcs[a];
                 if (f == "AVG") {
+                    // AVG/SUM with no non-NULL input emit NULL, matching native.
                     chunk.data[a].SetValue(0, sink.ungrouped_count[a] > 0 ? Value::DOUBLE(sink.ungrouped_sum[a] / sink.ungrouped_count[a])
-                                                                          : Value::DOUBLE(0.0));
+                                                                          : Value());
                 } else if (f == "MIN") {
                     if (sink.ungrouped_has[a]) chunk.data[a].SetValue(0, Value::DOUBLE(sink.ungrouped_min[a]));
                     else chunk.data[a].SetValue(0, Value());
@@ -149,6 +194,8 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                     else chunk.data[a].SetValue(0, Value());
                 } else if (chunk.data[a].GetType().InternalType() == PhysicalType::INT64) {
                     chunk.data[a].SetValue(0, Value::BIGINT((int64_t)sink.ungrouped_sum[a]));
+                } else if (f == "SUM" && !sink.ungrouped_has[a]) {
+                    chunk.data[a].SetValue(0, Value());
                 } else {
                     chunk.data[a].SetValue(0, Value::DOUBLE(sink.ungrouped_sum[a]));
                 }
@@ -242,34 +289,39 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
             if (f == "AVG") {
                 auto *sums = sink.segmented_direct_mode ? nullptr : sink.direct_sums.data() + a * sink.key_range;
                 auto *counts = sink.segmented_direct_mode ? nullptr : sink.direct_counts.data() + a * sink.key_range;
+                auto &validity = FlatVector::Validity(chunk.data[out_idx]);
                 if (out_type == PhysicalType::DOUBLE) {
                     auto *dst = FlatVector::GetData<double>(chunk.data[out_idx]);
                     for (idx_t i = 0; i < batch; i++) {
                         auto k = src.direct_keys[src.pos + i];
+                        double sum, cnt;
                         if (sink.segmented_direct_mode) {
                             auto seg = k >> sink.segmented_shift;
                             auto local = k & sink.segmented_mask;
-                            auto sum = sink.segmented_sums[seg][local];
-                            auto cnt = sink.segmented_avg_counts[seg][local];
-                            dst[i] = cnt > 0 ? sum / cnt : 0.0;
+                            sum = sink.segmented_sums[seg][local];
+                            cnt = sink.segmented_avg_counts[seg][local];
                         } else {
-                            dst[i] = counts[k] > 0 ? sums[k] / counts[k] : 0.0;
+                            sum = sums[k];
+                            cnt = counts[k];
                         }
+                        // AVG over a group whose inputs were all NULL is NULL.
+                        if (cnt > 0) dst[i] = sum / cnt;
+                        else validity.SetInvalid(i);
                     }
                 } else {
                     for (idx_t i = 0; i < batch; i++) {
                         auto k = src.direct_keys[src.pos + i];
-                        double v = 0.0;
+                        double sum, cnt;
                         if (sink.segmented_direct_mode) {
                             auto seg = k >> sink.segmented_shift;
                             auto local = k & sink.segmented_mask;
-                            auto sum = sink.segmented_sums[seg][local];
-                            auto cnt = sink.segmented_avg_counts[seg][local];
-                            v = cnt > 0 ? sum / cnt : 0.0;
+                            sum = sink.segmented_sums[seg][local];
+                            cnt = sink.segmented_avg_counts[seg][local];
                         } else {
-                            v = counts[k] > 0 ? sums[k] / counts[k] : 0.0;
+                            sum = sums[k];
+                            cnt = counts[k];
                         }
-                        chunk.data[out_idx].SetValue(i, Value::DOUBLE(v));
+                        chunk.data[out_idx].SetValue(i, cnt > 0 ? Value::DOUBLE(sum / cnt) : Value());
                     }
                 }
             } else if (f == "MIN" || f == "MAX") {
@@ -305,6 +357,18 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                 }
             } else {
                 auto *sums = sink.segmented_direct_mode ? nullptr : sink.direct_sums.data() + a * sink.key_range;
+                // SUM over a group whose inputs were all NULL is NULL; COUNT stays 0.
+                bool is_sum = (f == "SUM");
+                auto *sum_has = (is_sum && !sink.direct_has.empty()) ? sink.direct_has.data() + a * sink.key_range : nullptr;
+                auto &validity = FlatVector::Validity(chunk.data[out_idx]);
+                auto sum_is_null = [&](idx_t k) {
+                    if (!is_sum) return false;
+                    if (sink.segmented_direct_mode) {
+                        return sink.segmented_sum_has.empty() ||
+                               !sink.segmented_sum_has[k >> sink.segmented_shift][k & sink.segmented_mask];
+                    }
+                    return !sum_has || !sum_has[k];
+                };
                 if (out_type == PhysicalType::INT64) {
                     auto *dst = FlatVector::GetData<int64_t>(chunk.data[out_idx]);
                     for (idx_t i = 0; i < batch; i++) {
@@ -321,6 +385,10 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                     auto *dst = FlatVector::GetData<double>(chunk.data[out_idx]);
                     for (idx_t i = 0; i < batch; i++) {
                         auto k = src.direct_keys[src.pos + i];
+                        if (sum_is_null(k)) {
+                            validity.SetInvalid(i);
+                            continue;
+                        }
                         if (sink.segmented_direct_mode) {
                             auto seg = k >> sink.segmented_shift;
                             auto local = k & sink.segmented_mask;
@@ -332,6 +400,10 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                 } else {
                     for (idx_t i = 0; i < batch; i++) {
                         auto k = src.direct_keys[src.pos + i];
+                        if (sum_is_null(k)) {
+                            chunk.data[out_idx].SetValue(i, Value());
+                            continue;
+                        }
                         double v = sink.segmented_direct_mode
                                        ? sink.segmented_sums[k >> sink.segmented_shift][k & sink.segmented_mask]
                                        : sums[k];
@@ -401,18 +473,21 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
             auto out_idx = 1 + a;
             auto out_type = chunk.data[out_idx].GetType().InternalType();
             if (f == "AVG") {
+                auto &validity = FlatVector::Validity(chunk.data[out_idx]);
                 if (out_type == PhysicalType::DOUBLE) {
                     auto *dst = FlatVector::GetData<double>(chunk.data[out_idx]);
                     for (idx_t i = 0; i < batch; i++) {
                         auto off = a * cap + src.slot_indices[src.pos + i];
                         auto cnt = sink.build_slot_counts[off];
-                        dst[i] = cnt > 0 ? sink.build_slot_sums[off] / cnt : 0.0;
+                        // AVG over a group whose inputs were all NULL is NULL.
+                        if (cnt > 0) dst[i] = sink.build_slot_sums[off] / cnt;
+                        else validity.SetInvalid(i);
                     }
                 } else {
                     for (idx_t i = 0; i < batch; i++) {
                         auto off = a * cap + src.slot_indices[src.pos + i];
                         auto cnt = sink.build_slot_counts[off];
-                        chunk.data[out_idx].SetValue(i, Value::DOUBLE(cnt > 0 ? sink.build_slot_sums[off] / cnt : 0.0));
+                        chunk.data[out_idx].SetValue(i, cnt > 0 ? Value::DOUBLE(sink.build_slot_sums[off] / cnt) : Value());
                     }
                 }
             } else if (f == "MIN" || f == "MAX") {
@@ -439,6 +514,9 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                     }
                 }
             } else {
+                // SUM over a group whose inputs were all NULL is NULL; COUNT stays 0.
+                bool is_sum = (f == "SUM");
+                auto &validity = FlatVector::Validity(chunk.data[out_idx]);
                 if (out_type == PhysicalType::INT64) {
                     auto *dst = FlatVector::GetData<int64_t>(chunk.data[out_idx]);
                     for (idx_t i = 0; i < batch; i++) {
@@ -449,11 +527,19 @@ bool TryEmitDirectLikeResult(const PhysicalAggJoin &op, DataChunk &chunk, AggJoi
                     auto *dst = FlatVector::GetData<double>(chunk.data[out_idx]);
                     for (idx_t i = 0; i < batch; i++) {
                         auto off = a * cap + src.slot_indices[src.pos + i];
+                        if (is_sum && !sink.build_slot_has[off]) {
+                            validity.SetInvalid(i);
+                            continue;
+                        }
                         dst[i] = sink.build_slot_sums[off];
                     }
                 } else {
                     for (idx_t i = 0; i < batch; i++) {
                         auto off = a * cap + src.slot_indices[src.pos + i];
+                        if (is_sum && !sink.build_slot_has[off]) {
+                            chunk.data[out_idx].SetValue(i, Value());
+                            continue;
+                        }
                         chunk.data[out_idx].SetValue(i, Value::DOUBLE(sink.build_slot_sums[off]));
                     }
                 }

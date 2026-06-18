@@ -1,0 +1,160 @@
+# name: test/sql/aggjoin_count_int_paths.test
+# description: Regression coverage for adjacent wrong-result shapes found while
+#              fixing the NULL/phantom bugs:
+#              - COUNT(col) must count matched non-NULL rows, never sum the
+#                values (direct fallback + generic hash path accumulated
+#                vals*bc for COUNT)
+#              - MIN/MAX over non-DOUBLE inputs crashed the typed fast path
+#                (GetData<double> on an INT vector)
+#              - ungrouped aggregates with non-DOUBLE inputs accumulated
+#                per-key but emitted the untouched scalar accumulators (0)
+#              - build-side COUNT(col) was double-counted (probe COUNT_STAR
+#                slot + build-agg loop)
+# group: [aggjoin]
+
+require aggjoin
+
+# NULLs keep DuckDB's stats from rewriting COUNT(col) into COUNT(*).
+statement ok
+CREATE TABLE ri (x INT, ival INT);
+
+statement ok
+INSERT INTO ri VALUES (1, 10), (1, NULL), (2, 30);
+
+statement ok
+CREATE TABLE si (x INT);
+
+statement ok
+INSERT INTO si VALUES (1), (2);
+
+# ── COUNT(int col) — direct fallback path (was: sum of values) ──
+
+query II rowsort
+SELECT ri.x, COUNT(ri.ival) FROM ri JOIN si ON ri.x = si.x GROUP BY ri.x;
+----
+1	1
+2	1
+
+# ── COUNT(int col) ungrouped — fallback per-key fold (was: 0) ──
+
+query I
+SELECT COUNT(ri.ival) FROM ri JOIN si ON ri.x = si.x;
+----
+2
+
+# ── MIN/MAX(int col) — was an internal error / DB invalidation ──
+
+query III rowsort
+SELECT ri.x, MIN(ri.ival), MAX(ri.ival) FROM ri JOIN si ON ri.x = si.x GROUP BY ri.x;
+----
+1	10	10
+2	30	30
+
+query II
+SELECT MIN(ri.ival), MAX(ri.ival) FROM ri JOIN si ON ri.x = si.x;
+----
+10	30
+
+# MIN/MAX(int) with an all-NULL group
+statement ok
+CREATE TABLE rin (x INT, ival INT);
+
+statement ok
+INSERT INTO rin VALUES (1, NULL), (2, 30);
+
+query IIII rowsort
+SELECT rin.x, MIN(rin.ival), MAX(rin.ival), COUNT(rin.ival)
+FROM rin JOIN si ON rin.x = si.x GROUP BY rin.x;
+----
+1	NULL	NULL	0
+2	30	30	1
+
+# ── COUNT(col with NULLs) — generic hash path (composite key + AVG) ──
+
+statement ok
+CREATE TABLE rh (x INT, y INT, val DOUBLE);
+
+statement ok
+INSERT INTO rh VALUES (1, 1, NULL), (2, 2, 8.0), (2, 2, 9.0);
+
+statement ok
+CREATE TABLE sh (x INT, y INT);
+
+statement ok
+INSERT INTO sh VALUES (1, 1), (2, 2);
+
+query IIII rowsort
+SELECT rh.x, rh.y, COUNT(rh.val), CAST(AVG(rh.val) * 2 AS INTEGER)
+FROM rh JOIN sh ON rh.x = sh.x AND rh.y = sh.y GROUP BY rh.x, rh.y;
+----
+1	1	0	NULL
+2	2	2	17
+
+# ── COUNT(col with NULLs) — build_slot path (DOUBLE group key) ──
+
+statement ok
+CREATE TABLE rd (k DOUBLE, val DOUBLE);
+
+statement ok
+INSERT INTO rd VALUES (1.5, NULL), (2.5, 7.0), (2.5, 6.0);
+
+statement ok
+CREATE TABLE sd (k DOUBLE);
+
+statement ok
+INSERT INTO sd VALUES (1.5), (2.5);
+
+query II rowsort
+SELECT CAST(rd.k * 2 AS INTEGER), COUNT(rd.val)
+FROM rd JOIN sd ON rd.k = sd.k GROUP BY rd.k;
+----
+3	0
+5	2
+
+# ── Build-side COUNT(col) — was double-counted ──
+
+statement ok
+CREATE TABLE pb (x INT);
+
+statement ok
+INSERT INTO pb VALUES (1), (2);
+
+statement ok
+CREATE TABLE bb (x INT, bval DOUBLE);
+
+statement ok
+INSERT INTO bb VALUES (1, NULL), (1, 4.0), (2, 6.0);
+
+query III rowsort
+SELECT pb.x, COUNT(bb.bval), CAST(SUM(bb.bval) AS INTEGER)
+FROM pb JOIN bb ON pb.x = bb.x GROUP BY pb.x;
+----
+1	1	4
+2	1	6
+
+query II
+SELECT COUNT(bb.bval), CAST(SUM(bb.bval) AS INTEGER)
+FROM pb JOIN bb ON pb.x = bb.x;
+----
+2	10
+
+# ── Native-HT path sanity: duplicate build keys + MIN must stay unscaled ──
+
+statement ok
+CREATE TABLE rmm (x INT, y INT, ival INT, val DOUBLE);
+
+statement ok
+INSERT INTO rmm VALUES (1, 1, 7, 10.0), (2, 2, 9, 20.0);
+
+statement ok
+CREATE TABLE smm (x INT, y INT);
+
+statement ok
+INSERT INTO smm VALUES (1, 1), (1, 1), (1, 1), (2, 2);
+
+query IIIII rowsort
+SELECT rmm.x, rmm.y, CAST(SUM(rmm.val) AS INTEGER), MIN(rmm.ival), MAX(rmm.ival)
+FROM rmm JOIN smm ON rmm.x = smm.x AND rmm.y = smm.y GROUP BY rmm.x, rmm.y;
+----
+1	1	30	7	7
+2	2	20	9	9

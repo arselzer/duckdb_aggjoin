@@ -1,0 +1,153 @@
+:root {
+  --font-display: 'Martian Mono', ui-monospace, monospace;
+  --font-body: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+
+  --ink: #08090a;
+  --ink-2: #0c0e10;
+  --panel: #101316;
+  --panel-2: #161a1e;
+  --panel-3: #1c2127;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.14);
+
+  --text: #e8eaeb;
+  --text-dim: #9aa1a8;
+  --text-faint: #616971;
+
+  --amber: #f5b417;
+  --amber-bright: #ffc63a;
+  --amber-soft: rgba(245, 180, 23, 0.13);
+  --amber-line: rgba(245, 180, 23, 0.32);
+
+  --slate: #66747f;
+  --slate-soft: rgba(102, 116, 127, 0.18);
+  --green: #57d49b;
+  --red: #ec6a4f;
+  --cyan: #58c6d6;
+
+  --r: 4px;
+  --r-lg: 9px;
+  --shadow: 0 18px 50px -22px rgba(0, 0, 0, 0.9);
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background-color: var(--ink);
+  background-image:
+    radial-gradient(900px 520px at 12% -8%, rgba(245, 180, 23, 0.09), transparent 60%),
+    radial-gradient(800px 600px at 100% 0%, rgba(88, 198, 214, 0.05), transparent 55%),
+    linear-gradient(transparent 0, transparent calc(100% - 1px), var(--line) 100%),
+    linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), var(--line) 100%);
+  background-size: auto, auto, 100% 46px, 46px 100%;
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Film-grain overlay for instrument texture. */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.035;
+  mix-blend-mode: screen;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+a { color: var(--amber); text-decoration: none; }
+a:hover { color: var(--amber-bright); }
+
+::selection { background: var(--amber); color: #000; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--slate); background-clip: content-box; }
+
+button { font-family: inherit; cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+
+/* ---- shared instrument primitives ---- */
+
+.panel {
+  background: linear-gradient(180deg, var(--panel), var(--ink-2));
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.mono { font-family: var(--font-mono); }
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  color: var(--text-dim);
+}
+.tag.amber { color: var(--amber); border-color: var(--amber-line); background: var(--amber-soft); }
+.tag.green { color: var(--green); border-color: rgba(87, 212, 155, 0.3); background: rgba(87, 212, 155, 0.1); }
+.tag.slate { color: var(--slate); }
+
+.dot { width: 7px; height: 7px; border-radius: 99px; background: currentColor; box-shadow: 0 0 8px currentColor; }
+
+/* ---- motion ---- */
+
+@keyframes reveal {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.reveal { animation: reveal 0.6s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+@keyframes barGrow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+@keyframes blink { 50% { opacity: 0; } }
+
+@keyframes shimmer {
+  0% { background-position: -180% 0; }
+  100% { background-position: 180% 0; }
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.7s linear infinite; }
+
+@keyframes glow {
+  0%, 100% { text-shadow: 0 0 24px rgba(245, 180, 23, 0.35); }
+  50% { text-shadow: 0 0 40px rgba(245, 180, 23, 0.6); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}

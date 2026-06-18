@@ -1,0 +1,101 @@
+# name: test/sql/aggjoin_path_toggle.test
+# group: [aggjoin]
+# description: Per-path enable/disable.  The extension bundles two mechanisms in
+#   one optimizer pass: the native-lowering Yannakakis frequency CASCADE and the
+#   fused PhysicalAggJoin OPERATOR.  aggjoin_set_cascade_enabled /
+#   aggjoin_set_operator_enabled toggle them independently, so a deployment can
+#   run the proven exact cascade while keeping the fused operator off.
+# differential: skip
+#   Uses fire-assertion markers + the runtime toggles, both extension-only.
+
+require aggjoin
+
+# A 3-table blow-up chain: 60k x 60k is 1:1 on k, then x100 fan-out on j, so the
+# join blows up to 6,000,000 rows and the chain-count cascade fires by default.
+statement ok
+CREATE TABLE pt0(k INT);
+
+statement ok
+CREATE TABLE pt1(k INT, j INT);
+
+statement ok
+CREATE TABLE pt2(j INT);
+
+statement ok
+INSERT INTO pt0 SELECT i FROM range(60000) t(i);
+
+statement ok
+INSERT INTO pt1 SELECT i, i % 600 FROM range(60000) t(i);
+
+statement ok
+INSERT INTO pt2 SELECT i % 600 FROM range(60000) t(i);
+
+# --- default: the cascade fires ---
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM pt0, pt1, pt2 WHERE pt0.k = pt1.k AND pt1.j = pt2.j;
+----
+6000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# --- disable the cascade: SAME correct count, no longer via the cascade (the
+#     fused operator picks it up) ---
+statement ok
+SELECT aggjoin_set_cascade_enabled(false);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM pt0, pt1, pt2 WHERE pt0.k = pt1.k AND pt1.j = pt2.j;
+----
+6000000
+
+query T
+SELECT aggjoin_last_rewrite() = 'chain_count';
+----
+false
+
+# --- disable BOTH: pure native, correct result, no aggjoin rewrite at all ---
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM pt0, pt1, pt2 WHERE pt0.k = pt1.k AND pt1.j = pt2.j;
+----
+6000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+# --- re-enable the cascade only: it fires again, operator still off ---
+statement ok
+SELECT aggjoin_set_cascade_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM pt0, pt1, pt2 WHERE pt0.k = pt1.k AND pt1.j = pt2.j;
+----
+6000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# restore both for any later tests in the same run
+statement ok
+SELECT aggjoin_set_operator_enabled(true);

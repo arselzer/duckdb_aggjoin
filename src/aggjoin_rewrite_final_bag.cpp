@@ -346,9 +346,25 @@ bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer
                                                          pattern.bridge_bindings[pattern.bridge_tail_key_idx]);
     tail_cond.right = make_uniq<BoundColumnRefExpression>(pattern.tail_types[pattern.tail_key_idx],
                                                           pattern.tail_bindings[pattern.tail_key_idx]);
-    if (pattern.bridge_types[pattern.bridge_tail_key_idx] != pattern.tail_types[pattern.tail_key_idx]) {
-        tail_cond.right = BoundCastExpression::AddCastToType(context, std::move(tail_cond.right),
-                                                             pattern.bridge_types[pattern.bridge_tail_key_idx]);
+    {
+        // Reconcile a mismatched bridge/tail key type by widening BOTH sides to
+        // the common super-type (matching DuckDB's binder). Never narrow the wider
+        // side down to the other — a narrowing cast can raise an out-of-range error
+        // or merge distinct keys (double-counting). (Review bug D, 2026-06-15.)
+        auto lt = pattern.bridge_types[pattern.bridge_tail_key_idx];
+        auto rt = pattern.tail_types[pattern.tail_key_idx];
+        if (lt != rt) {
+            LogicalType super;
+            if (!LogicalType::TryGetMaxLogicalType(context, lt, rt, super)) {
+                return false;
+            }
+            if (lt != super) {
+                tail_cond.left = BoundCastExpression::AddCastToType(context, std::move(tail_cond.left), super);
+            }
+            if (rt != super) {
+                tail_cond.right = BoundCastExpression::AddCastToType(context, std::move(tail_cond.right), super);
+            }
+        }
     }
     tail_join->conditions.push_back(std::move(tail_cond));
     tail_join->children.push_back(std::move(bridge_child));
@@ -414,9 +430,22 @@ bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer
     final_cond.comparison = ExpressionType::COMPARE_EQUAL;
     final_cond.left = make_uniq<BoundColumnRefExpression>(head_preagg->types[0], ColumnBinding(head_group_index, 0));
     final_cond.right = make_uniq<BoundColumnRefExpression>(tail_preagg->types[0], ColumnBinding(tail_group_index, 0));
-    if (head_preagg->types[0] != tail_preagg->types[0]) {
-        final_cond.right = BoundCastExpression::AddCastToType(context, std::move(final_cond.right),
-                                                              head_preagg->types[0]);
+    {
+        // Widen both final-join keys to the common super-type (see bug D above).
+        auto lt = head_preagg->types[0];
+        auto rt = tail_preagg->types[0];
+        if (lt != rt) {
+            LogicalType super;
+            if (!LogicalType::TryGetMaxLogicalType(context, lt, rt, super)) {
+                return false;
+            }
+            if (lt != super) {
+                final_cond.left = BoundCastExpression::AddCastToType(context, std::move(final_cond.left), super);
+            }
+            if (rt != super) {
+                final_cond.right = BoundCastExpression::AddCastToType(context, std::move(final_cond.right), super);
+            }
+        }
     }
     final_join->conditions.push_back(std::move(final_cond));
     final_join->children.push_back(std::move(head_preagg));
@@ -633,6 +662,7 @@ bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer
                 agg.groups.size(), agg.expressions.size(), (unsigned long long)head_est,
                 (unsigned long long)bridge_est, (unsigned long long)tail_est, (unsigned long long)group_est);
     }
+    SetAggJoinLastRewrite("final_bag");
     op = std::move(replacement);
     return true;
 }

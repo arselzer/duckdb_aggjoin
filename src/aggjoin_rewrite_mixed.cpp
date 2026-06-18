@@ -319,7 +319,19 @@ bool TryRewriteNativeMixedSidePreagg(ClientContext &context, Optimizer &optimize
         cond.left = make_uniq<BoundColumnRefExpression>(probe_preagg->types[i], ColumnBinding(probe_group_index, i));
         cond.right = make_uniq<BoundColumnRefExpression>(build_preagg->types[i], ColumnBinding(build_group_index, i));
         if (probe_preagg->types[i] != build_preagg->types[i]) {
-            cond.right = BoundCastExpression::AddCastToType(context, std::move(cond.right), probe_preagg->types[i]);
+            // Widen both keys to the common super-type, never narrow. (Review bug D, 2026-06-15.)
+            auto lt = probe_preagg->types[i];
+            auto rt = build_preagg->types[i];
+            LogicalType super;
+            if (!LogicalType::TryGetMaxLogicalType(context, lt, rt, super)) {
+                return false;
+            }
+            if (lt != super) {
+                cond.left = BoundCastExpression::AddCastToType(context, std::move(cond.left), super);
+            }
+            if (rt != super) {
+                cond.right = BoundCastExpression::AddCastToType(context, std::move(cond.right), super);
+            }
         }
         native_join->conditions.push_back(std::move(cond));
     }
@@ -554,6 +566,7 @@ bool TryRewriteNativeMixedSidePreagg(ClientContext &context, Optimizer &optimize
                 join.conditions.size(), agg.groups.size(), agg.expressions.size(), (unsigned long long)probe_est,
                 (unsigned long long)build_est, (unsigned long long)group_est);
     }
+    SetAggJoinLastRewrite("native_mixed");
     op = std::move(replacement);
     return true;
 }

@@ -252,7 +252,10 @@ SourceResultType PhysicalAggJoin::AGGJOIN_GETDATA(ExecutionContext &ctx, DataChu
             } else if (f == "MAX") {
                 v = rht.GetHas(slot, a) ? Value(rht.Max(slot, a)) : Value();
             } else if (f == "AVG") {
-                v = rht.Count(slot, a) > 0 ? Value(rht.Sum(slot, a) / rht.Count(slot, a)) : Value(0.0);
+                // AVG/SUM over a group whose inputs were all NULL must be NULL.
+                v = rht.Count(slot, a) > 0 ? Value(rht.Sum(slot, a) / rht.Count(slot, a)) : Value();
+            } else if (f == "SUM" && !rht.GetHas(slot, a)) {
+                v = Value();
             } else if (chunk.data[ng + a].GetType().InternalType() == PhysicalType::INT64) {
                 v = Value::BIGINT((int64_t)rht.Sum(slot, a));
             } else {

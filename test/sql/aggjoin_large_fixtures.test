@@ -1,0 +1,70 @@
+# name: test/sql/aggjoin_large_fixtures.test
+# description: Large-cardinality runtime coverage (volume-only bugs: column-major
+#              accumulator, direct-mode key range, HT sizing) with fire-assertion.
+# group: [aggjoin]
+# differential: skip
+#   Uses aggjoin_last_rewrite() fire-assertions (meaningless with the optimizer
+#   disabled). Expected values were taken from a native extension-disabled run.
+#
+# The rest of the suite tops out around generate_series(1,100); direct/segmented
+# accumulation, key-offset arithmetic and HT growth only stress at scale. This
+# fixture drives the fused direct-mode path at 150K dense keys / 600K probe rows
+# and cross-checks the value native produces (expected values were taken from a
+# `PRAGMA disabled_optimizers='extension'` run). Larger segmented (> 2M key range)
+# and hash (> 1M non-dense key) regimes remain covered by benchmarks/ rather than
+# the unit suite to keep `make test` fast.
+
+require aggjoin
+
+statement ok
+CREATE TABLE lg_build(k INT);
+
+statement ok
+INSERT INTO lg_build SELECT i FROM range(150000) t(i);
+
+statement ok
+CREATE TABLE lg_probe(k INT, val DOUBLE);
+
+# 600K probe rows, each key appearing 4x, values cycling 0..6 (catches
+# accumulator/precision drift the tiny fixtures cannot).
+statement ok
+INSERT INTO lg_probe SELECT i % 150000, (i % 7)::DOUBLE FROM range(600000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+# Grouped SUM over 150K dense keys (group == join key -> direct mode). Wrapped in
+# an outer aggregate so the result is a single comparable row.
+query II
+SELECT CAST(SUM(s) AS BIGINT) AS total, COUNT(*) AS groups
+FROM (SELECT lg_probe.k AS gk, SUM(lg_probe.val) AS s
+      FROM lg_probe JOIN lg_build ON lg_probe.k = lg_build.k
+      GROUP BY lg_probe.k) x;
+----
+1799995	150000
+
+# The fused operator (direct mode) must have fired on the inner aggregate.
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+# Same shape with multi-aggregate fusion (SUM + MIN + MAX + COUNT) — exercises
+# the column-major multi-accumulator layout at scale. MIN/MAX of a 0..6 cycle are
+# 0 and 6; COUNT(*) per key is 4, summed over 150K groups = 600000.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IIII
+SELECT CAST(SUM(s) AS BIGINT), CAST(MIN(mn) AS BIGINT), CAST(MAX(mx) AS BIGINT), CAST(SUM(c) AS BIGINT)
+FROM (SELECT lg_probe.k AS gk, SUM(lg_probe.val) AS s, MIN(lg_probe.val) AS mn,
+             MAX(lg_probe.val) AS mx, COUNT(*) AS c
+      FROM lg_probe JOIN lg_build ON lg_probe.k = lg_build.k
+      GROUP BY lg_probe.k) x;
+----
+1799995	0	6	600000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused

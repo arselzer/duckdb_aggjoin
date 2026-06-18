@@ -22,6 +22,9 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
     }
 
     auto ptype = input.data[pki].GetType().InternalType();
+    // NULL probe keys never match an inner join; the data under NULL slots is
+    // undefined and must not be interpreted as a key offset.
+    auto *key_validity = FlatVector::Validity(input.data[pki]).GetData();
     auto kmin = sink.key_min;
     auto krange = sink.key_range;
     auto *bc = sink.build_counts.data();
@@ -39,7 +42,8 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         // release keeps the defensive continue below so wrong results never ship.
         D_ASSERT(ai != DConstants::INVALID_INDEX && ai < input.ColumnCount());
         if (ai == DConstants::INVALID_INDEX || ai >= input.ColumnCount()) continue;
-        if (f == "MIN" || f == "MAX") continue;
+        // MIN/MAX inputs are included: the fast path reads every input via
+        // FlatVector::GetData<double>, which is only valid for DOUBLE vectors.
         if (input.data[ai].GetType().InternalType() != PhysicalType::DOUBLE) {
             all_sum_count_double = false;
             break;
@@ -56,7 +60,11 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
     for (idx_t a = 0; a < na; a++) {
         auto &f = col.agg_funcs[a];
         auto ai = col.agg_input_cols[a];
-        if (f == "COUNT" && ai == DConstants::INVALID_INDEX) {
+        // Build-side aggregates also carry an INVALID probe input column; they
+        // are accumulated by the dedicated build-agg loops and must not be
+        // treated as COUNT(*) here (that would double-count them).
+        bool on_build = (col.agg_on_build.size() > a && col.agg_on_build[a]);
+        if (f == "COUNT" && ai == DConstants::INVALID_INDEX && !on_build) {
             agg_slots[a].kind = AggSlot::COUNT_STAR;
         } else if (ai == DConstants::INVALID_INDEX || ai >= input.ColumnCount()) {
             agg_slots[a].kind = AggSlot::SKIP;
@@ -86,7 +94,7 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
 
     auto *mins = has_minmax ? sink.direct_mins.data() : nullptr;
     auto *maxs = has_minmax ? sink.direct_maxs.data() : nullptr;
-    auto *has_arr = has_minmax ? sink.direct_has.data() : nullptr;
+    auto *has_arr = sink.direct_has.empty() ? nullptr : sink.direct_has.data();
 
     auto is_int_key = (ptype == PhysicalType::INT32 || ptype == PhysicalType::INT64 ||
                        ptype == PhysicalType::UINT32 || ptype == PhysicalType::UINT64 ||
@@ -96,6 +104,7 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k < krange && bc[k] > 0) {                                                               \
                 double bcount = (double)bc[k];                                                           \
@@ -107,7 +116,10 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                         break;                                                                           \
                     case AggSlot::SUM_VAL: {                                                             \
                         auto *v = slot.validity;                                                         \
-                        if (!v || ((v[r / 64] >> (r % 64)) & 1)) sink.ungrouped_sum[a] += slot.vals[r] * bcount; \
+                        if (!v || ((v[r / 64] >> (r % 64)) & 1)) {                                       \
+                            sink.ungrouped_sum[a] += slot.vals[r] * bcount;                              \
+                            sink.ungrouped_has[a] = 1;                                                   \
+                        }                                                                                \
                         break;                                                                           \
                     }                                                                                    \
                     case AggSlot::AVG_VAL: {                                                             \
@@ -175,9 +187,13 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= krange || !bc[k]) continue;                                                         \
-            if (f == "SUM") sink.ungrouped_sum[a] += bsums[k];                                           \
+            if (f == "SUM") {                                                                            \
+                sink.ungrouped_sum[a] += bsums[k];                                                       \
+                if (bcnts[k] > 0) sink.ungrouped_has[a] = 1;                                             \
+            }                                                                                            \
             else if (f == "AVG") {                                                                       \
                 sink.ungrouped_sum[a] += bsums[k];                                                       \
                 sink.ungrouped_count[a] += bcnts[k];                                                     \
@@ -231,15 +247,28 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         if (pkfk) {                                                                                      \
             for (idx_t r = 0; r < n; r++) {                                                              \
+                if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) {                        \
+                    key_buf[r] = krange; /* sentinel: NULL key never matches */                          \
+                    continue;                                                                            \
+                }                                                                                        \
                 auto k = (idx_t)((int64_t)keys[r] - kmin);                                               \
+                if (k >= krange || !bc[k]) {                                                             \
+                    key_buf[r] = krange; /* sentinel: no build match for this key */                     \
+                    continue;                                                                            \
+                }                                                                                        \
                 key_buf[r] = k;                                                                          \
-                if (track_active_keys && k < krange && !seen_keys[k]) {                                  \
+                if (track_active_keys && !seen_keys[k]) {                                                \
                     seen_keys[k] = 1;                                                                    \
                     sink.direct_active_keys.push_back(k);                                                \
                 }                                                                                        \
             }                                                                                            \
         } else {                                                                                         \
             for (idx_t r = 0; r < n; r++) {                                                              \
+                if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) {                        \
+                    key_buf[r] = krange;                                                                 \
+                    bc_buf[r] = 0.0;                                                                     \
+                    continue;                                                                            \
+                }                                                                                        \
                 auto k = (idx_t)((int64_t)keys[r] - kmin);                                               \
                 key_buf[r] = k;                                                                          \
                 bc_buf[r] = (k < krange) ? (double)bc[k] : 0.0;                                          \
@@ -279,18 +308,21 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 break;
             case AggSlot::SUM_VAL: {
                 auto *v = slot.validity;
+                uint8_t *agg_has = has_arr + a * krange;
                 if (pkfk) {
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
                         if (k >= krange) continue;
                         if (v && !((v[r / 64] >> (r % 64)) & 1)) continue;
                         agg_sums[k] += slot.vals[r];
+                        agg_has[k] = 1;
                     }
                 } else {
                     for (idx_t r = 0; r < n; r++) {
                         if (bc_buf[r] == 0.0) continue;
                         if (v && !((v[r / 64] >> (r % 64)) & 1)) continue;
                         agg_sums[key_buf[r]] += slot.vals[r] * bc_buf[r];
+                        agg_has[key_buf[r]] = 1;
                     }
                 }
                 break;
@@ -379,10 +411,13 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 double *agg_sums_a = sums + a * krange;
                 if (f == "SUM") {
                     double *bsums = sink.direct_build_sums.data() + ba * krange;
+                    double *bcnts = sink.direct_build_counts.data() + ba * krange;
+                    uint8_t *agg_has = has_arr + a * krange;
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
                         if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
                         agg_sums_a[k] += bsums[k];
+                        if (bcnts[k] > 0) agg_has[k] = 1;
                     }
                 } else if (f == "MIN" && mins) {
                     double *bmins = sink.direct_build_mins.data() + ba * krange;
@@ -432,18 +467,62 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
             }
         }
     } else {
+        if (col.group_cols.empty()) {
+            // Slow-path loops accumulate per key; emit folds them once.
+            sink.ungrouped_per_key = true;
+        }
+        if (sink.track_active_keys) {
+            // The slow-path probe loops below index keys directly without the
+            // shared key_buf; record probe-matched keys here so grouped direct
+            // emit stays gated on probe matches (not build-side presence).
+            auto *seen = sink.direct_key_seen.data();
+#define MARK_ACTIVE_KEYS(KTYPE)                                                                          \
+    {                                                                                                    \
+        auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
+        for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
+            auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
+            if (k >= krange || !bc[k] || seen[k]) continue;                                              \
+            seen[k] = 1;                                                                                 \
+            sink.direct_active_keys.push_back(k);                                                        \
+        }                                                                                                \
+    }
+            switch (ptype) {
+            case PhysicalType::INT8: MARK_ACTIVE_KEYS(int8_t); break;
+            case PhysicalType::INT16: MARK_ACTIVE_KEYS(int16_t); break;
+            case PhysicalType::INT32: MARK_ACTIVE_KEYS(int32_t); break;
+            case PhysicalType::INT64: MARK_ACTIVE_KEYS(int64_t); break;
+            case PhysicalType::UINT8: MARK_ACTIVE_KEYS(uint8_t); break;
+            case PhysicalType::UINT16: MARK_ACTIVE_KEYS(uint16_t); break;
+            case PhysicalType::UINT32: MARK_ACTIVE_KEYS(uint32_t); break;
+            case PhysicalType::UINT64: MARK_ACTIVE_KEYS(uint64_t); break;
+            default:
+                for (idx_t r = 0; r < n; r++) {
+                    auto kv = input.data[pki].GetValue(r);
+                    if (kv.IsNull()) continue;
+                    auto k = (idx_t)(kv.GetValue<int64_t>() - kmin);
+                    if (k >= krange || !bc[k] || seen[k]) continue;
+                    seen[k] = 1;
+                    sink.direct_active_keys.push_back(k);
+                }
+                break;
+            }
+#undef MARK_ACTIVE_KEYS
+        }
         for (idx_t a = 0; a < na; a++) {
             auto ai = col.agg_input_cols[a];
             auto &f = col.agg_funcs[a];
+            bool is_build_agg = (col.agg_on_build.size() > a && col.agg_on_build[a]);
 
-            if (f == "COUNT" && ai == DConstants::INVALID_INDEX) {
+            if (f == "COUNT" && ai == DConstants::INVALID_INDEX && !is_build_agg) {
 #define DIRECT_COUNT_LOOP(TYPE)                                                                          \
     {                                                                                                    \
         auto *keys = FlatVector::GetData<TYPE>(input.data[pki]);                                         \
         double *agg_s = sums + a * krange;                                                               \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
-            if (k < krange) agg_s[k] += (double)bc[k];                                                   \
+            if (k < krange && bc[k]) agg_s[k] += (double)bc[k];                                          \
         }                                                                                                \
     }
                 switch (ptype) {
@@ -461,7 +540,6 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 continue;
             }
 
-            bool is_build_agg = (col.agg_on_build.size() > a && col.agg_on_build[a]);
             if (is_build_agg && !sink.direct_build_sums.empty()) {
                 idx_t ba = 0;
                 for (idx_t i = 0; i < a; i++) {
@@ -474,9 +552,17 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= krange || !bc[k]) continue;                                                         \
-            if (f == "SUM" || f == "AVG") agg_s[k] += bsums[k];                                          \
+            if (f == "SUM") {                                                                            \
+                agg_s[k] += bsums[k];                                                                    \
+                if (has_arr && sink.direct_build_counts[ba * krange + k] > 0) has_arr[a * krange + k] = 1; \
+            }                                                                                            \
+            else if (f == "AVG") {                                                                       \
+                agg_s[k] += bsums[k];                                                                    \
+                if (avg_counts) avg_counts[a * krange + k] += sink.direct_build_counts[ba * krange + k]; \
+            }                                                                                            \
             else if (f == "COUNT") agg_s[k] += sink.direct_build_counts[ba * krange + k];               \
             else if (f == "MIN" && has_minmax && build_has) {                                            \
                 if (!build_has[k]) continue;                                                             \
@@ -506,7 +592,13 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                         if (kv.IsNull()) continue;
                         auto k = (idx_t)(kv.GetValue<int64_t>() - kmin);
                         if (k >= krange || !bc[k]) continue;
-                        if (f == "SUM" || f == "AVG") agg_s[k] += bsums[k];
+                        if (f == "SUM") {
+                            agg_s[k] += bsums[k];
+                            if (has_arr && sink.direct_build_counts[ba * krange + k] > 0) has_arr[a * krange + k] = 1;
+                        } else if (f == "AVG") {
+                            agg_s[k] += bsums[k];
+                            if (avg_counts) avg_counts[a * krange + k] += sink.direct_build_counts[ba * krange + k];
+                        }
                         else if (f == "COUNT") agg_s[k] += sink.direct_build_counts[ba * krange + k];
                         else if (f == "MIN" && has_minmax && build_has) {
                             if (!build_has[k]) continue;
@@ -532,7 +624,11 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 auto vtype = input.data[ai].GetType().InternalType();
                 auto *validity = FlatVector::Validity(input.data[ai]).GetData();
                 bool is_avg = (f == "AVG");
+                // COUNT(col) counts matched rows with non-NULL values — it must
+                // never accumulate the values themselves.
+                bool is_count = (f == "COUNT");
                 auto *dcounts = is_avg ? sink.direct_counts.data() : nullptr;
+                uint8_t *agg_h = (f == "SUM" && has_arr) ? has_arr + a * krange : nullptr;
 #define DIRECT_SUM_LOOP(KTYPE, VTYPE)                                                                    \
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
@@ -540,11 +636,13 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         double *agg_s = sums + a * krange;                                                               \
         double *agg_c = dcounts ? dcounts + a * krange : nullptr;                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
-            if (k >= krange) continue;                                                                   \
+            if (k >= krange || !bc[k]) continue;                                                         \
             if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue;                            \
-            agg_s[k] += (double)vals[r] * (double)bc[k];                                                 \
+            agg_s[k] += is_count ? (double)bc[k] : (double)vals[r] * (double)bc[k];                      \
             if (agg_c) agg_c[k] += (double)bc[k];                                                        \
+            if (agg_h) agg_h[k] = 1;                                                                     \
         }                                                                                                \
     }
                 bool ran_typed = true;
@@ -584,8 +682,9 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                         if (k >= krange || !bc[k]) continue;
                         auto v = input.data[ai].GetValue(r);
                         if (v.IsNull()) continue;
-                        agg_s[k] += v.GetValue<double>() * (double)bc[k];
+                        agg_s[k] += is_count ? (double)bc[k] : v.GetValue<double>() * (double)bc[k];
                         if (agg_c) agg_c[k] += (double)bc[k];
+                        if (agg_h) agg_h[k] = 1;
                     }
                 }
 #undef DIRECT_SUM_LOOP
@@ -600,6 +699,7 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         auto *vals = FlatVector::GetData<VTYPE>(input.data[ai]);                                         \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= krange || !bc[k]) continue;                                                         \
             if (mm_validity && !((mm_validity[r / 64] >> (r % 64)) & 1)) continue;                      \
@@ -668,6 +768,7 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= krange || !bc[k] || sink.direct_group_init[k]) continue;                            \
             sink.direct_group_init[k] = true;                                                            \

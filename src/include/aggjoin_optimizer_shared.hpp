@@ -36,6 +36,18 @@ bool AggJoinTraceEnabled();
 bool AggJoinTraceStatsEnabled();
 bool AggJoinStaticDisabledByEnv();
 
+// Per-path enable/disable (cascade = native-lowering frequency cascade;
+// operator = the fused PhysicalAggJoin).  See aggjoin_optimizer.cpp.
+bool AggJoinCascadeEnabled();
+bool AggJoinOperatorEnabled();
+void SetAggJoinCascadeEnabled(bool enabled);
+void SetAggJoinOperatorEnabled(bool enabled);
+
+// Last-fired rewrite marker (test introspection — see aggjoin_optimizer.cpp).
+const char *GetAggJoinLastRewrite();
+void SetAggJoinLastRewrite(const char *marker);
+void ResetAggJoinLastRewrite();
+
 int64_t GetAggJoinTestHashBits();
 void SetAggJoinTestHashBits(int64_t bits);
 int64_t GetAggJoinTestHTCapacity();

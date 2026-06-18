@@ -18,6 +18,22 @@
 
 namespace duckdb {
 
+// A join-key side is a "bare column" if it is a column reference, possibly
+// wrapped in value-reconciling CASTs, but NOT wrapped in a function or
+// arithmetic expression. LOWER(x), x+1, etc. change the join semantics; treating
+// them as an equi-key on the raw column joins on the wrong values. (Review bug B,
+// 2026-06-15.) Shared by IsEquiJoin and the chain-COUNT rewrite's edge detector.
+inline bool IsBareColumnKey(Expression &expr) {
+    auto cls = expr.GetExpressionClass();
+    if (cls == ExpressionClass::BOUND_COLUMN_REF || cls == ExpressionClass::BOUND_REF) {
+        return true;
+    }
+    if (cls == ExpressionClass::BOUND_CAST) {
+        return IsBareColumnKey(*expr.Cast<BoundCastExpression>().child);
+    }
+    return false;
+}
+
 inline unique_ptr<BoundAggregateExpression> BindAggregateByName(ClientContext &context, const string &name,
                                                                vector<unique_ptr<Expression>> children) {
     auto &entry =
@@ -47,6 +63,10 @@ bool TryRewriteNativeMixedSidePreagg(ClientContext &context, Optimizer &optimize
                                      bool has_parent);
 
 bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
+                                    LogicalAggregate &agg, LogicalComparisonJoin &join, LogicalOperator &agg_child,
+                                    AggJoinRewriteState &state, bool has_parent);
+
+bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
                                     LogicalAggregate &agg, LogicalComparisonJoin &join, LogicalOperator &agg_child,
                                     AggJoinRewriteState &state, bool has_parent);
 

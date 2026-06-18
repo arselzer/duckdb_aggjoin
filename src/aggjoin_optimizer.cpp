@@ -72,6 +72,67 @@ void SetAggJoinTestHTCapacity(int64_t capacity) {
     aggjoin_test_ht_capacity.store(capacity);
 }
 
+// ── Per-path enable/disable ─────────────────────────────────────────────────
+// The extension bundles two independent mechanisms in one optimizer pass:
+//   * the "cascade"  — the Yannakakis frequency cascade, lowered ENTIRELY to
+//                      native operators (chain-count / final-bag / mixed /
+//                      build).  No custom execution code; the safe half.
+//   * the "operator" — the fused PhysicalAggJoin (custom in-memory execution).
+// These flags let a deployment run one without the other (e.g. ship the proven
+// exact cascade while keeping the fused operator off).  -1 = "use env default";
+// 0/1 = explicit runtime override (set via the aggjoin_set_*_enabled SQL fns).
+static std::atomic<int> aggjoin_cascade_enabled {-1};
+static std::atomic<int> aggjoin_operator_enabled {-1};
+
+static bool AggJoinPathDisabledByEnv(const char *name) {
+    auto *env = std::getenv(name);
+    return env && env[0] && env[0] != '0';
+}
+
+bool AggJoinCascadeEnabled() {
+    auto v = aggjoin_cascade_enabled.load();
+    if (v >= 0) {
+        return v != 0;
+    }
+    static int env_disabled = AggJoinPathDisabledByEnv("AGGJOIN_DISABLE_CASCADE") ? 1 : 0;
+    return env_disabled == 0;
+}
+
+bool AggJoinOperatorEnabled() {
+    auto v = aggjoin_operator_enabled.load();
+    if (v >= 0) {
+        return v != 0;
+    }
+    static int env_disabled = AggJoinPathDisabledByEnv("AGGJOIN_DISABLE_OPERATOR") ? 1 : 0;
+    return env_disabled == 0;
+}
+
+void SetAggJoinCascadeEnabled(bool enabled) {
+    aggjoin_cascade_enabled.store(enabled ? 1 : 0);
+}
+
+void SetAggJoinOperatorEnabled(bool enabled) {
+    aggjoin_operator_enabled.store(enabled ? 1 : 0);
+}
+
+// Last-fired rewrite marker — lets sqllogictest assert WHICH rewrite path fired
+// (the native-lowering rewrites are invisible in EXPLAIN, so a marker is the only
+// way to test firing). Markers are string literals (static storage), so an atomic
+// pointer is safe. Set on fire by each rewrite; reset explicitly by the test hook.
+static std::atomic<const char *> aggjoin_last_rewrite {"none"};
+
+const char *GetAggJoinLastRewrite() {
+    return aggjoin_last_rewrite.load();
+}
+
+void SetAggJoinLastRewrite(const char *marker) {
+    aggjoin_last_rewrite.store(marker);
+}
+
+void ResetAggJoinLastRewrite() {
+    aggjoin_last_rewrite.store("none");
+}
+
 struct AggJoinOptimizerInfo : public OptimizerExtensionInfo {
     explicit AggJoinOptimizerInfo(bool ignore_disable_static_p) : ignore_disable_static(ignore_disable_static_p) {
     }

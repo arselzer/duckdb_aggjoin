@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#0a0b0d"/>
+  <!-- two streams folding into one: the aggregate-over-join glyph -->
+  <path d="M6 8 H13 Q20 8 20 16 Q20 24 6 24" fill="none" stroke="#f5b417" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M6 16 H18" fill="none" stroke="#f5b417" stroke-width="2.4" stroke-linecap="round"/>
+  <circle cx="24" cy="16" r="3" fill="#f5b417"/>
+</svg>

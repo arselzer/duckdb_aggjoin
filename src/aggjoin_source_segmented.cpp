@@ -16,6 +16,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
         }
 
         auto ptype = input.data[pki].GetType().InternalType();
+        auto *key_validity = FlatVector::Validity(input.data[pki]).GetData();
         auto kmin = sink.key_min;
         auto seg_shift = sink.segmented_shift;
         auto seg_mask = sink.segmented_mask;
@@ -67,6 +68,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= range) continue;                                                                    \
             auto seg = k >> seg_shift;                                                                   \
@@ -78,6 +80,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
             mark_active(k);                                                                              \
             auto mult = pkfk ? 1.0 : (double)bcount;                                                     \
             auto *accums = sink.segmented_accum_slots ? sink.segmented_multi_accums[seg].data() : nullptr;       \
+            auto *accum_has = sink.segmented_multi_accum_has.empty() ? nullptr : sink.segmented_multi_accum_has[seg].data(); \
             auto *avg_counts = sink.segmented_avg_slots ? sink.segmented_multi_avg_counts[seg].data() : nullptr; \
             auto *mins = sink.segmented_min_slots ? sink.segmented_multi_mins[seg].data() : nullptr;             \
             auto *maxs = sink.segmented_max_slots ? sink.segmented_multi_maxs[seg].data() : nullptr;             \
@@ -100,6 +103,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
                 case SegAggSlot::SUM_VAL:                                                                \
                     if (slot.validity && !((slot.validity[r / 64] >> (r % 64)) & 1)) break;             \
                     accums[accum_base + slot.accum_idx] += slot.vals[r] * mult;                          \
+                    accum_has[accum_base + slot.accum_idx] = 1;                                          \
                     break;                                                                               \
                 case SegAggSlot::AVG_VAL:                                                                \
                     if (slot.validity && !((slot.validity[r / 64] >> (r % 64)) & 1)) break;             \
@@ -151,6 +155,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
     if (ai != DConstants::INVALID_INDEX && ai < input.ColumnCount()) input.data[ai].Flatten(n);
 
     auto ptype = input.data[pki].GetType().InternalType();
+    auto *key_validity = FlatVector::Validity(input.data[pki]).GetData();
     auto kmin = sink.key_min;
     auto seg_shift = sink.segmented_shift;
     auto seg_mask = sink.segmented_mask;
@@ -170,6 +175,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= range) continue;                                                                    \
             auto seg = k >> seg_shift;                                                                   \
@@ -207,6 +213,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= range) continue;                                                                    \
             auto seg = k >> seg_shift;                                                                   \
@@ -215,8 +222,8 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
             if (count_seg.empty()) continue;                                                             \
             auto bcount = count_seg[local];                                                              \
             if (!bcount) continue;                                                                       \
+            mark_active(k); /* group exists once the key matches, even if all values are NULL */         \
             if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue;                            \
-            mark_active(k);                                                                              \
             sink.segmented_sums[seg][local] += pkfk ? 1.0 : (double)bcount;                             \
         }                                                                                                \
     }
@@ -242,6 +249,7 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         auto *vals = FlatVector::GetData<VTYPE>(input.data[ai]);                                         \
         for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= range) continue;                                                                    \
             auto seg = k >> seg_shift;                                                                   \
@@ -250,10 +258,11 @@ bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, 
             if (count_seg.empty()) continue;                                                             \
             auto bcount = count_seg[local];                                                              \
             if (!bcount) continue;                                                                       \
+            mark_active(k); /* group exists once the key matches, even if all values are NULL */         \
             if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue;                            \
-            mark_active(k);                                                                              \
             sink.segmented_sums[seg][local] += (double)vals[r] * (pkfk ? 1.0 : (double)bcount);         \
             if (f0 == "AVG") sink.segmented_avg_counts[seg][local] += pkfk ? 1.0 : (double)bcount;     \
+            if (f0 == "SUM") sink.segmented_sum_has[seg][local] = 1;                                    \
         }                                                                                                \
     }
     bool ran_typed = true;

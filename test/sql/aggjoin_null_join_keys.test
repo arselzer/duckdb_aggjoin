@@ -1,0 +1,156 @@
+# name: test/sql/aggjoin_null_join_keys.test
+# description: NULL join keys must never match (inner equi-join semantics).
+#              The typed probe key-extraction loops previously read undefined
+#              data under NULL slots without checking the key validity mask.
+# group: [aggjoin]
+
+require aggjoin
+
+# ── Single integer key (direct mode) ──
+
+statement ok
+CREATE TABLE rn (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO rn VALUES (NULL, 100.0), (NULL, 100.0), (1, 1.0), (2, 2.0);
+
+statement ok
+CREATE TABLE sn (x INT);
+
+statement ok
+INSERT INTO sn VALUES (NULL), (1), (2);
+
+query III rowsort
+SELECT rn.x, COUNT(*), CAST(SUM(rn.val) AS INTEGER)
+FROM rn JOIN sn ON rn.x = sn.x GROUP BY rn.x;
+----
+1	1	1
+2	1	2
+
+query III
+SELECT COUNT(*), CAST(SUM(rn.val) AS INTEGER), CAST(MIN(rn.val) AS INTEGER)
+FROM rn JOIN sn ON rn.x = sn.x;
+----
+2	3	1
+
+# ── NULL keys only on the probe side ──
+
+statement ok
+CREATE TABLE sn2 (x INT);
+
+statement ok
+INSERT INTO sn2 VALUES (1), (2), (3);
+
+query III rowsort
+SELECT rn.x, COUNT(*), CAST(SUM(rn.val) AS INTEGER)
+FROM rn JOIN sn2 ON rn.x = sn2.x GROUP BY rn.x;
+----
+1	1	1
+2	1	2
+
+# ── All probe keys NULL: no matches at all ──
+
+statement ok
+CREATE TABLE rnull (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO rnull VALUES (NULL, 5.0), (NULL, 6.0);
+
+query II rowsort
+SELECT rnull.x, COUNT(*) FROM rnull JOIN sn2 ON rnull.x = sn2.x GROUP BY rnull.x;
+----
+
+query II
+SELECT COUNT(*), CAST(SUM(rnull.val) AS INTEGER) FROM rnull JOIN sn2 ON rnull.x = sn2.x;
+----
+0	NULL
+
+# ── DOUBLE key (build_slot hash mode) ──
+
+statement ok
+CREATE TABLE rdn (k DOUBLE, val DOUBLE);
+
+statement ok
+INSERT INTO rdn VALUES (NULL, 100.0), (1.5, 1.0);
+
+statement ok
+CREATE TABLE sdn (k DOUBLE);
+
+statement ok
+INSERT INTO sdn VALUES (NULL), (1.5);
+
+query III rowsort
+SELECT CAST(rdn.k * 2 AS INTEGER), COUNT(*), CAST(SUM(rdn.val) AS INTEGER)
+FROM rdn JOIN sdn ON rdn.k = sdn.k GROUP BY rdn.k;
+----
+3	1	1
+
+# ── VARCHAR key ──
+
+statement ok
+CREATE TABLE rvn (k VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO rvn VALUES (NULL, 100.0), ('a', 1.0);
+
+statement ok
+CREATE TABLE svn (k VARCHAR);
+
+statement ok
+INSERT INTO svn VALUES (NULL), ('a');
+
+query TIII rowsort
+SELECT rvn.k, COUNT(*), CAST(SUM(rvn.val) AS INTEGER), CAST(MIN(rvn.val) AS INTEGER)
+FROM rvn JOIN svn ON rvn.k = svn.k GROUP BY rvn.k;
+----
+a	1	1	1
+
+# ── Composite key with NULL in one component ──
+
+statement ok
+CREATE TABLE rcomp (x INT, y INT, val DOUBLE);
+
+statement ok
+INSERT INTO rcomp VALUES (1, NULL, 100.0), (1, 1, 1.0), (2, 2, 2.0);
+
+statement ok
+CREATE TABLE scomp (x INT, y INT);
+
+statement ok
+INSERT INTO scomp VALUES (1, NULL), (1, 1), (2, 2);
+
+query IIII rowsort
+SELECT rcomp.x, rcomp.y, COUNT(*), CAST(SUM(rcomp.val) AS INTEGER)
+FROM rcomp JOIN scomp ON rcomp.x = scomp.x AND rcomp.y = scomp.y
+GROUP BY rcomp.x, rcomp.y;
+----
+1	1	1	1
+2	2	1	2
+
+# ── Wide key range (segmented / track-active paths) with NULL probe keys ──
+
+statement ok
+CREATE TABLE rwide (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO rwide VALUES (NULL, 100.0), (0, 1.0), (4000000, 2.0);
+
+statement ok
+CREATE TABLE swide (x INT);
+
+statement ok
+INSERT INTO swide VALUES (0), (4000000);
+
+query II rowsort
+SELECT rwide.x, CAST(SUM(rwide.val) AS INTEGER)
+FROM rwide JOIN swide ON rwide.x = swide.x GROUP BY rwide.x;
+----
+0	1
+4000000	2
+
+query III rowsort
+SELECT rwide.x, COUNT(*), CAST(SUM(rwide.val) AS INTEGER)
+FROM rwide JOIN swide ON rwide.x = swide.x GROUP BY rwide.x;
+----
+0	1	1
+4000000	1	2

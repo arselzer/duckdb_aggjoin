@@ -208,7 +208,24 @@ OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, Execut
         for (idx_t g = 0; g < col.group_cols.size(); g++) {
             auto &src_vec = input.data[col.group_cols[g]];
             auto &dst_type = op.group_types[g];
-            if (src_vec.GetType() == dst_type) {
+            bool compressed_group = g < col.group_compress.size() && col.group_compress[g].has_compress &&
+                                    !col.group_compress[g].is_string_compress;
+            if (compressed_group) {
+                // The probe scan provides raw values, but the operator's output
+                // schema (and the decompress Projection above it) expects the
+                // compressed form raw - offset; a plain Cast would shift every
+                // emitted group value by the compress offset.
+                auto offset = col.group_compress[g].offset;
+                for (idx_t m = 0; m < mc; m++) {
+                    auto r = match_sel.get_index(m);
+                    auto v = src_vec.GetValue(r);
+                    if (v.IsNull()) {
+                        group_chunk.data[g].SetValue(m, Value(dst_type));
+                    } else {
+                        group_chunk.data[g].SetValue(m, Value::Numeric(dst_type, v.GetValue<int64_t>() - offset));
+                    }
+                }
+            } else if (src_vec.GetType() == dst_type) {
                 group_chunk.data[g].Reference(src_vec);
                 group_chunk.data[g].Slice(match_sel, mc);
             } else {
@@ -228,50 +245,42 @@ OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, Execut
                 }
                 continue;
             }
-            auto ptype = input.data[ai].GetType().InternalType();
-            if (ptype == PhysicalType::DOUBLE) {
-                auto *src = FlatVector::GetData<double>(input.data[ai]);
-                auto *dst = FlatVector::GetData<double>(payload_chunk.data[a]);
-                for (idx_t m = 0; m < mc; m++) {
-                    auto r = match_sel.get_index(m);
-                    dst[m] = src[r] * row_bc[r];
+            if (col.agg_funcs[a] != "SUM") {
+                // MIN/MAX payload: raw selected values in their original type —
+                // scaling by the build count would corrupt the result whenever
+                // a build key has duplicates — with NULL validity riding along.
+                payload_chunk.data[a].Reference(input.data[ai]);
+                payload_chunk.data[a].Slice(match_sel, mc);
+                continue;
+            }
+            // SUM payload: fold the build-side multiplicity in by scaling.
+            // NULL inputs must stay NULL so the native aggregate skips them.
+            // GetGlobalSinkState only admits SUM payloads that are physically
+            // DOUBLE, so the typed access below is safe.
+            auto *src = FlatVector::GetData<double>(input.data[ai]);
+            auto *dst = FlatVector::GetData<double>(payload_chunk.data[a]);
+            auto *src_validity = FlatVector::Validity(input.data[ai]).GetData();
+            auto &payload_validity = FlatVector::Validity(payload_chunk.data[a]);
+            for (idx_t m = 0; m < mc; m++) {
+                auto r = match_sel.get_index(m);
+                if (src_validity && !((src_validity[r / 64] >> (r % 64)) & 1)) {
+                    payload_validity.SetInvalid(m);
+                    continue;
                 }
-            } else {
-                auto *dst = FlatVector::GetData<double>(payload_chunk.data[a]);
-#define NATIVE_PAYLOAD_LOOP(TYPE)                                                                        \
-    {                                                                                                    \
-        auto *src = FlatVector::GetData<TYPE>(input.data[ai]);                                           \
-        for (idx_t m = 0; m < mc; m++) {                                                                 \
-            auto r = match_sel.get_index(m);                                                             \
-            dst[m] = (double)src[r] * row_bc[r];                                                         \
-        }                                                                                                \
-    }
-                switch (ptype) {
-                case PhysicalType::FLOAT: NATIVE_PAYLOAD_LOOP(float); break;
-                case PhysicalType::INT64: NATIVE_PAYLOAD_LOOP(int64_t); break;
-                case PhysicalType::INT32: NATIVE_PAYLOAD_LOOP(int32_t); break;
-                case PhysicalType::INT16: NATIVE_PAYLOAD_LOOP(int16_t); break;
-                case PhysicalType::INT8: NATIVE_PAYLOAD_LOOP(int8_t); break;
-                case PhysicalType::UINT64: NATIVE_PAYLOAD_LOOP(uint64_t); break;
-                case PhysicalType::UINT32: NATIVE_PAYLOAD_LOOP(uint32_t); break;
-                case PhysicalType::UINT16: NATIVE_PAYLOAD_LOOP(uint16_t); break;
-                case PhysicalType::UINT8: NATIVE_PAYLOAD_LOOP(uint8_t); break;
-                default:
-                    for (idx_t m = 0; m < mc; m++) {
-                        auto r = match_sel.get_index(m);
-                        dst[m] = input.data[ai].GetValue(r).GetValue<double>() * row_bc[r];
-                    }
-                    break;
-                }
-#undef NATIVE_PAYLOAD_LOOP
+                dst[m] = src[r] * row_bc[r];
             }
         }
         payload_chunk.SetCardinality(mc);
 
+        // Hash the FINAL group_chunk values (not the raw probe columns):
+        // FetchAggregates re-hashes the stored group values at scan time, so a
+        // mismatched insert hash silently finalizes fresh empty states (NULLs).
         Vector group_hashes(LogicalType::HASH, mc);
         group_hashes.Flatten(mc);
-        auto *ghd = FlatVector::GetData<hash_t>(group_hashes);
-        for (idx_t m = 0; m < mc; m++) ghd[m] = gh[match_sel.get_index(m)];
+        VectorOperations::Hash(group_chunk.data[0], group_hashes, mc);
+        for (idx_t g = 1; g < col.group_cols.size(); g++) {
+            VectorOperations::CombineHash(group_hashes, group_chunk.data[g], mc);
+        }
 
         unsafe_vector<idx_t> filter;
         for (idx_t a = 0; a < na; a++) filter.push_back(a);
@@ -314,6 +323,7 @@ OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, Execut
                 auto &bav = build->bav;
                 if (f == "SUM") {
                     rht.Sum(sl[r], a) += bav.agg_sum[ba];
+                    if (bav.agg_count[ba] > 0) rht.SetHas(sl[r], a, true);
                 } else if (f == "AVG") {
                     rht.Sum(sl[r], a) += bav.agg_sum[ba];
                     rht.Count(sl[r], a) += bav.agg_count[ba];
@@ -354,6 +364,11 @@ OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, Execut
 
         if (f == "SUM" || f == "AVG" || f == "COUNT") {
             bool is_avg = (f == "AVG");
+            // COUNT(col) counts matched rows with non-NULL values — it must
+            // never accumulate the values themselves. SUM records non-NULL-seen
+            // so an all-NULL group emits NULL.
+            bool is_count = (f == "COUNT");
+            bool is_sum = (f == "SUM");
             bool pkfk = sink.all_bc_one;
 #define SUM_LOOP(TYPE)                                                                                   \
     {                                                                                                    \
@@ -362,15 +377,17 @@ OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, Execut
             for (idx_t r = 0; r < n; r++) {                                                              \
                 if (sl[r] == DConstants::INVALID_INDEX) continue;                                        \
                 if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue;                        \
-                rht.Sum(sl[r], a) += (double)vals[r];                                                    \
+                rht.Sum(sl[r], a) += is_count ? 1.0 : (double)vals[r];                                   \
                 if (is_avg) rht.Count(sl[r], a) += 1.0;                                                  \
+                if (is_sum) rht.SetHas(sl[r], a, true);                                                  \
             }                                                                                            \
         } else {                                                                                         \
             for (idx_t r = 0; r < n; r++) {                                                              \
                 if (sl[r] == DConstants::INVALID_INDEX) continue;                                        \
                 if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue;                        \
-                rht.Sum(sl[r], a) += (double)vals[r] * bc[r];                                            \
+                rht.Sum(sl[r], a) += is_count ? bc[r] : (double)vals[r] * bc[r];                         \
                 if (is_avg) rht.Count(sl[r], a) += bc[r];                                                \
+                if (is_sum) rht.SetHas(sl[r], a, true);                                                  \
             }                                                                                            \
         }                                                                                                \
     }
@@ -389,8 +406,9 @@ OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, Execut
                 for (idx_t r = 0; r < n; r++) {
                     if (sl[r] == DConstants::INVALID_INDEX) continue;
                     if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue;
-                    rht.Sum(sl[r], a) += input.data[ai].GetValue(r).GetValue<double>() * bc[r];
+                    rht.Sum(sl[r], a) += is_count ? bc[r] : input.data[ai].GetValue(r).GetValue<double>() * bc[r];
                     if (is_avg) rht.Count(sl[r], a) += bc[r];
+                    if (is_sum) rht.SetHas(sl[r], a, true);
                 }
                 break;
             }

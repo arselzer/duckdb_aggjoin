@@ -1,0 +1,242 @@
+# name: test/sql/aggjoin_null_aggregates.test
+# description: SUM/AVG over a matched group whose values are all NULL must be
+#              NULL (COUNT(col)=0, MIN/MAX=NULL). Pre-fix the grouped emit
+#              paths returned 0.0 for SUM/AVG. Covers direct, segmented,
+#              build_slot, generic hash, native-ht, build-side-aggregate and
+#              ungrouped paths.
+# group: [aggjoin]
+
+require aggjoin
+
+# ── Direct mode (dense integer key, GROUP BY join key) ──
+
+statement ok
+CREATE TABLE r (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r VALUES (1, NULL), (1, NULL), (2, 5.0);
+
+statement ok
+CREATE TABLE s (x INT);
+
+statement ok
+INSERT INTO s VALUES (1), (2);
+
+query IIIIII rowsort
+SELECT r.x, CAST(SUM(r.val) AS INTEGER), CAST(AVG(r.val) AS INTEGER), COUNT(r.val),
+       CAST(MIN(r.val) AS INTEGER), CAST(MAX(r.val) AS INTEGER)
+FROM r JOIN s ON r.x = s.x GROUP BY r.x;
+----
+1	NULL	NULL	0	NULL	NULL
+2	5	5	1	5	5
+
+# COUNT(*) still counts NULL-valued rows
+query II rowsort
+SELECT r.x, COUNT(*) FROM r JOIN s ON r.x = s.x GROUP BY r.x;
+----
+1	2
+2	1
+
+# ── Ungrouped: all-NULL matched rows ──
+
+query III
+SELECT CAST(SUM(r.val) AS INTEGER), CAST(AVG(r.val) AS INTEGER), COUNT(r.val)
+FROM r JOIN s ON r.x = s.x WHERE r.x = 1;
+----
+NULL	NULL	0
+
+# ── Ungrouped: zero matched rows (non-empty build side) ──
+
+statement ok
+CREATE TABLE r_far (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r_far VALUES (99, 1.0);
+
+query IIII
+SELECT CAST(SUM(r_far.val) AS INTEGER), CAST(AVG(r_far.val) AS INTEGER),
+       COUNT(r_far.val), COUNT(*)
+FROM r_far JOIN s ON r_far.x = s.x;
+----
+NULL	NULL	0	0
+
+# ── Segmented direct (single aggregate, key range > direct limit) ──
+# Pre-fix the all-NULL group was dropped entirely (mark_active ran after the
+# value-validity check), not just emitted as 0.0.
+
+statement ok
+CREATE TABLE rb (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO rb VALUES (0, NULL), (0, NULL), (4000000, 7.0);
+
+statement ok
+CREATE TABLE sb (x INT);
+
+statement ok
+INSERT INTO sb VALUES (0), (4000000);
+
+query II rowsort
+SELECT rb.x, CAST(SUM(rb.val) AS INTEGER)
+FROM rb JOIN sb ON rb.x = sb.x GROUP BY rb.x;
+----
+0	NULL
+4000000	7
+
+query II rowsort
+SELECT rb.x, CAST(AVG(rb.val) AS INTEGER)
+FROM rb JOIN sb ON rb.x = sb.x GROUP BY rb.x;
+----
+0	NULL
+4000000	7
+
+query II rowsort
+SELECT rb.x, COUNT(rb.val)
+FROM rb JOIN sb ON rb.x = sb.x GROUP BY rb.x;
+----
+0	0
+4000000	1
+
+# ── Segmented multi-aggregate ──
+
+query IIII rowsort
+SELECT rb.x, CAST(SUM(rb.val) AS INTEGER), CAST(MIN(rb.val) AS INTEGER), COUNT(rb.val)
+FROM rb JOIN sb ON rb.x = sb.x GROUP BY rb.x;
+----
+0	NULL	NULL	0
+4000000	7	7	1
+
+query III rowsort
+SELECT rb.x, CAST(AVG(rb.val) AS INTEGER), CAST(MAX(rb.val) AS INTEGER)
+FROM rb JOIN sb ON rb.x = sb.x GROUP BY rb.x;
+----
+0	NULL	NULL
+4000000	7	7
+
+# ── build_slot hash mode (DOUBLE group key == join key) ──
+
+statement ok
+CREATE TABLE rd (k DOUBLE, val DOUBLE);
+
+statement ok
+INSERT INTO rd VALUES (1.5, NULL), (1.5, NULL), (2.5, 7.0);
+
+statement ok
+CREATE TABLE sd (k DOUBLE);
+
+statement ok
+INSERT INTO sd VALUES (1.5), (2.5);
+
+query IIII rowsort
+SELECT CAST(rd.k * 2 AS INTEGER), CAST(SUM(rd.val) AS INTEGER),
+       CAST(AVG(rd.val) AS INTEGER), COUNT(rd.val)
+FROM rd JOIN sd ON rd.k = sd.k GROUP BY rd.k;
+----
+3	NULL	NULL	0
+5	7	7	1
+
+# ── build_slot hash mode (VARCHAR group key == join key, multi-agg) ──
+
+statement ok
+CREATE TABLE rv (k VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO rv VALUES ('a', NULL), ('a', NULL), ('b', 3.0);
+
+statement ok
+CREATE TABLE sv (k VARCHAR);
+
+statement ok
+INSERT INTO sv VALUES ('a'), ('b');
+
+query TIII rowsort
+SELECT rv.k, CAST(SUM(rv.val) AS INTEGER), CAST(MIN(rv.val) AS INTEGER), COUNT(rv.val)
+FROM rv JOIN sv ON rv.k = sv.k GROUP BY rv.k;
+----
+a	NULL	NULL	0
+b	3	3	1
+
+# ── Generic hash path (composite key; AVG keeps it off the native HT) ──
+
+statement ok
+CREATE TABLE rh (x INT, y INT, val DOUBLE);
+
+statement ok
+INSERT INTO rh VALUES (1, 1, NULL), (2, 2, 8.0);
+
+statement ok
+CREATE TABLE sh (x INT, y INT);
+
+statement ok
+INSERT INTO sh VALUES (1, 1), (2, 2);
+
+query IIII rowsort
+SELECT rh.x, rh.y, CAST(SUM(rh.val) AS INTEGER), CAST(AVG(rh.val) AS INTEGER)
+FROM rh JOIN sh ON rh.x = sh.x AND rh.y = sh.y GROUP BY rh.x, rh.y;
+----
+1	1	NULL	NULL
+2	2	8	8
+
+# ── Native-HT path (composite key, SUM/MIN/MAX only) ──
+# Also covers: NULL payloads must not poison native aggregate states, MIN/MAX
+# must not be scaled by the build-side duplicate count, and group values must
+# survive compressed-materialization offsets.
+
+statement ok
+CREATE TABLE rc (x INT, y INT, val DOUBLE);
+
+statement ok
+INSERT INTO rc VALUES (1, 1, 10.0), (2, 2, 20.0);
+
+statement ok
+CREATE TABLE sc (x INT, y INT);
+
+statement ok
+INSERT INTO sc VALUES (1, 1), (1, 1), (2, 2);
+
+query IIII rowsort
+SELECT rc.x, rc.y, CAST(SUM(rc.val) AS INTEGER), CAST(MIN(rc.val) AS INTEGER)
+FROM rc JOIN sc ON rc.x = sc.x AND rc.y = sc.y GROUP BY rc.x, rc.y;
+----
+1	1	20	10
+2	2	20	20
+
+statement ok
+CREATE TABLE rcn (x INT, y INT, val DOUBLE);
+
+statement ok
+INSERT INTO rcn VALUES (1, 1, NULL), (2, 2, 20.0);
+
+query IIII rowsort
+SELECT rcn.x, rcn.y, CAST(SUM(rcn.val) AS INTEGER), CAST(MIN(rcn.val) AS INTEGER)
+FROM rcn JOIN sc ON rcn.x = sc.x AND rcn.y = sc.y GROUP BY rcn.x, rcn.y;
+----
+1	1	NULL	NULL
+2	2	20	20
+
+# ── Build-side aggregates over all-NULL build values ──
+
+statement ok
+CREATE TABLE pb (x INT);
+
+statement ok
+INSERT INTO pb VALUES (1), (2);
+
+statement ok
+CREATE TABLE bb (x INT, bval DOUBLE);
+
+statement ok
+INSERT INTO bb VALUES (1, NULL), (1, NULL), (2, 6.0);
+
+query IIII rowsort
+SELECT pb.x, CAST(SUM(bb.bval) AS INTEGER), CAST(AVG(bb.bval) AS INTEGER), COUNT(bb.bval)
+FROM pb JOIN bb ON pb.x = bb.x GROUP BY pb.x;
+----
+1	NULL	NULL	0
+2	6	6	1
+
+query III
+SELECT CAST(SUM(bb.bval) AS INTEGER), CAST(AVG(bb.bval) AS INTEGER), COUNT(bb.bval)
+FROM pb JOIN bb ON pb.x = bb.x WHERE pb.x = 1;
+----
+NULL	NULL	0

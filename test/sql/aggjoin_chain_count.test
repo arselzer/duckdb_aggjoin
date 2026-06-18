@@ -1,0 +1,980 @@
+# name: test/sql/aggjoin_chain_count.test
+# description: N-relation linear-chain COUNT(*) frequency-propagation cascade (MVP)
+# group: [aggjoin]
+# differential: skip
+#   Uses aggjoin_last_rewrite() fire-assertions, which require the optimizer to be
+#   live (disabled, the marker is always 'none'). Every expected count was taken
+#   from a native (extension-disabled) run, so the differential pass adds nothing.
+#
+# The cascade fires only on large chains with an estimated multiplicity BLOWUP
+# (join product >> inputs); on near-1:1 chains it bails to native (the extra
+# GROUP-BYs would lose). FIRE cases assert BOTH the value AND that the cascade
+# fired (aggjoin_last_rewrite() = 'chain_count'); BAIL cases assert the value is
+# still correct via native AND that the cascade did NOT fire. All fixtures are
+# >= 50K rows. The fire-assertion is the only way to test these rewrites — they
+# lower to native HASH_GROUP_BY/HASH_JOIN and are invisible in EXPLAIN.
+
+require aggjoin
+
+# ============================================================================
+# FIRE: 3-table chain with a 100x fan-out on the last edge -> 6,000,000.
+# ============================================================================
+statement ok
+CREATE TABLE bl_t2(c INT);
+
+statement ok
+INSERT INTO bl_t2 SELECT i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE bl_t1(b INT, c INT);
+
+statement ok
+INSERT INTO bl_t1 SELECT i, i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE bl_t0(b INT);
+
+statement ok
+INSERT INTO bl_t0 SELECT i FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM bl_t0, bl_t1, bl_t2
+WHERE bl_t0.b = bl_t1.b AND bl_t1.c = bl_t2.c;
+----
+6000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# ============================================================================
+# FIRE: 4-table chain that collapses 1:1 then fans out 50x -> 3,000,000.
+# ============================================================================
+statement ok
+CREATE TABLE q3(d INT);
+
+statement ok
+INSERT INTO q3 SELECT i % 1200 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE q2(c INT, d INT);
+
+statement ok
+INSERT INTO q2 SELECT i, i % 1200 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE q1(b INT, c INT);
+
+statement ok
+INSERT INTO q1 SELECT i, i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE q0(b INT);
+
+statement ok
+INSERT INTO q0 SELECT i FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM q0, q1, q2, q3
+WHERE q0.b = q1.b AND q1.c = q2.c AND q2.d = q3.d;
+----
+3000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# ============================================================================
+# BAIL (1:1 PK-FK chain): no blowup -> native; correct value, cascade did NOT fire.
+# ============================================================================
+statement ok
+CREATE TABLE pf3(d INT);
+
+statement ok
+INSERT INTO pf3 SELECT i FROM range(200000) t(i);
+
+statement ok
+CREATE TABLE pf2(c INT, d INT);
+
+statement ok
+INSERT INTO pf2 SELECT i, i FROM range(200000) t(i);
+
+statement ok
+CREATE TABLE pf1(b INT, c INT);
+
+statement ok
+INSERT INTO pf1 SELECT i, i FROM range(200000) t(i);
+
+statement ok
+CREATE TABLE pf0(b INT);
+
+statement ok
+INSERT INTO pf0 SELECT i FROM range(200000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM pf0, pf1, pf2, pf3
+WHERE pf0.b = pf1.b AND pf1.c = pf2.c AND pf2.d = pf3.d;
+----
+200000
+
+query T
+SELECT aggjoin_last_rewrite() != 'chain_count';
+----
+true
+
+# ============================================================================
+# FIRE (general tree / STAR): a fact center joined to 3 dimensions on distinct
+# columns (center degree 3 -- not a linear chain). 5 rows/key on each side over
+# 50000 keys: 50000 * 5 * 5^3 = 31,250,000. Exercises the multi-child tree fold.
+# ============================================================================
+statement ok
+CREATE TABLE sd1(k INT);
+
+statement ok
+INSERT INTO sd1 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE sd2(k INT);
+
+statement ok
+INSERT INTO sd2 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE sd3(k INT);
+
+statement ok
+INSERT INTO sd3 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE sf(k1 INT, k2 INT, k3 INT, m INT);
+
+statement ok
+INSERT INTO sf SELECT i % 50000, i % 50000, i % 50000, i % 4 FROM range(250000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM sf, sd1, sd2, sd3
+WHERE sf.k1 = sd1.k AND sf.k2 = sd2.k AND sf.k3 = sd3.k;
+----
+31250000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# Grouped by a FACT attribute -> the guard is the star CENTER (interior root,
+# which the linear MVP could not handle). 31,250,000 / 4 = 7,812,500 per group.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT sf.m, COUNT(*) FROM sf, sd1, sd2, sd3
+WHERE sf.k1 = sd1.k AND sf.k2 = sd2.k AND sf.k3 = sd3.k
+GROUP BY sf.m ORDER BY sf.m;
+----
+0	7812500
+1	7812500
+2	7812500
+3	7812500
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# ============================================================================
+# FIRE (grouped): GROUP BY a column on the root endpoint. The group column is
+# low-cardinality so CompressedMaterialization wraps it -> exercises the compress
+# offset re-emit path. g = i%10 (6000 rows each) * 100x fan-out = 600000 / group.
+# ============================================================================
+statement ok
+CREATE TABLE gc_t2(c INT);
+
+statement ok
+INSERT INTO gc_t2 SELECT i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE gc_t1(b INT, c INT);
+
+statement ok
+INSERT INTO gc_t1 SELECT i, i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE gc_t0(b INT, g INT);
+
+statement ok
+INSERT INTO gc_t0 SELECT i, i % 10 FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT gc_t0.g, COUNT(*) FROM gc_t0, gc_t1, gc_t2
+WHERE gc_t0.b = gc_t1.b AND gc_t1.c = gc_t2.c
+GROUP BY gc_t0.g ORDER BY gc_t0.g;
+----
+0	600000
+1	600000
+2	600000
+3	600000
+4	600000
+5	600000
+6	600000
+7	600000
+8	600000
+9	600000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# BAIL (grouped): multi-column GROUP BY is not in the single-guard MVP.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query III
+SELECT gc_t0.g, gc_t2.c, COUNT(*) FROM gc_t0, gc_t1, gc_t2
+WHERE gc_t0.b = gc_t1.b AND gc_t1.c = gc_t2.c
+GROUP BY gc_t0.g, gc_t2.c ORDER BY gc_t0.g, gc_t2.c LIMIT 3;
+----
+0	0	10000
+0	10	10000
+0	20	10000
+
+query T
+SELECT aggjoin_last_rewrite() != 'chain_count';
+----
+true
+
+# ============================================================================
+# BAIL (empty endpoint): COALESCE -> 0 path is only reachable when fired, but the
+# blowup gate bails empty chains; native returns 0 correctly either way.
+# ============================================================================
+statement ok
+CREATE TABLE em2(c INT);
+
+statement ok
+INSERT INTO em2 SELECT i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE em1(b INT, c INT);
+
+statement ok
+INSERT INTO em1 SELECT i, i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE em0(b INT);
+
+statement ok
+INSERT INTO em0 SELECT i FROM range(60000) t(i) WHERE i < 0;
+
+query I
+SELECT COUNT(*) FROM em0, em1, em2
+WHERE em0.b = em1.b AND em1.c = em2.c;
+----
+0
+
+# ============================================================================
+# BAIL (cycle / triangle): not a chain; correct via native, cascade did NOT fire.
+# ============================================================================
+statement ok
+CREATE TABLE cy_a(x INT, z INT);
+
+statement ok
+INSERT INTO cy_a SELECT i, i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE cy_b(x INT, y INT);
+
+statement ok
+INSERT INTO cy_b SELECT i, i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE cy_c(y INT, z INT);
+
+statement ok
+INSERT INTO cy_c SELECT i, i FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM cy_a, cy_b, cy_c
+WHERE cy_a.x = cy_b.x AND cy_b.y = cy_c.y AND cy_c.z = cy_a.z;
+----
+60000
+
+query T
+SELECT aggjoin_last_rewrite() != 'chain_count';
+----
+true
+
+# ============================================================================
+# BAIL (true branching star, distinct FK columns): degree-3; correct via native.
+# ============================================================================
+statement ok
+CREATE TABLE st_d1(k INT);
+
+statement ok
+INSERT INTO st_d1 SELECT i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE st_d2(k INT);
+
+statement ok
+INSERT INTO st_d2 SELECT i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE st_d3(k INT);
+
+statement ok
+INSERT INTO st_d3 SELECT i FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE st_f(k1 INT, k2 INT, k3 INT);
+
+statement ok
+INSERT INTO st_f SELECT i, i, i FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM st_f, st_d1, st_d2, st_d3
+WHERE st_f.k1 = st_d1.k AND st_f.k2 = st_d2.k AND st_f.k3 = st_d3.k;
+----
+60000
+
+query T
+SELECT aggjoin_last_rewrite() != 'chain_count';
+----
+true
+
+# ============================================================================
+# SUM / MIN / MAX / AVG / COUNT(col) — piecewise aggregate propagation.
+# Fact-center star: 5 rows/key over 50000 keys on every side -> 31,250,000-row
+# join. The aggregate cascade threads each aggregate's partial state through the
+# fold (_freq for COUNT/SUM, set-safe pass-through for MIN/MAX, sum+count pair
+# for AVG). All ground-truth values were taken from a native run. dv is DOUBLE
+# (integer SUM binds sum_no_overflow/HUGEINT and bails -> see the last BAIL).
+# ============================================================================
+statement ok
+CREATE TABLE ad1(k INT, dn DOUBLE);
+
+statement ok
+INSERT INTO ad1 SELECT i % 50000, (i % 11) * 1.0 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE ad2(k INT);
+
+statement ok
+INSERT INTO ad2 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE ad3(k INT);
+
+statement ok
+INSERT INTO ad3 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE af(k1 INT, k2 INT, k3 INT, dv DOUBLE, iv INT, cat INT);
+
+statement ok
+INSERT INTO af SELECT i % 50000, i % 50000, i % 50000, (i % 8) * 1.0, i % 8, i % 5 FROM range(250000) t(i);
+
+# FIRE: ungrouped SUM over a DOUBLE measure on the fact (home = root center).
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query R
+SELECT SUM(af.dv) FROM af, ad1, ad2, ad3
+WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k;
+----
+109375000.0
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: set-safe MIN/MAX (no _freq weight) + COUNT(col) (SUM of _freq over
+# non-null rows) in one ungrouped query.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query III
+SELECT MIN(af.iv), MAX(af.iv), COUNT(af.iv) FROM af, ad1, ad2, ad3
+WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k;
+----
+0	7	31250000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: AVG grouped by a fact attribute (guard = star center). AVG carries a
+# weighted sum + weighted count pair and divides at the root.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IR
+SELECT af.cat, ROUND(AVG(af.dv), 6) FROM af, ad1, ad2, ad3
+WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k
+GROUP BY af.cat ORDER BY af.cat;
+----
+0	3.5
+1	3.5
+2	3.5
+3	3.5
+4	3.5
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: multi-node aggregates — SUM over the fact AND SUM over a DIMENSION
+# (ad1.dn) in the same query, grouped by a fact attribute. Exercises threading
+# an off-root aggregate's _agg state up through the fold.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IRR
+SELECT af.cat, SUM(af.dv), SUM(ad1.dn) FROM af, ad1, ad2, ad3
+WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k
+GROUP BY af.cat ORDER BY af.cat;
+----
+0	21875000.0	31250375.0
+1	21875000.0	31249625.0
+2	21875000.0	31248875.0
+3	21875000.0	31249500.0
+4	21875000.0	31250125.0
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: COUNT(*) + SUM + MIN + MAX mixed in one grouped query.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IIRII
+SELECT af.cat, COUNT(*), SUM(af.dv), MIN(af.iv), MAX(af.iv) FROM af, ad1, ad2, ad3
+WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k
+GROUP BY af.cat ORDER BY af.cat;
+----
+0	6250000	21875000.0	0	7
+1	6250000	21875000.0	0	7
+2	6250000	21875000.0	0	7
+3	6250000	21875000.0	0	7
+4	6250000	21875000.0	0	7
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: integer SUM (HUGEINT result) is accumulated EXACTLY in HUGEINT through the
+# cascade. Small-value case over af.iv (INT) -- fires and matches native.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT SUM(af.iv) FROM af, ad1, ad2, ad3
+WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k;
+----
+109375000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# ============================================================================
+# EXACT-INTEGER GUARD: SUM over a BIGINT measure whose join-multiplied total
+# exceeds 2^53, so a DOUBLE accumulator (the original COUNT-only MVP's _freq
+# type) would silently round. The expected values are the EXACT native results;
+# their DOUBLE round-trips differ (e.g. 3906246093921875000 vs ...874944), so any
+# regression to DOUBLE arithmetic fails this test. big = i*1000003 + 7.
+# ============================================================================
+statement ok
+CREATE TABLE bi_d1(k INT);
+
+statement ok
+INSERT INTO bi_d1 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE bi_d2(k INT);
+
+statement ok
+INSERT INTO bi_d2 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE bi_d3(k INT);
+
+statement ok
+INSERT INTO bi_d3 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE bi_f(k1 INT, k2 INT, k3 INT, big BIGINT, cat INT);
+
+statement ok
+INSERT INTO bi_f SELECT i % 50000, i % 50000, i % 50000, (i * 1000003 + 7)::BIGINT, i % 5 FROM range(250000) t(i);
+
+# Ungrouped exact SUM (> 2^53). DOUBLE would give 3906246093921874944.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT SUM(bi_f.big) FROM bi_f, bi_d1, bi_d2, bi_d3
+WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k;
+----
+3906246093921875000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# Grouped exact SUM by a fact attribute (piecewise) -- each group > 2^53.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT bi_f.cat, SUM(bi_f.big) FROM bi_f, bi_d1, bi_d2, bi_d3
+WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k
+GROUP BY bi_f.cat ORDER BY bi_f.cat;
+----
+0	781236718746875000
+1	781242968765625000
+2	781249218784375000
+3	781255468803125000
+4	781261718821875000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# COUNT(col) + exact SUM mixed: COUNT also accumulates in HUGEINT now.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT COUNT(bi_f.big), SUM(bi_f.big) FROM bi_f, bi_d1, bi_d2, bi_d3
+WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k;
+----
+31250000	3906246093921875000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# AVG over the same BIGINT measure: the numerator (= the SUM above, 3.9e18) exceeds
+# 2^53, so a DOUBLE numerator would round. AVG(integer) keeps numerator AND
+# denominator exact in HUGEINT and divides as DOUBLE only at the root, reproducing
+# native AVG(int) = (double)int128_sum/(double)count EXACTLY. The .5 fraction is the
+# tell -- it survives only with the exact numerator.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query R
+SELECT AVG(bi_f.big) FROM bi_f, bi_d1, bi_d2, bi_d3
+WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k;
+----
+124999875005.5
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# Grouped exact AVG(integer) -- each group's numerator also exceeds 2^53.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IR
+SELECT bi_f.cat, AVG(bi_f.big) FROM bi_f, bi_d1, bi_d2, bi_d3
+WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k
+GROUP BY bi_f.cat ORDER BY bi_f.cat;
+----
+0	124997874999.5
+1	124998875002.5
+2	124999875005.5
+3	125000875008.5
+4	125001875011.5
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# ============================================================================
+# EXACT-DECIMAL GUARD: SUM over a DECIMAL(18,2) money column. DuckDB SUM(decimal)
+# returns DECIMAL(38,s); the cascade accumulates in DECIMAL(38,s), not DOUBLE.
+# One fact row carries an odd cent (+0.01), so the join-multiplied total has an odd
+# unscaled value above 2^53 -- non-DOUBLE-representable, so a DOUBLE-accumulator
+# regression would round (the .25 / odd cents would not survive). Values are the
+# exact native results.
+# ============================================================================
+statement ok
+CREATE TABLE dc_d1(k INT);
+
+statement ok
+INSERT INTO dc_d1 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE dc_d2(k INT);
+
+statement ok
+INSERT INTO dc_d2 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE dc_d3(k INT);
+
+statement ok
+INSERT INTO dc_d3 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE dc_f(k1 INT, k2 INT, k3 INT, amt DECIMAL(18,2), cat INT);
+
+statement ok
+INSERT INTO dc_f SELECT i % 50000, i % 50000, i % 50000,
+  ((((i * 1000003 + 7) % 1000000000) / 100.0) + CASE WHEN i = 0 THEN 0.01 ELSE 0.00 END)::DECIMAL(18,2),
+  i % 5 FROM range(250000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query R
+SELECT SUM(dc_f.amt) FROM dc_f, dc_d1, dc_d2, dc_d3
+WHERE dc_f.k1 = dc_d1.k AND dc_f.k2 = dc_d2.k AND dc_f.k3 = dc_d3.k;
+----
+156210939218751.25
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# Grouped exact DECIMAL SUM -- group 0 carries the odd-cent fact row.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IR
+SELECT dc_f.cat, SUM(dc_f.amt) FROM dc_f, dc_d1, dc_d2, dc_d3
+WHERE dc_f.k1 = dc_d1.k AND dc_f.k2 = dc_d2.k AND dc_f.k3 = dc_d3.k
+GROUP BY dc_f.cat ORDER BY dc_f.cat;
+----
+0	31117187468751.25
+1	31179687656250.00
+2	31242187843750.00
+3	31304688031250.00
+4	31367188218750.00
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# ============================================================================
+# MULTI-COLUMN GROUP BY: two (or more) GROUP BY columns that all live on the SAME
+# tree node ride through every fold as persistent kept columns (the common
+# "GROUP BY dim.a, dim.b" shape, e.g. TPC-H Q1). Columns spanning DIFFERENT nodes
+# bail (later stage). 3-table chain with a 100x fan-out -> 6,000,000 join rows.
+# ============================================================================
+statement ok
+CREATE TABLE mc_t2(c INT, g3 INT);
+
+statement ok
+INSERT INTO mc_t2 SELECT i % 600, i % 2 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE mc_t1(b INT, c INT);
+
+statement ok
+INSERT INTO mc_t1 SELECT i, i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE mc_t0(b INT, g1 INT, g2 INT);
+
+statement ok
+INSERT INTO mc_t0 SELECT i, i % 3, i % 2 FROM range(60000) t(i);
+
+# FIRE: GROUP BY two columns on the same node (mc_t0), COUNT(*) + SUM(mc_t1.b).
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IIII
+SELECT mc_t0.g1, mc_t0.g2, COUNT(*), SUM(mc_t1.b) FROM mc_t0, mc_t1, mc_t2
+WHERE mc_t0.b = mc_t1.b AND mc_t1.c = mc_t2.c
+GROUP BY mc_t0.g1, mc_t0.g2 ORDER BY mc_t0.g1, mc_t0.g2;
+----
+0	0	1000000	29997000000
+0	1	1000000	30000000000
+1	0	1000000	30001000000
+1	1	1000000	29998000000
+2	0	1000000	29999000000
+2	1	1000000	30002000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# BAIL: GROUP BY columns on DIFFERENT nodes (mc_t0.g1 + mc_t2.g3) -> stays native;
+# value still correct.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query III
+SELECT mc_t0.g1, mc_t2.g3, COUNT(*) FROM mc_t0, mc_t1, mc_t2
+WHERE mc_t0.b = mc_t1.b AND mc_t1.c = mc_t2.c
+GROUP BY mc_t0.g1, mc_t2.g3 ORDER BY mc_t0.g1, mc_t2.g3;
+----
+0	0	1000000
+0	1	1000000
+1	0	1000000
+1	1	1000000
+2	0	1000000
+2	1	1000000
+
+query T
+SELECT aggjoin_last_rewrite() != 'chain_count';
+----
+true
+
+# ============================================================================
+# SET-SAFE AGGREGATES: BOOL_AND / BOOL_OR / BIT_AND / BIT_OR are idempotent under
+# multiplicity (repeating a value freq times doesn't change the result), so the
+# fold passes them straight through with NO _freq weighting -- like MIN/MAX.
+# BIT_XOR is NOT set-safe (cancels on even repeats) and must bail. 3-table chain
+# with a 100x fan-out -> 6,000,000 join rows.
+# ============================================================================
+statement ok
+CREATE TABLE ss_t2(c INT);
+
+statement ok
+INSERT INTO ss_t2 SELECT i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ss_t1(b INT, c INT);
+
+statement ok
+INSERT INTO ss_t1 SELECT i, i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ss_t0(b INT, flag BOOLEAN, bits INTEGER, cat INT);
+
+statement ok
+INSERT INTO ss_t0 SELECT i, (i % 7 <> 0), (i % 64), i % 2 FROM range(60000) t(i);
+
+# FIRE: all four set-safe aggregates in one ungrouped query.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query TTII
+SELECT bool_and(ss_t0.flag), bool_or(ss_t0.flag), bit_and(ss_t0.bits), bit_or(ss_t0.bits)
+FROM ss_t0, ss_t1, ss_t2 WHERE ss_t0.b = ss_t1.b AND ss_t1.c = ss_t2.c;
+----
+false	true	0	63
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: grouped set-safe aggregates.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query ITTII
+SELECT ss_t0.cat, bool_and(ss_t0.flag), bool_or(ss_t0.flag), bit_and(ss_t0.bits), bit_or(ss_t0.bits)
+FROM ss_t0, ss_t1, ss_t2 WHERE ss_t0.b = ss_t1.b AND ss_t1.c = ss_t2.c
+GROUP BY ss_t0.cat ORDER BY ss_t0.cat;
+----
+0	false	true	0	62
+1	false	true	1	63
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# BAIL: BIT_XOR is multiplicity-sensitive (x ^ x = 0) -> stays native; value correct.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT bit_xor(ss_t0.bits) FROM ss_t0, ss_t1, ss_t2
+WHERE ss_t0.b = ss_t1.b AND ss_t1.c = ss_t2.c;
+----
+0
+
+query T
+SELECT aggjoin_last_rewrite() != 'chain_count';
+----
+true
+
+# ============================================================================
+# VAR / STDDEV via EXACT HUGEINT moments. The variance numerator n·Σx² − (Σx)² is
+# an exact non-negative integer for integer x, so the cancellation that plagues the
+# DOUBLE moment form vanishes -- and the result is DETERMINISTIC and the correctly-
+# rounded true value (native var_pop is thread-dependent: parallel Welford). So the
+# cascade is the more accurate AND reproducible answer; we ROUND for the assertion
+# (cascade and native agree to ~7 digits). Gated to <= 32-bit integer inputs to stay
+# overflow-safe (n·Σx² << HUGEINT max). 3-chain, 100x fan-out -> 6,000,000 rows.
+# ============================================================================
+statement ok
+CREATE TABLE vr_t2(c INT);
+
+statement ok
+INSERT INTO vr_t2 SELECT i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE vr_t1(b INT, c INT);
+
+statement ok
+INSERT INTO vr_t1 SELECT i, i % 600 FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE vr_t0(b INT, v INT, cat INT);
+
+statement ok
+INSERT INTO vr_t0 SELECT i, (i % 97), i % 2 FROM range(60000) t(i);
+
+# FIRE: VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP in one query (deterministic).
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query RRRR
+SELECT ROUND(VAR_POP(vr_t0.v), 6), ROUND(VAR_SAMP(vr_t0.v), 6),
+       ROUND(STDDEV_POP(vr_t0.v), 6), ROUND(STDDEV_SAMP(vr_t0.v), 6)
+FROM vr_t0, vr_t1, vr_t2 WHERE vr_t0.b = vr_t1.b AND vr_t1.c = vr_t2.c;
+----
+783.928676	783.928806	27.998726	27.998729
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: VARIANCE = VAR_SAMP, STDDEV = STDDEV_SAMP (SQL-standard sample defaults).
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query RR
+SELECT ROUND(VARIANCE(vr_t0.v), 6), ROUND(STDDEV(vr_t0.v), 6)
+FROM vr_t0, vr_t1, vr_t2 WHERE vr_t0.b = vr_t1.b AND vr_t1.c = vr_t2.c;
+----
+783.928806	27.998729
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: grouped VAR_POP by a fact attribute.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IR
+SELECT vr_t0.cat, ROUND(VAR_POP(vr_t0.v), 6) FROM vr_t0, vr_t1, vr_t2
+WHERE vr_t0.b = vr_t1.b AND vr_t1.c = vr_t2.c
+GROUP BY vr_t0.cat ORDER BY vr_t0.cat;
+----
+0	783.948008
+1	783.909343
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: a BIGINT input now fires when column STATISTICS bound the actual values
+# small enough that the exact HUGEINT moment can't overflow.  bv holds 0..96, so
+# the stats-driven overflow guard admits it (value identical to native — the
+# exact moment is the oracle).  bh holds the SAME values × 1e14 (large) and still
+# bails, since the stats then prove an overflow risk.
+statement ok
+CREATE TABLE vr_big(b INT, bv BIGINT, bh BIGINT, bv_u UBIGINT, bv_h HUGEINT);
+
+statement ok
+INSERT INTO vr_big SELECT i, (i % 97)::BIGINT, (i % 97)::BIGINT * 100000000000000, (i % 97)::UBIGINT, (i % 97)::HUGEINT FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query R
+SELECT ROUND(VAR_POP(vr_big.bv), 6) FROM vr_big, vr_t1, vr_t2
+WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
+----
+783.928676
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# FIRE: UBIGINT and HUGEINT inputs fire identically — same stats-driven admission
+# (bounded 0..96), same exact value.  The moment accumulates in HUGEINT regardless
+# of the input integer width, so the result is byte-identical to the BIGINT case.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query R
+SELECT ROUND(VAR_POP(vr_big.bv_u), 6) FROM vr_big, vr_t1, vr_t2
+WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
+----
+783.928676
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query R
+SELECT ROUND(VAR_POP(vr_big.bv_h), 6) FROM vr_big, vr_t1, vr_t2
+WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
+----
+783.928676
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
+# BAIL: the same column scaled up (bh ~ values × 1e14) overflows the exact moment,
+# so the stats-driven overflow guard still bails to native.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+SELECT VAR_POP(vr_big.bh) FROM vr_big, vr_t1, vr_t2
+WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
+
+query T
+SELECT aggjoin_last_rewrite() != 'chain_count';
+----
+true

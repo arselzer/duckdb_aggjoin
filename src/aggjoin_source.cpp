@@ -89,18 +89,19 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                 for (idx_t a = 0; a < na; a++) {
                     auto &fn = col.agg_funcs[a];
                     if (fn == "COUNT") {
-                        if (bc_all_one) {
-                            for (idx_t r = 0; r < n; r++) {
-                                if (sl[r] != DConstants::INVALID_INDEX) sink.build_slot_sums[a * cap + sl[r]] += 1.0;
-                            }
-                        } else {
-                            for (idx_t r = 0; r < n; r++) {
-                                if (sl[r] != DConstants::INVALID_INDEX) sink.build_slot_sums[a * cap + sl[r]] += bc[r];
-                            }
+                        auto ci = col.agg_input_cols[a];
+                        auto *cvalidity = (ci != DConstants::INVALID_INDEX && ci < input.ColumnCount())
+                                              ? FlatVector::Validity(input.data[ci]).GetData()
+                                              : nullptr;
+                        for (idx_t r = 0; r < n; r++) {
+                            if (sl[r] == DConstants::INVALID_INDEX) continue;
+                            if (cvalidity && !((cvalidity[r / 64] >> (r % 64)) & 1)) continue;
+                            sink.build_slot_sums[a * cap + sl[r]] += bc_all_one ? 1.0 : bc[r];
                         }
                         continue;
                     }
                     auto ai = col.agg_input_cols[a];
+                    auto *validity = FlatVector::Validity(input.data[ai]).GetData();
                     auto ptype = input.data[ai].GetType().InternalType();
                     bool is_sum = (fn == "SUM");
                     bool is_avg = (fn == "AVG");
@@ -112,6 +113,7 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                             if (is_min || is_max) { \
                                 for (idx_t r = 0; r < n; r++) { \
                                     if (sl[r] == DConstants::INVALID_INDEX) continue; \
+                                    if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue; \
                                     auto off = a * cap + sl[r]; \
                                     double v = (double)vals[r]; \
                                     if (!sink.build_slot_has[off]) { \
@@ -125,14 +127,18 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                             } else if (bc_all_one) { \
                                 for (idx_t r = 0; r < n; r++) { \
                                     if (sl[r] == DConstants::INVALID_INDEX) continue; \
+                                    if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue; \
                                     sink.build_slot_sums[a * cap + sl[r]] += (double)vals[r]; \
                                     if (is_avg) sink.build_slot_counts[a * cap + sl[r]] += 1.0; \
+                                    if (is_sum) sink.build_slot_has[a * cap + sl[r]] = 1; \
                                 } \
                             } else { \
                                 for (idx_t r = 0; r < n; r++) { \
                                     if (sl[r] == DConstants::INVALID_INDEX) continue; \
+                                    if (validity && !((validity[r / 64] >> (r % 64)) & 1)) continue; \
                                     sink.build_slot_sums[a * cap + sl[r]] += (double)vals[r] * bc[r]; \
                                     if (is_avg) sink.build_slot_counts[a * cap + sl[r]] += bc[r]; \
+                                    if (is_sum) sink.build_slot_has[a * cap + sl[r]] = 1; \
                                 } \
                             } \
                         } while (0)
@@ -254,7 +260,7 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                 auto *avg_counts = sink.has_avg ? sink.build_slot_counts.data() : nullptr;
                 auto *mins = sink.has_min_max ? sink.build_slot_mins.data() : nullptr;
                 auto *maxs = sink.has_min_max ? sink.build_slot_maxs.data() : nullptr;
-                auto *has = sink.has_min_max ? sink.build_slot_has.data() : nullptr;
+                auto *has = sink.build_slot_has.empty() ? nullptr : sink.build_slot_has.data();
                 for (idx_t r = 0; r < n; r++) {
                     auto slot_idx = sl[r];
                     if (slot_idx == DConstants::INVALID_INDEX) continue;
@@ -272,6 +278,7 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                         case BuildSlotAggSlot::SUM_VAL:
                             if (slot.validity && !((slot.validity[r / 64] >> (r % 64)) & 1)) break;
                             sums[a * cap + slot_idx] += slot.vals[r] * mult;
+                            has[a * cap + slot_idx] = 1;
                             break;
                         case BuildSlotAggSlot::AVG_VAL:
                             if (slot.validity && !((slot.validity[r / 64] >> (r % 64)) & 1)) break;
@@ -324,6 +331,7 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                 if (f == "SUM" || f == "AVG" || f == "COUNT") {
                     bool is_avg = (f == "AVG");
                     bool is_count = (f == "COUNT");
+                    bool is_sum = (f == "SUM");
                     bool pkfk = sink.all_bc_one;
                     auto cap = sink.build_ht.mask + 1;
                     #define BUILD_SLOT_SUM_LOOP(TYPE) { \
@@ -334,6 +342,7 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                                 if (validity && !((validity[r/64] >> (r%64)) & 1)) continue; \
                                 sink.build_slot_sums[a * cap + sl[r]] += is_count ? 1.0 : (double)vals[r]; \
                                 if (is_avg) sink.build_slot_counts[a * cap + sl[r]] += 1.0; \
+                                if (is_sum) sink.build_slot_has[a * cap + sl[r]] = 1; \
                             } \
                         } else { \
                             for (idx_t r = 0; r < n; r++) { \
@@ -341,6 +350,7 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                                 if (validity && !((validity[r/64] >> (r%64)) & 1)) continue; \
                                 sink.build_slot_sums[a * cap + sl[r]] += (is_count ? 1.0 : (double)vals[r]) * bc[r]; \
                                 if (is_avg) sink.build_slot_counts[a * cap + sl[r]] += bc[r]; \
+                                if (is_sum) sink.build_slot_has[a * cap + sl[r]] = 1; \
                             } \
                         } \
                     }
@@ -359,7 +369,12 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
                         for (idx_t r = 0; r < n; r++) {
                             if (sl[r] == DConstants::INVALID_INDEX) continue;
                             if (validity && !((validity[r/64] >> (r%64)) & 1)) continue;
-                            sink.build_slot_sums[a * cap + sl[r]] += input.data[ai].GetValue(r).GetValue<double>() * (is_count ? 1.0 : bc[r]);
+                            if (is_count) {
+                                sink.build_slot_sums[a * cap + sl[r]] += bc[r];
+                            } else {
+                                sink.build_slot_sums[a * cap + sl[r]] += input.data[ai].GetValue(r).GetValue<double>() * bc[r];
+                                if (is_sum) sink.build_slot_has[a * cap + sl[r]] = 1;
+                            }
                             if (is_avg) sink.build_slot_counts[a * cap + sl[r]] += bc[r];
                         }
                         break;

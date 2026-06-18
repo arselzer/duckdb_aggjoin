@@ -1,0 +1,115 @@
+# name: test/sql/aggjoin_phantom_groups.test
+# description: Direct-mode group emission must be gated on probe-matched keys,
+#              not build-side key presence. DuckDB's dynamic min/max join
+#              filter only trims build keys OUTSIDE the probe range, so
+#              build-key gaps strictly INSIDE the probe range expose
+#              build-presence emission as phantom (COUNT=0) groups.
+# group: [aggjoin]
+
+require aggjoin
+
+# ── Build keys with gaps inside the probe range (probe = even keys only) ──
+
+statement ok
+CREATE TABLE probe_even AS SELECT (i*2)::INT AS x, 1.0::DOUBLE AS val FROM range(50) t(i);
+
+statement ok
+CREATE TABLE build_all AS SELECT i::INT AS x FROM range(100) t(i);
+
+# Odd build keys (1,3,...) never match any probe row; an inner join must not
+# produce them. Pre-fix the extension emitted 99 groups incl. (1, 0, 0.0).
+query III
+SELECT probe_even.x, COUNT(*), CAST(SUM(probe_even.val) AS INTEGER)
+FROM probe_even JOIN build_all ON probe_even.x = build_all.x
+GROUP BY probe_even.x ORDER BY probe_even.x LIMIT 6;
+----
+0	1	1
+2	1	1
+4	1	1
+6	1	1
+8	1	1
+10	1	1
+
+# ── Small exact-result variant (direct mode) ──
+
+statement ok
+CREATE TABLE pr (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO pr VALUES (0, 1.0), (2, 2.0), (2, 3.0), (4, 4.0);
+
+statement ok
+CREATE TABLE bl (x INT);
+
+statement ok
+INSERT INTO bl VALUES (0), (1), (2), (3), (4);
+
+query III rowsort
+SELECT pr.x, COUNT(*), CAST(SUM(pr.val) AS INTEGER)
+FROM pr JOIN bl ON pr.x = bl.x GROUP BY pr.x;
+----
+0	1	1
+2	2	5
+4	1	4
+
+# Probe keys missing from build must not appear either.
+statement ok
+CREATE TABLE bl2 (x INT);
+
+statement ok
+INSERT INTO bl2 VALUES (2);
+
+query III rowsort
+SELECT pr.x, COUNT(*), CAST(SUM(pr.val) AS INTEGER)
+FROM pr JOIN bl2 ON pr.x = bl2.x GROUP BY pr.x;
+----
+2	2	5
+
+# ── Zero probe matches: grouped result must be empty, not all build keys ──
+
+statement ok
+CREATE TABLE pr_miss (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO pr_miss VALUES (10, 1.0), (11, 2.0);
+
+statement ok
+CREATE TABLE bl_miss (x INT);
+
+statement ok
+INSERT INTO bl_miss VALUES (1), (2), (3);
+
+query III rowsort
+SELECT pr_miss.x, COUNT(*), CAST(SUM(pr_miss.val) AS INTEGER)
+FROM pr_miss JOIN bl_miss ON pr_miss.x = bl_miss.x GROUP BY pr_miss.x;
+----
+
+# ── track_active_keys direct path (key range > 1M): probe keys inside the
+#    range but absent from the build side must not be recorded as groups ──
+
+statement ok
+CREATE TABLE pr_wide (x INT, val DOUBLE);
+
+statement ok
+INSERT INTO pr_wide VALUES (0, 1.0), (1000000, 9.0), (2000000, 2.0);
+
+statement ok
+CREATE TABLE bl_wide (x INT);
+
+statement ok
+INSERT INTO bl_wide VALUES (0), (2000000);
+
+query II rowsort
+SELECT pr_wide.x, CAST(SUM(pr_wide.val) AS INTEGER)
+FROM pr_wide JOIN bl_wide ON pr_wide.x = bl_wide.x GROUP BY pr_wide.x;
+----
+0	1
+2000000	2
+
+# Same shape with COUNT(*) + SUM (segmented multi-aggregate path)
+query III rowsort
+SELECT pr_wide.x, COUNT(*), CAST(SUM(pr_wide.val) AS INTEGER)
+FROM pr_wide JOIN bl_wide ON pr_wide.x = bl_wide.x GROUP BY pr_wide.x;
+----
+0	1	1
+2000000	1	2

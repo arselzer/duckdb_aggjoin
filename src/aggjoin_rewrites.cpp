@@ -19,11 +19,20 @@ namespace duckdb {
 // Optimizer: post-optimize with Projection chain tracing
 // ============================================================
 
+// IsBareColumnKey lives in aggjoin_rewrites_internal.hpp (shared with the
+// chain-COUNT rewrite). (Review bug B, 2026-06-15.)
+
 static bool IsEquiJoin(LogicalOperator &op) {
     if(op.type!=LogicalOperatorType::LOGICAL_COMPARISON_JOIN) return false;
     auto &j=op.Cast<LogicalComparisonJoin>();
     if(j.join_type!=JoinType::INNER) return false;
-    for(auto &c:j.conditions) if(c.comparison!=ExpressionType::COMPARE_EQUAL) return false;
+    for(auto &c:j.conditions) {
+        if(c.comparison!=ExpressionType::COMPARE_EQUAL) return false;
+        // Both sides must be bare columns — reject function/arithmetic-wrapped
+        // keys (LOWER(x)=LOWER(y), x+1=y) which the runtime would otherwise join
+        // on the raw column, silently dropping the function. (Review bug B.)
+        if(!IsBareColumnKey(*c.left) || !IsBareColumnKey(*c.right)) return false;
+    }
     return !j.conditions.empty();
 }
 
@@ -48,7 +57,13 @@ static bool ExtractBinding(Expression &expr, ColumnBinding &binding) {
 static bool IsAggregate(LogicalOperator &op) {
     if(op.type!=LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) return false;
     auto &a=op.Cast<LogicalAggregate>();
-    
+
+    // ROLLUP / CUBE / GROUPING SETS lower to a single LogicalAggregate with
+    // multiple grouping sets; the fused operator only computes the primary
+    // grouping and would silently drop the other levels. GROUPING() functions
+    // likewise have no fused equivalent. Bail to native execution.
+    if (a.grouping_sets.size() > 1 || !a.grouping_functions.empty()) return false;
+
     // Ungrouped aggregates (no GROUP BY) are supported — single result row
     for(auto &e:a.expressions) {
         if(e->type!=ExpressionType::BOUND_AGGREGATE) { return false; }
@@ -83,20 +98,74 @@ static LogicalComparisonJoin *FindJoin(LogicalOperator &op) {
     return nullptr;
 }
 
+// A correlated subquery is decorrelated into DELIM_JOIN / DELIM_GET (and, before
+// decorrelation, DEPENDENT_JOIN) nodes: a DELIM_GET replays the OUTER query's
+// tuples into the inner plan. An aggregate matched over such a subtree depends on
+// that correlation, which neither the fused PhysicalAggJoin operator nor the
+// native cascades model -- firing computes the aggregate over the wrong (outer-
+// independent) relation and silently drops the correlation (TPC-H q02 dropped all
+// rows; q17 inflated ~100x because the subquery AVG was wrong, so the outer
+// l_quantity < AVG filter passed everything). Decline every aggjoin rewrite when
+// any such node is in the aggregate's input subtree.
+static bool SubtreeHasDelim(LogicalOperator &op) {
+    switch (op.type) {
+    case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+    case LogicalOperatorType::LOGICAL_DELIM_GET:
+    case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+        return true;
+    default:
+        break;
+    }
+    for (auto &c : op.children) {
+        if (SubtreeHasDelim(*c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
                     AggJoinRewriteState &state, bool has_parent) {
     for (auto &c : op->children) {
         WalkAndReplace(context, optimizer, c, state, true);
     }
+
+    // Correlated-subquery decorrelation guard (see SubtreeHasDelim): an aggregate
+    // whose input subtree contains a DELIM/dependent join replays outer tuples that
+    // none of the aggjoin rewrites model -- decline all of them for this aggregate.
+    if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
+        SubtreeHasDelim(*op->children[0])) {
+        return;
+    }
+
+    // The chain-count cascade lowers entirely to native operators and has complete
+    // internal gating, including an EXACT-HUGEINT path for integer SUM (whose
+    // HUGEINT result the shared IsAggregate gate below excludes for the Value-heavy
+    // operator paths). Try it FIRST, before that gate, so integer SUM is not
+    // blocked; it bails cleanly on every shape it does not own.
+    if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1) {
+        if (auto *cc_join = FindJoin(*op->children[0])) {
+            auto &cc_agg = op->Cast<LogicalAggregate>();
+            auto &cc_child = *op->children[0];
+            if (AggJoinCascadeEnabled() &&
+                TryRewriteNativeChainCountStar(context, optimizer, op, cc_agg, *cc_join, cc_child, state, has_parent)) {
+                return;
+            }
+        }
+    }
+
     if(!IsAggregate(*op)||op->children.size()!=1) return;
     auto *join = FindJoin(*op->children[0]);
     if(!join) { return; }
-    
+
 
     auto &agg = op->Cast<LogicalAggregate>();
     auto &agg_child = *op->children[0]; // Projection chain above Join
 
-    if (TryRewriteNativeFinalBagPreagg(context, optimizer, op, agg, *join, agg_child, state, has_parent)) {
+    // final-bag covers the SUM/MIN/MAX/AVG split-payload shapes the chain-count
+    // cascade declines (chain-count was already attempted above).
+    if (AggJoinCascadeEnabled() &&
+        TryRewriteNativeFinalBagPreagg(context, optimizer, op, agg, *join, agg_child, state, has_parent)) {
         return;
     }
 
@@ -359,10 +428,24 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         return ExtractBinding(expr, binding) ? find_binding_idx(child_bindings, binding)
                                              : DConstants::INVALID_INDEX;
     };
+    auto &left_child_types = join->children[0]->types;
+    auto &right_child_types = join->children[1]->types;
     for(auto &cond : join->conditions) {
         auto li = resolve_join_child_idx(*cond.left, left_child_bindings);
         auto ri = resolve_join_child_idx(*cond.right, right_child_bindings);
         if (li == DConstants::INVALID_INDEX || ri == DConstants::INVALID_INDEX) return;
+        // Bug C (2026-06-15): a UINT64 join key paired with a different-width or
+        // signed integer key can hold values (> INT64_MAX) that are
+        // unrepresentable in the signed-offset arithmetic the direct/segmented
+        // runtime uses — such a value wraps negative and can collide with a real
+        // signed build-key slot. Bail mismatched-integer-type joins to native.
+        if (li < left_child_types.size() && ri < right_child_types.size()) {
+            auto lp = left_child_types[li].InternalType();
+            auto rp = right_child_types[ri].InternalType();
+            if ((lp == PhysicalType::UINT64 || rp == PhysicalType::UINT64) && lp != rp) {
+                return;
+            }
+        }
         if (need_swap) {
             // After swap: original left (probe) is now build, right is now probe
             col.probe_key_cols.push_back(ri);
@@ -377,12 +460,14 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
     if (col.probe_key_cols.empty() || col.build_key_cols.empty()) return;
     if (col.probe_key_cols.size() != col.build_key_cols.size()) return;
 
-    if (TryRewriteNativeMixedSidePreagg(context, optimizer, op, agg, *join, agg_child, col, need_swap,
+    if (AggJoinCascadeEnabled() &&
+        TryRewriteNativeMixedSidePreagg(context, optimizer, op, agg, *join, agg_child, col, need_swap,
                                         state, has_parent)) {
         return;
     }
 
-    if (TryRewriteNativeBuildPreagg(context, optimizer, op, agg, *join, agg_child, col, build_agg_count, need_swap,
+    if (AggJoinCascadeEnabled() &&
+        TryRewriteNativeBuildPreagg(context, optimizer, op, agg, *join, agg_child, col, build_agg_count, need_swap,
                                     state, has_parent)) {
         return;
     }
@@ -531,6 +616,12 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                 need_swap ? 1 : 0);
     }
 
+    // The fused operator is the riskier, custom-execution path — let a deployment
+    // turn it off independently of the native-lowering cascade.
+    if (!AggJoinOperatorEnabled()) {
+        return;
+    }
+
     // Create LogicalAggJoin
     auto aj = make_uniq<LogicalAggJoin>();
     // Build return types: group columns use compressed types (if compression exists)
@@ -573,7 +664,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         aj->children = std::move(join->children);
     }
 
-
+    SetAggJoinLastRewrite("fused");
     op = std::move(aj);
 }
 

@@ -73,6 +73,13 @@ unique_ptr<GlobalSinkState> PhysicalAggJoin::GetGlobalSinkState(ClientContext &c
             native_safe = false;
             break;
         }
+        // The native-HT payload path scales SUM inputs as doubles in place;
+        // a non-DOUBLE payload would be reinterpreted with the wrong width.
+        if (fn == "SUM" &&
+            (ba.children.empty() || ba.children[0]->return_type.InternalType() != PhysicalType::DOUBLE)) {
+            native_safe = false;
+            break;
+        }
     }
     bool weak_group_shape = (col.group_cols.size() > 1 || col.probe_key_cols.size() > 1);
     state->use_native_ht = native_safe && weak_group_shape;
@@ -224,12 +231,15 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
             idx_t direct_limit = bytes_per_key > 0 ? max_working_set / bytes_per_key : 2000000;
             if (direct_limit < 100000) direct_limit = 100000;  // floor: always allow ≥100K keys
             if (direct_limit > 8000000) direct_limit = 8000000; // avoid pathological over-allocation
-            // Disable direct mode when build-side aggs are present and GROUP BY != join key.
-            // Direct mode maps one group per key offset, but multiple groups can share one key.
-            bool has_build_aggs_for_dm = false;
-            for (idx_t a = 0; a < col.agg_funcs.size(); a++)
-                if (col.agg_on_build.size() > a && col.agg_on_build[a]) { has_build_aggs_for_dm = true; break; }
-            bool allow_direct = !has_build_aggs_for_dm || group_is_key_candidate;
+            // Direct mode stores one group value per join-key offset (first-wins),
+            // so a grouped aggregate is only representable when GROUP BY *is* the
+            // join key (group_is_key_candidate) or the aggregate is ungrouped. For
+            // any independent GROUP BY column, distinct groups that share a join
+            // key would be silently merged into one result row — fall through to
+            // the per-group result-hash path instead. (Review bug A, 2026-06-15:
+            // the prior `!has_build_aggs_for_dm` escape let probe-side-aggregate
+            // group!=key shapes — the canonical star-join — into direct mode.)
+            bool allow_direct = group_is_key_candidate;
             // Non-numeric MIN/MAX can't use double flat arrays — skip direct mode
             bool has_non_numeric_minmax = false;
             for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
@@ -246,14 +256,18 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                 sink.num_aggs = col.agg_funcs.size();
                 sink.build_counts.resize(range, 0);
                 sink.direct_sums.resize(range * sink.num_aggs, 0.0);
-                // Check if any aggregates are MIN/MAX or AVG and allocate flat arrays
+                // Check if any aggregates are MIN/MAX/SUM or AVG and allocate flat arrays
                 for (auto &f : col.agg_funcs) {
                     if (f == "MIN" || f == "MAX") sink.has_min_max = true;
                     if (f == "AVG") sink.has_avg = true;
+                    if (f == "SUM") sink.has_sum = true;
                 }
                 if (sink.has_min_max) {
                     sink.direct_mins.resize(range * sink.num_aggs, std::numeric_limits<double>::max());
                     sink.direct_maxs.resize(range * sink.num_aggs, std::numeric_limits<double>::lowest());
+                }
+                if (sink.has_min_max || sink.has_sum) {
+                    // SUM shares direct_has so all-NULL groups emit NULL.
                     sink.direct_has.resize(range * sink.num_aggs, false);
                 }
                 if (sink.has_avg) {
@@ -273,7 +287,11 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                 if (col.group_cols.size() == 1 && col.group_cols[0] == col.probe_key_cols[0]) {
                     sink.group_is_key = true;
                 }
-                if (sink.group_is_key && range > 1000000) {
+                // Always track probe-matched keys for grouped direct emit:
+                // emission must be gated on probe matches, not build presence,
+                // or build keys with zero probe matches surface as phantom
+                // COUNT=0 groups an inner join can never produce.
+                if (sink.group_is_key) {
                     sink.track_active_keys = true;
                     sink.direct_key_seen.assign(range, 0);
                     sink.direct_active_keys.reserve(std::min<idx_t>(range, sink.build_ht.count));
@@ -346,6 +364,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                     sink.segmented_build_counts.resize(seg_count);
                     sink.segmented_sums.resize(seg_count);
                     if (f0 == "AVG") sink.segmented_avg_counts.resize(seg_count);
+                    if (f0 == "SUM") sink.segmented_sum_has.resize(seg_count);
                     sink.segmented_active_bits.assign((range + 63) / 64, 0);
                         sink.segmented_active_keys.reserve(std::min<idx_t>(range, sink.build_ht.count));
                         sink.build_ht.ForEach([&](BuildEntry &b) {
@@ -356,6 +375,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                             sink.segmented_build_counts[seg].resize(sink.segmented_size, 0);
                             sink.segmented_sums[seg].resize(sink.segmented_size, 0.0);
                             if (f0 == "AVG") sink.segmented_avg_counts[seg].resize(sink.segmented_size, 0.0);
+                            if (f0 == "SUM") sink.segmented_sum_has[seg].resize(sink.segmented_size, 0);
                         }
                         sink.segmented_build_counts[seg][local] = (uint32_t)b.count;
                         if (b.count != 1) sink.all_bc_one = false;
@@ -371,6 +391,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                                          n_build_aggs_est == 0;
             if (!sink.direct_mode && !sink.segmented_direct_mode && all_int && segmented_multi_shape) {
                 bool segmented_multi_supported = true;
+                bool segmented_multi_has_sum = false;
                 idx_t accum_slots = 0, avg_slots = 0, min_slots = 0, max_slots = 0;
                 vector<idx_t> accum_index(na_total, DConstants::INVALID_INDEX);
                 vector<idx_t> avg_index(na_total, DConstants::INVALID_INDEX);
@@ -381,6 +402,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                     auto ai = col.agg_input_cols[a];
                     if (fn == "SUM" || fn == "AVG" || fn == "COUNT") {
                         accum_index[a] = accum_slots++;
+                        if (fn == "SUM") segmented_multi_has_sum = true;
                     }
                     if (fn == "AVG") {
                         avg_index[a] = avg_slots++;
@@ -423,6 +445,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                     auto seg_count = (range + sink.segmented_mask) >> sink.segmented_shift;
                     sink.segmented_build_counts.resize(seg_count);
                     sink.segmented_multi_accums.resize(seg_count);
+                    if (segmented_multi_has_sum) sink.segmented_multi_accum_has.resize(seg_count);
                     if (avg_slots) sink.segmented_multi_avg_counts.resize(seg_count);
                     if (min_slots) {
                         sink.segmented_multi_mins.resize(seg_count);
@@ -441,6 +464,8 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                         if (sink.segmented_build_counts[seg].empty()) {
                             sink.segmented_build_counts[seg].resize(sink.segmented_size, 0);
                             if (accum_slots) sink.segmented_multi_accums[seg].resize(sink.segmented_size * accum_slots, 0.0);
+                            if (segmented_multi_has_sum)
+                                sink.segmented_multi_accum_has[seg].resize(sink.segmented_size * accum_slots, 0);
                             if (avg_slots) sink.segmented_multi_avg_counts[seg].resize(sink.segmented_size * avg_slots, 0.0);
                             if (min_slots) {
                                 sink.segmented_multi_mins[seg].resize(sink.segmented_size * min_slots, std::numeric_limits<double>::max());
@@ -502,11 +527,15 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                     for (auto &fn : col.agg_funcs) {
                         if (fn == "MIN" || fn == "MAX") sink.has_min_max = true;
                         if (fn == "AVG") sink.has_avg = true;
+                        if (fn == "SUM") sink.has_sum = true;
                     }
                     if (sink.has_avg) sink.build_slot_counts.assign(cap * sink.num_aggs, 0.0);
                     if (sink.has_min_max) {
                         sink.build_slot_mins.assign(cap * sink.num_aggs, std::numeric_limits<double>::max());
                         sink.build_slot_maxs.assign(cap * sink.num_aggs, std::numeric_limits<double>::lowest());
+                    }
+                    if (sink.has_min_max || sink.has_sum) {
+                        // SUM shares build_slot_has so all-NULL groups emit NULL.
                         sink.build_slot_has.assign(cap * sink.num_aggs, 0);
                     }
                     if (varchar_key && sink.has_min_max && col.agg_funcs.size() >= 2 && sink.build_ht.count <= 5000) {

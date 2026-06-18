@@ -1,0 +1,157 @@
+# name: test/sql/aggjoin_review_fixes.test
+# description: Regression tests for the 2026-06-15 critical-review correctness bugs
+# group: [aggjoin]
+
+require aggjoin
+
+# ============================================================================
+# Bug A (HIGH): direct-mode merged distinct GROUP BY groups that share a join
+# key. SELECT <probe col != join key>, SUM(..) over a dense-integer-keyed join
+# grouped the result by the JOIN KEY and mislabelled groups (first-cat-wins).
+# This is the canonical star-join aggregate (group by a fact attribute, join to
+# a dimension). Before the fix: 3 rows all labelled cat=200. After: correct.
+# ============================================================================
+
+statement ok
+CREATE TABLE fact_a(fk INT, cat INT, amount DOUBLE);
+
+statement ok
+INSERT INTO fact_a VALUES (0,100,10.0),(0,200,20.0),(1,100,5.0),(1,200,7.0),(2,100,3.0);
+
+statement ok
+CREATE TABLE dim_a(pk INT);
+
+statement ok
+INSERT INTO dim_a VALUES (0),(1),(2),(3),(4);
+
+query IR rowsort
+SELECT fact_a.cat, SUM(fact_a.amount)
+FROM fact_a JOIN dim_a ON fact_a.fk = dim_a.pk
+GROUP BY fact_a.cat;
+----
+100	18.000000
+200	27.000000
+
+# Also COUNT(*) by an independent probe column.
+query II rowsort
+SELECT fact_a.cat, COUNT(*)
+FROM fact_a JOIN dim_a ON fact_a.fk = dim_a.pk
+GROUP BY fact_a.cat;
+----
+100	3
+200	2
+
+# ============================================================================
+# Bug B (HIGH): function/arithmetic-wrapped equi-join keys were silently
+# stripped (ExtractBinding peeled the function), joining on the raw column.
+# LOWER(r.x)=LOWER(s.x) was executed as r.x=s.x. The rewrite must now BAIL so
+# native runs the real predicate.
+# ============================================================================
+
+statement ok
+CREATE TABLE r_fn(x VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO r_fn VALUES ('A',1.0),('a',2.0),('B',4.0),('b',8.0);
+
+statement ok
+CREATE TABLE s_fn(x VARCHAR);
+
+statement ok
+INSERT INTO s_fn VALUES ('a'),('a'),('b');
+
+query TR rowsort
+SELECT r_fn.x, SUM(r_fn.val)
+FROM r_fn JOIN s_fn ON LOWER(r_fn.x) = LOWER(s_fn.x)
+GROUP BY r_fn.x;
+----
+A	2.000000
+B	4.000000
+a	4.000000
+b	8.000000
+
+# Arithmetic-wrapped key: r.x + 1 = s.y must NOT be executed as r.x = s.y.
+statement ok
+CREATE TABLE r_ar(x INT, val DOUBLE);
+
+statement ok
+INSERT INTO r_ar VALUES (1,10.0),(2,20.0),(3,30.0);
+
+statement ok
+CREATE TABLE s_ar(y INT);
+
+statement ok
+INSERT INTO s_ar VALUES (2),(3),(4);
+
+query IR rowsort
+SELECT r_ar.x, SUM(r_ar.val)
+FROM r_ar JOIN s_ar ON r_ar.x + 1 = s_ar.y
+GROUP BY r_ar.x;
+----
+1	10.000000
+2	20.000000
+3	30.000000
+
+# ============================================================================
+# Bug C (MED): UINT64 probe key > INT64_MAX collided into a signed direct-array
+# slot. A mixed-signedness equi-join (BIGINT build, UBIGINT probe) must not
+# enter the signed-offset direct/segmented path; the 2^64-1 probe value (which
+# matches nothing) must not be counted against build key -1.
+# ============================================================================
+
+statement ok
+CREATE TABLE b_u(k BIGINT, v DOUBLE);
+
+statement ok
+INSERT INTO b_u VALUES (0,5.0),(-1,99.0);
+
+statement ok
+CREATE TABLE p_u(k UBIGINT);
+
+statement ok
+INSERT INTO p_u VALUES (0),(18446744073709551615);
+
+query IR rowsort
+SELECT b_u.k, SUM(b_u.v)
+FROM b_u JOIN p_u ON b_u.k = p_u.k
+GROUP BY b_u.k;
+----
+0	5.000000
+
+# ============================================================================
+# Bug D (MED): the native final-bag rewrite reconciled mismatched join-key types
+# by casting the wider (tail) key DOWN to the narrower (bridge) type, instead of
+# widening both to the common super-type (as DuckDB's binder does). A tail key
+# value exceeding the narrow type's range raised an out-of-range Conversion
+# Error on a query native executes fine. After the fix both sides widen.
+# Sizes are >100K so the final-bag cardinality gate fires.
+# ============================================================================
+
+statement ok
+CREATE TABLE fb_head(ha INT, p1 DOUBLE);
+
+statement ok
+INSERT INTO fb_head SELECT i, 1.0 FROM range(120000) t(i);
+
+statement ok
+CREATE TABLE fb_bridge(ba INT, bb INT);
+
+statement ok
+INSERT INTO fb_bridge SELECT i, i FROM range(120000) t(i);
+
+statement ok
+CREATE TABLE fb_tail(tb BIGINT, p2 DOUBLE);
+
+statement ok
+INSERT INTO fb_tail SELECT i, 2.0 FROM range(120000) t(i);
+
+# One tail key > INT32 max that matches nothing — the narrowing cast errored on it.
+statement ok
+INSERT INTO fb_tail VALUES (4294970337, 7.0);
+
+query RR
+SELECT SUM(fb_head.p1), SUM(fb_tail.p2)
+FROM fb_head, fb_bridge, fb_tail
+WHERE fb_head.ha = fb_bridge.ba AND fb_bridge.bb = fb_tail.tb;
+----
+120000.000000	240000.000000
