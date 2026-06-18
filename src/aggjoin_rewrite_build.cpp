@@ -1,6 +1,112 @@
 #include "aggjoin_rewrites_internal.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+
+#include <cmath>
+#include <limits>
 
 namespace duckdb {
+
+namespace {
+
+bool ExtractStatsBinding(Expression &expr, ColumnBinding &binding) {
+    auto cls = expr.GetExpressionClass();
+    if (cls == ExpressionClass::BOUND_COLUMN_REF) {
+        binding = expr.Cast<BoundColumnRefExpression>().binding;
+        return true;
+    }
+    if (cls == ExpressionClass::BOUND_CAST) {
+        return ExtractStatsBinding(*expr.Cast<BoundCastExpression>().child, binding);
+    }
+    return false;
+}
+
+bool IsIntegralPhysicalType(PhysicalType type) {
+    switch (type) {
+    case PhysicalType::INT8:
+    case PhysicalType::INT16:
+    case PhysicalType::INT32:
+    case PhysicalType::INT64:
+    case PhysicalType::UINT8:
+    case PhysicalType::UINT16:
+    case PhysicalType::UINT32:
+    case PhysicalType::UINT64:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool TryGetIntegerKeyDomainFromStats(ClientContext &context, LogicalOperator &op, ColumnBinding binding,
+                                     idx_t &domain) {
+    LogicalOperator *cur = &op;
+    while (cur) {
+        if (cur->type == LogicalOperatorType::LOGICAL_GET) {
+            auto &get = cur->Cast<LogicalGet>();
+            if (binding.table_index != get.table_index) {
+                return false;
+            }
+            auto &col_ids = get.GetColumnIds();
+            if (binding.column_index >= col_ids.size()) {
+                return false;
+            }
+            auto col_idx = col_ids[binding.column_index];
+            unique_ptr<BaseStatistics> stats;
+#if __has_include("duckdb/main/extension_callback_manager.hpp")
+            if (get.function.statistics_extended) {
+                TableFunctionGetStatisticsInput input(get.bind_data.get(), col_idx);
+                stats = get.function.statistics_extended(context, input);
+            } else if (get.function.statistics) {
+                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
+            } else {
+                return false;
+            }
+#else
+            if (get.function.statistics) {
+                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
+            } else {
+                return false;
+            }
+#endif
+            if (!stats || !NumericStats::HasMinMax(*stats)) {
+                return false;
+            }
+            auto min_value = NumericStats::Min(*stats).GetValue<double>();
+            auto max_value = NumericStats::Max(*stats).GetValue<double>();
+            if (!std::isfinite(min_value) || !std::isfinite(max_value) || max_value < min_value) {
+                return false;
+            }
+            auto domain_d = max_value - min_value + 1.0;
+            if (domain_d <= 0 || domain_d > static_cast<double>(std::numeric_limits<idx_t>::max())) {
+                return false;
+            }
+            domain = static_cast<idx_t>(domain_d);
+            return domain > 0;
+        }
+        if (cur->type == LogicalOperatorType::LOGICAL_PROJECTION && cur->children.size() == 1) {
+            auto &proj = cur->Cast<LogicalProjection>();
+            if (binding.table_index != proj.table_index || binding.column_index >= proj.expressions.size()) {
+                return false;
+            }
+            if (!ExtractStatsBinding(*proj.expressions[binding.column_index], binding)) {
+                return false;
+            }
+            cur = cur->children[0].get();
+            continue;
+        }
+        if (cur->children.size() == 1) {
+            cur = cur->children[0].get();
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+} // namespace
+
 bool TryRewriteNativeBuildPreagg(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
                                  LogicalAggregate &agg, LogicalComparisonJoin &join, LogicalOperator &agg_child,
                                  const AggJoinColInfo &col, idx_t build_agg_count, bool need_swap,
@@ -69,24 +175,55 @@ bool TryRewriteNativeBuildPreagg(ClientContext &context, Optimizer &optimizer, u
     };
     auto probe_est = get_est(*(need_swap ? join.children[1] : join.children[0]));
     auto build_est = get_est(*(need_swap ? join.children[0] : join.children[1]));
+    auto join_est = join.has_estimated_cardinality ? join.estimated_cardinality : 0;
     auto group_est = agg.has_estimated_cardinality ? agg.estimated_cardinality : 0;
+    auto thread_count = ThreadsSetting::GetSetting(context).GetValue<int64_t>();
     if (AggJoinTraceEnabled()) {
         fprintf(stderr,
-                "[AGGJOIN] native-build-preagg estimates: probe_est=%llu build_est=%llu group_est=%llu\n",
-                (unsigned long long)probe_est, (unsigned long long)build_est, (unsigned long long)group_est);
+                "[AGGJOIN] native-build-preagg estimates: probe_est=%llu build_est=%llu join_est=%llu group_est=%llu threads=%lld\n",
+                (unsigned long long)probe_est, (unsigned long long)build_est,
+                (unsigned long long)join_est, (unsigned long long)group_est, (long long)thread_count);
     }
     if (probe_est == 0 || build_est == 0 || group_est == 0) {
         return false;
     }
+    bool all_linear_aggs = true;
+    for (idx_t a = 0; a < agg.expressions.size(); a++) {
+        auto &ba = agg.expressions[a]->Cast<BoundAggregateExpression>();
+        auto fn = StringUtil::Upper(ba.function.name);
+        if (fn != "SUM" && fn != "COUNT" && fn != "COUNT_STAR" && fn != "AVG") {
+            all_linear_aggs = false;
+            break;
+        }
+    }
     bool large_balanced_shape = probe_est >= 250000 && build_est >= 250000 &&
                                 probe_est <= build_est * 4 && build_est <= probe_est * 4;
     bool probe_key_is_varlen = false;
+    bool dense_duplicate_build_keys = false;
+    bool probe_preagg_reduces_rows = false;
     if (key_count == 1) {
         auto &probe_side = *(need_swap ? join.children[1] : join.children[0]);
+        auto &build_side = *(need_swap ? join.children[0] : join.children[1]);
         auto key_idx = col.probe_key_cols[0];
         if (key_idx < probe_side.types.size()) {
             auto key_id = probe_side.types[key_idx].id();
             probe_key_is_varlen = key_id == LogicalTypeId::VARCHAR || key_id == LogicalTypeId::BLOB;
+        }
+        if (key_idx < probe_side.types.size() && col.build_key_cols[0] < build_side.types.size() &&
+            IsIntegralPhysicalType(probe_side.types[key_idx].InternalType()) &&
+            IsIntegralPhysicalType(build_side.types[col.build_key_cols[0]].InternalType())) {
+            auto probe_bindings = probe_side.GetColumnBindings();
+            auto build_bindings = build_side.GetColumnBindings();
+            idx_t probe_key_domain = 0;
+            idx_t build_key_domain = 0;
+            if (key_idx < probe_bindings.size() && col.build_key_cols[0] < build_bindings.size() &&
+                TryGetIntegerKeyDomainFromStats(context, probe_side, probe_bindings[key_idx], probe_key_domain) &&
+                TryGetIntegerKeyDomainFromStats(context, build_side, build_bindings[col.build_key_cols[0]],
+                                                build_key_domain)) {
+                dense_duplicate_build_keys = build_est >= build_key_domain &&
+                                             build_est - build_key_domain >= build_key_domain / 2;
+                probe_preagg_reduces_rows = probe_est / 2 >= probe_key_domain;
+            }
         }
     }
     bool mid_fanout_varlen_probe_shape = !payload_on_build && grouped_by_join_key && key_count == 1 &&
@@ -94,7 +231,15 @@ bool TryRewriteNativeBuildPreagg(ClientContext &context, Optimizer &optimizer, u
                                          probe_est >= 100000 && build_est >= 100000 &&
                                          probe_est <= build_est * 4 && build_est <= probe_est * 4 &&
                                          group_est >= 20000 && group_est <= 100000;
-    if (!large_balanced_shape && !mid_fanout_varlen_probe_shape) {
+    bool join_fanout_at_least_1_5x = join_est >= probe_est && join_est - probe_est >= probe_est / 2;
+    bool stats_fanout_at_least_1_5x = dense_duplicate_build_keys && probe_preagg_reduces_rows;
+    bool single_thread_probe_heavy_ungrouped_shape = !payload_on_build && all_linear_aggs &&
+                                                     ungrouped && key_count == 1 && !probe_key_is_varlen &&
+                                                     thread_count <= 1 &&
+                                                     probe_est >= 1000000 && build_est >= 100000 &&
+                                                     (join_fanout_at_least_1_5x || stats_fanout_at_least_1_5x);
+    if (!large_balanced_shape && !mid_fanout_varlen_probe_shape &&
+        !single_thread_probe_heavy_ungrouped_shape) {
         if (AggJoinTraceEnabled()) {
             fprintf(stderr, "[AGGJOIN] native-build-preagg skip: outside balanced build-heavy envelope\n");
         }

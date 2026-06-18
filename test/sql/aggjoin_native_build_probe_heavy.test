@@ -1,0 +1,68 @@
+# name: test/sql/aggjoin_native_build_probe_heavy.test
+# description: Probe-heavy low-fanout ungrouped SUM can be faster as native
+#              build/preaggregate in single-threaded runtimes, but should stay
+#              native for unique build keys and parallel DuckDB.
+# group: [aggjoin]
+# differential: skip
+#   Uses aggjoin_last_rewrite() fire-assertions.
+
+require aggjoin
+
+statement ok
+CREATE TABLE nb_dim_unique AS SELECT i::INT x FROM range(100000) t(i);
+
+statement ok
+CREATE TABLE nb_dim_dup AS SELECT (i % 100000)::INT x FROM range(150000) t(i);
+
+statement ok
+CREATE TABLE nb_fact AS
+SELECT (i % 100000)::INT x, (i % 1000)::DOUBLE v
+FROM range(1000000) t(i);
+
+statement ok
+PRAGMA threads=1;
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT CAST(SUM(nb_fact.v) AS BIGINT)
+FROM nb_fact JOIN nb_dim_unique ON nb_fact.x = nb_dim_unique.x;
+----
+499500000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT CAST(SUM(nb_fact.v) AS BIGINT)
+FROM nb_fact JOIN nb_dim_dup ON nb_fact.x = nb_dim_dup.x;
+----
+749250000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+native_build
+
+statement ok
+PRAGMA threads=8;
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT CAST(SUM(nb_fact.v) AS BIGINT)
+FROM nb_fact JOIN nb_dim_dup ON nb_fact.x = nb_dim_dup.x;
+----
+749250000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
