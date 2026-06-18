@@ -18,8 +18,9 @@ const bootError = ref<string | null>(null)
 const version = ref('')
 const aggjoinLoaded = ref(false)
 
-const sql = ref('-- pick an example to the left, or import data, then hit Benchmark.\nSELECT 1;')
+const sql = ref('-- pick an example to the left, or import data, then benchmark it.\nSELECT 1;')
 const busy = ref(false)
+const importing = ref(false)
 const bench = ref<BenchResult | null>(null)
 const result = ref<QueryResult | null>(null)
 const error = ref<string | null>(null)
@@ -114,6 +115,7 @@ async function runOnce() {
 
 async function onFiles(files: File[]) {
   busy.value = true
+  importing.value = true
   try {
     let last: TableInfo | null = null
     for (const f of files) {
@@ -130,6 +132,7 @@ async function onFiles(files: File[]) {
     error.value = e?.message ?? String(e)
     notify('import failed', 'err')
   } finally {
+    importing.value = false
     busy.value = false
   }
 }
@@ -153,9 +156,11 @@ async function dropTable(name: string) {
     <!-- boot overlay -->
     <div v-if="!ready" class="boot">
       <div class="boot-card panel reveal">
-        <div class="scope"><div class="sweep" :class="{ err: bootError }" /></div>
         <template v-if="!bootError">
-          <p class="bs mono"><span class="dot" /> {{ bootStatus }}</p>
+          <div class="boot-status mono">
+            <span class="spin boot-ring" />
+            <span>{{ bootStatus }}</span>
+          </div>
           <p class="bn">Booting DuckDB-WASM &amp; the aggjoin extension — all client-side.</p>
         </template>
         <template v-else>
@@ -168,12 +173,12 @@ async function dropTable(name: string) {
     <main v-else class="grid reveal">
       <aside class="rail">
         <ExamplesPanel :active-id="activeExampleId" :busy="busy" @load="loadExample" />
-        <ImportPanel :busy="busy" @files="onFiles" />
+        <ImportPanel :busy="importing" @files="onFiles" />
         <SchemaPanel :tables="tables" @use="useTable" @drop="dropTable" />
       </aside>
 
       <div class="main">
-        <SqlPanel v-model="sql" :busy="busy" :ready="ready" @run="runOnce" @benchmark="runBenchmark" />
+        <SqlPanel v-model="sql" :busy="busy" :ready="ready" @benchmark="runBenchmark" />
         <BenchPanel :bench="bench" :busy="busy" />
         <ResultsTable :result="result" :error="error" />
       </div>
@@ -194,7 +199,7 @@ async function dropTable(name: string) {
 .app { max-width: 1320px; margin: 0 auto; padding: 0 26px 60px; }
 
 .grid { display: grid; grid-template-columns: 348px 1fr; gap: 18px; margin-top: 20px; align-items: start; }
-.rail { display: grid; gap: 18px; position: sticky; top: 18px; }
+.rail { display: grid; gap: 18px; position: sticky; top: 18px; min-width: 0; }
 .main { display: grid; gap: 18px; min-width: 0; }
 
 @media (max-width: 980px) {
@@ -205,17 +210,12 @@ async function dropTable(name: string) {
 /* boot overlay */
 .boot { display: grid; place-items: center; min-height: 56vh; }
 .boot-card { width: min(520px, 92vw); padding: 26px; text-align: center; }
-.scope {
-  height: 84px; border-radius: var(--r); border: 1px solid var(--line); overflow: hidden; position: relative;
-  background:
-    linear-gradient(transparent calc(50% - 1px), var(--amber-line) 50%, transparent calc(50% + 1px)),
-    repeating-linear-gradient(90deg, transparent 0 23px, var(--line) 23px 24px),
-    var(--ink-2);
+.boot-status { display: inline-flex; align-items: center; justify-content: center; gap: 10px; color: var(--blue); font-size: 13px; }
+.boot-ring {
+  width: 16px; height: 16px; border-radius: 99px;
+  border: 2px solid rgba(15, 105, 134, 0.22);
+  border-top-color: var(--blue);
 }
-.sweep { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--amber); box-shadow: 0 0 16px var(--amber); animation: sweepX 1.4s linear infinite; }
-.sweep.err { background: var(--red); box-shadow: 0 0 16px var(--red); animation: none; left: 0; opacity: 0.5; }
-@keyframes sweepX { from { left: -2%; } to { left: 102%; } }
-.bs { margin: 20px 0 8px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--amber); font-size: 13px; }
 .bn { margin: 0; color: var(--text-faint); font-size: 12px; }
 .be { color: var(--red); margin: 18px 0 8px; }
 .bep { color: var(--text-dim); font-size: 11.5px; white-space: pre-wrap; text-align: left; line-height: 1.5; }

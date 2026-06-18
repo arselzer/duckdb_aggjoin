@@ -41,15 +41,15 @@ ORDER BY r_str.x;`,
   },
   {
     id: 'asymmetric-sum',
-    title: 'Asymmetric SUM over a join',
+    title: 'Fanout SUM over a join',
     kind: 'operator',
     blurb:
-      'A 2M-row fact probing a 100K-key dimension. AggJoin fuses the aggregate into the probe — no 2M-row intermediate to scan twice.',
+      'A 1.2M-row fact joins a repeated-key dimension, expanding to 6M rows. AggJoin folds the dimension multiplicity into the aggregate instead of scanning the fanout.',
     setup: `CREATE OR REPLACE TABLE dim AS
-  SELECT i AS x FROM range(100000) t(i);
+  SELECT (i % 80000) AS x FROM range(400000) t(i);
 CREATE OR REPLACE TABLE fact AS
-  SELECT (i % 100000) AS x, (i % 997)::DOUBLE AS v
-  FROM range(2000000) t(i);`,
+  SELECT (i % 80000) AS x, (i % 997)::DOUBLE AS v
+  FROM range(1200000) t(i);`,
     query: `SELECT SUM(fact.v) AS total
 FROM fact JOIN dim ON fact.x = dim.x;`,
   },
@@ -73,13 +73,42 @@ GROUP BY rows_t.x;`,
     title: 'DBLP graph · 3-hop paths',
     kind: 'cascade',
     blurb:
-      'A real 1.05M-edge co-authorship graph (SNAP com-DBLP). Counting 3-edge paths explodes to 67M — the Yannakakis cascade propagates per-node frequencies instead of building that product. The win climbs steeply with path length (≈8× at 4 hops, ≈24× at 5).',
+      'A real 1.05M-edge co-authorship graph (SNAP com-DBLP). Counting 3-edge paths already expands heavily; the cascade propagates per-node frequencies instead of building the product.',
     dataset: { file: 'dblp.parquet', table: 'edges', sizeLabel: '3.3 MB · 1.05M edges' },
     setup: '',
     query: `SELECT COUNT(*) AS three_hop_paths
 FROM edges e1, edges e2, edges e3
 WHERE e1.toNode = e2.fromNode
   AND e2.toNode = e3.fromNode;`,
+  },
+  {
+    id: 'dblp-graph-4hop',
+    title: 'DBLP graph · 4-hop paths',
+    kind: 'cascade',
+    blurb:
+      'The same DBLP graph with one more hop. This is where the Yannakakis-style rewrite starts to look materially different from the native join tree.',
+    dataset: { file: 'dblp.parquet', table: 'edges', sizeLabel: '3.3 MB · 1.05M edges' },
+    setup: '',
+    query: `SELECT COUNT(*) AS four_hop_paths
+FROM edges e1, edges e2, edges e3, edges e4
+WHERE e1.toNode = e2.fromNode
+  AND e2.toNode = e3.fromNode
+  AND e3.toNode = e4.fromNode;`,
+  },
+  {
+    id: 'dblp-graph-5hop',
+    title: 'DBLP graph · 5-hop paths',
+    kind: 'cascade',
+    blurb:
+      'A 5-hop path count on the bundled graph. The native baseline has much more fanout to account for, while the cascade keeps propagating compact counts.',
+    dataset: { file: 'dblp.parquet', table: 'edges', sizeLabel: '3.3 MB · 1.05M edges' },
+    setup: '',
+    query: `SELECT COUNT(*) AS five_hop_paths
+FROM edges e1, edges e2, edges e3, edges e4, edges e5
+WHERE e1.toNode = e2.fromNode
+  AND e2.toNode = e3.fromNode
+  AND e3.toNode = e4.fromNode
+  AND e4.toNode = e5.fromNode;`,
   },
   {
     id: 'chain-count',

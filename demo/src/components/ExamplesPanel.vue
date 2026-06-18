@@ -18,7 +18,7 @@ const emit = defineEmits<{ load: [Example] }>()
       >
         <div class="top">
           <span class="title">{{ ex.title }}</span>
-          <span class="tag" :class="ex.kind === 'operator' ? 'amber' : 'slate'">{{ KIND_LABEL[ex.kind] }}</span>
+          <span class="tag" :class="ex.kind === 'operator' ? 'amber' : 'cyan'">{{ KIND_LABEL[ex.kind] }}</span>
         </div>
         <p class="blurb">{{ ex.blurb }}</p>
         <p v-if="ex.dataset" class="ds mono">⤓ bundled dataset · {{ ex.dataset.sizeLabel }}</p>

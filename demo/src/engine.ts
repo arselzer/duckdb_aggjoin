@@ -38,6 +38,7 @@ export interface BenchResult {
   aggjoinMs: number
   nativeMs: number
   speedup: number
+  rewrite: string
   result: QueryResult
   plan: string
   planHasAggjoin: boolean
@@ -186,6 +187,9 @@ export class AggJoinEngine {
 
     // --- aggjoin ON ---
     await this.setOptimizer(true)
+    try {
+      await this.c().query('SELECT aggjoin_reset_rewrite_marker()')
+    } catch { /* older builds may not expose the marker helpers */ }
     const agg = await this.measureAdaptive(clean, runs)
     const display = await this.run(clean)
 
@@ -201,6 +205,12 @@ export class AggJoinEngine {
         .trim()
     } catch { /* EXPLAIN can fail on some statements; non-fatal */ }
 
+    let rewrite = ''
+    try {
+      const marker = await this.c().query('SELECT aggjoin_last_rewrite() AS rewrite')
+      rewrite = String((marker.toArray()[0] as any)?.rewrite ?? '')
+    } catch { /* non-fatal */ }
+
     // --- native (aggjoin OFF) ---
     await this.setOptimizer(false)
     let nat: { ms: number; rowCount: number }
@@ -215,6 +225,7 @@ export class AggJoinEngine {
       aggjoinMs: agg.ms,
       nativeMs: nat.ms,
       speedup: agg.ms > 0 ? nat.ms / agg.ms : 0,
+      rewrite,
       result: display,
       plan,
       planHasAggjoin: /AGGJOIN/i.test(plan),

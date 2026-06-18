@@ -8,7 +8,6 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   'update:modelValue': [string]
-  run: []
   benchmark: []
 }>()
 
@@ -37,7 +36,6 @@ function onKeydown(e: KeyboardEvent) {
   <section class="panel editor">
     <div class="bar">
       <span class="eyebrow">query</span>
-      <span class="hint mono">⌘↵ to benchmark</span>
     </div>
     <div class="surface">
       <div class="gutter mono" aria-hidden="true">
@@ -57,9 +55,8 @@ function onKeydown(e: KeyboardEvent) {
     <div class="actions">
       <button class="btn primary" :disabled="busy || !ready" @click="emit('benchmark')">
         <span v-if="busy" class="spin ring" />
-        <span>{{ busy ? 'measuring…' : 'Benchmark ⚡' }}</span>
+        <span>{{ busy ? 'Measuring' : 'Benchmark' }}</span>
       </button>
-      <button class="btn ghost" :disabled="busy || !ready" @click="emit('run')">Run once</button>
     </div>
   </section>
 </template>
@@ -76,8 +73,9 @@ function onKeydown(e: KeyboardEvent) {
 .hint { font-size: 10.5px; color: var(--text-faint); }
 .surface {
   display: flex;
-  background: var(--ink-2);
+  background: var(--panel-2);
   min-height: 220px;
+  min-width: 0;
 }
 .gutter {
   display: flex;
@@ -90,11 +88,13 @@ function onKeydown(e: KeyboardEvent) {
   line-height: 1.65;
   user-select: none;
   border-right: 1px solid var(--line);
-  background: rgba(0, 0, 0, 0.2);
+  background: rgba(29, 83, 112, 0.05);
 }
 .gutter span { padding-right: 12px; }
 .code {
   flex: 1;
+  min-width: 0;
+  width: 100%;
   resize: vertical;
   border: 0;
   outline: none;
@@ -118,16 +118,16 @@ function onKeydown(e: KeyboardEvent) {
   font-family: var(--font-mono);
   font-size: 12.5px;
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.02em;
   border: 1px solid transparent;
   transition: transform 0.08s ease, filter 0.15s ease, background 0.15s ease;
 }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:disabled { opacity: 0.45; }
 .primary {
-  color: #14100a;
-  background: linear-gradient(180deg, var(--amber-bright), var(--amber));
-  box-shadow: 0 8px 22px -10px rgba(245, 180, 23, 0.7);
+  color: white;
+  background: linear-gradient(180deg, var(--blue), var(--cyan));
+  box-shadow: 0 12px 24px -18px rgba(15, 105, 134, 0.8);
 }
 .primary:hover:not(:disabled) { filter: brightness(1.08); }
 .ghost { color: var(--text-dim); border-color: var(--line-strong); background: var(--panel-2); }
@@ -136,7 +136,7 @@ function onKeydown(e: KeyboardEvent) {
   width: 13px;
   height: 13px;
   border-radius: 99px;
-  border: 2px solid rgba(20, 16, 10, 0.35);
-  border-top-color: #14100a;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: white;
 }
 </style>
