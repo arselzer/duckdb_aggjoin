@@ -2,6 +2,7 @@
 
 #include "aggjoin_runtime.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
+#include "duckdb/execution/physical_operator.hpp"
 #include <unordered_map>
 
 namespace duckdb {
@@ -32,6 +33,7 @@ struct AggJoinSinkState : public GlobalSinkState {
     // Eliminates ALL hash table lookups when keys are dense integers.
     bool direct_mode = false;
     bool direct_build_without_ht = false; // Build side populated build_counts directly from planned stats range.
+    mutex direct_merge_lock;
     int64_t key_min = 0;        // Min key value (offset for array indexing)
     idx_t key_range = 0;        // key_max - key_min + 1
     vector<idx_t> build_counts; // [key - key_min] → frequency count (0 = no match)
@@ -126,6 +128,28 @@ struct AggJoinSinkState : public GlobalSinkState {
     idx_t range_prefilter_skips = 0;
     idx_t bloom_prefilter_skips = 0;
     bool stats_emitted = false;
+};
+
+struct AggJoinOperatorState : public CachingOperatorState {
+    bool parallel_direct_active = false;
+    bool parallel_direct_initialized = false;
+    bool parallel_direct_merged = false;
+    bool parallel_direct_grouped = false;
+    idx_t parallel_probe_rows_seen = 0;
+    vector<double> parallel_ungrouped_sum;
+    vector<double> parallel_ungrouped_count;
+    vector<double> parallel_ungrouped_min;
+    vector<double> parallel_ungrouped_max;
+    vector<uint8_t> parallel_ungrouped_has;
+    vector<double> parallel_direct_sums;
+    vector<double> parallel_direct_counts;
+    vector<double> parallel_direct_mins;
+    vector<double> parallel_direct_maxs;
+    vector<uint8_t> parallel_direct_has;
+    vector<uint8_t> parallel_direct_key_seen;
+    vector<idx_t> parallel_direct_active_keys;
+
+    void Finalize(const PhysicalOperator &op, ExecutionContext &context) override;
 };
 
 struct AggJoinSourceState : public GlobalSourceState {

@@ -32,6 +32,7 @@ public:
 
     bool IsSink() const override { return true; }
     bool ParallelSink() const override { return false; }
+    bool ParallelOperator() const override;
     bool IsSource() const override { return true; }
     vector<const_reference<PhysicalOperator>> GetSources() const override { return {*this}; }
 

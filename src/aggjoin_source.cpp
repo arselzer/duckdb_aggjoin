@@ -14,6 +14,12 @@ OperatorResultType PhysicalAggJoin::ExecuteInternal(ExecutionContext &ctx, DataC
         }
         auto n = input.size(); if (!n) return OperatorResultType::NEED_MORE_INPUT;
         auto na = col.agg_funcs.size();
+        auto &op_local = state.Cast<AggJoinOperatorState>();
+
+        if (TryExecutePlannedDirectParallelSourcePath(*this, input, chunk, sink, op_local, n, na)) {
+            return OperatorResultType::NEED_MORE_INPUT;
+        }
+
         sink.probe_rows_seen += n;
 
         if (TryExecuteDirectSourcePath(*this, input, chunk, sink, n, na)) {

@@ -2,6 +2,256 @@
 
 namespace duckdb {
 
+bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataChunk &input, DataChunk &chunk,
+                                               AggJoinSinkState &sink, AggJoinOperatorState &state,
+                                               idx_t n, idx_t na) {
+    auto &col = op.col;
+    bool ungrouped = col.group_cols.empty();
+    bool grouped_by_key = col.group_cols.size() == 1 && col.group_cols[0] == col.probe_key_cols[0];
+    if (!sink.direct_build_without_ht || (!ungrouped && !grouped_by_key)) {
+        return false;
+    }
+    for (idx_t a = 0; a < na; a++) {
+        if (col.agg_on_build.size() > a && col.agg_on_build[a]) {
+            return false;
+        }
+        auto &fn = col.agg_funcs[a];
+        auto ai = col.agg_input_cols[a];
+        if (fn == "COUNT") {
+            if (ai != DConstants::INVALID_INDEX && ai >= input.ColumnCount()) {
+                return false;
+            }
+            if (ai != DConstants::INVALID_INDEX && ai < input.ColumnCount()) {
+                input.data[ai].Flatten(n);
+            }
+            continue;
+        }
+        if (fn != "SUM" && fn != "AVG" && fn != "MIN" && fn != "MAX") {
+            return false;
+        }
+        if (ai == DConstants::INVALID_INDEX || ai >= input.ColumnCount() ||
+            input.data[ai].GetType().InternalType() != PhysicalType::DOUBLE) {
+            return false;
+        }
+        input.data[ai].Flatten(n);
+    }
+
+    if (!state.parallel_direct_initialized) {
+        state.parallel_direct_active = true;
+        state.parallel_direct_initialized = true;
+        state.parallel_direct_grouped = grouped_by_key;
+        if (grouped_by_key) {
+            auto krange = sink.key_range;
+            state.parallel_direct_sums.assign(na * krange, 0.0);
+            if (sink.has_avg) {
+                state.parallel_direct_counts.assign(na * krange, 0.0);
+            }
+            if (sink.has_min_max) {
+                state.parallel_direct_mins.assign(na * krange, std::numeric_limits<double>::max());
+                state.parallel_direct_maxs.assign(na * krange, std::numeric_limits<double>::lowest());
+            }
+            if (sink.has_min_max || sink.has_sum) {
+                state.parallel_direct_has.assign(na * krange, 0);
+            }
+            state.parallel_direct_key_seen.assign(krange, 0);
+            state.parallel_direct_active_keys.reserve(std::min<idx_t>(krange, n));
+        } else {
+            state.parallel_ungrouped_sum.assign(na, 0.0);
+            state.parallel_ungrouped_count.assign(na, 0.0);
+            state.parallel_ungrouped_min.assign(na, std::numeric_limits<double>::max());
+            state.parallel_ungrouped_max.assign(na, std::numeric_limits<double>::lowest());
+            state.parallel_ungrouped_has.assign(na, 0);
+        }
+    }
+
+    struct AggSlot {
+        enum Kind { SUM_VAL, AVG_VAL, COUNT_STAR, COUNT_COL, MIN_VAL, MAX_VAL } kind;
+        const double *vals = nullptr;
+        const uint64_t *validity = nullptr;
+    };
+    vector<AggSlot> slots(na);
+    for (idx_t a = 0; a < na; a++) {
+        auto &fn = col.agg_funcs[a];
+        auto ai = col.agg_input_cols[a];
+        if (fn == "COUNT" && ai == DConstants::INVALID_INDEX) {
+            slots[a].kind = AggSlot::COUNT_STAR;
+        } else if (fn == "COUNT") {
+            slots[a].kind = AggSlot::COUNT_COL;
+            slots[a].validity = FlatVector::Validity(input.data[ai]).GetData();
+        } else {
+            slots[a].vals = FlatVector::GetData<double>(input.data[ai]);
+            slots[a].validity = FlatVector::Validity(input.data[ai]).GetData();
+            if (fn == "SUM") {
+                slots[a].kind = AggSlot::SUM_VAL;
+            } else if (fn == "AVG") {
+                slots[a].kind = AggSlot::AVG_VAL;
+            } else if (fn == "MIN") {
+                slots[a].kind = AggSlot::MIN_VAL;
+            } else {
+                slots[a].kind = AggSlot::MAX_VAL;
+            }
+        }
+    }
+
+    auto pki = col.probe_key_cols[0];
+    input.data[pki].Flatten(n);
+    auto ptype = input.data[pki].GetType().InternalType();
+    auto *key_validity = FlatVector::Validity(input.data[pki]).GetData();
+    auto kmin = sink.key_min;
+    auto krange = sink.key_range;
+    auto *bc = sink.build_counts.data();
+
+#define AGGJOIN_PARALLEL_DIRECT_UNGROUPED(KTYPE)                                                         \
+    {                                                                                                    \
+        auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
+        for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
+            auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
+            if (k >= krange || bc[k] == 0) continue;                                                     \
+            auto bcount = (double)bc[k];                                                                 \
+            for (idx_t a = 0; a < na; a++) {                                                             \
+                auto &slot = slots[a];                                                                   \
+                auto *validity = slot.validity;                                                          \
+                switch (slot.kind) {                                                                     \
+                case AggSlot::COUNT_STAR:                                                                \
+                    state.parallel_ungrouped_sum[a] += bcount;                                           \
+                    break;                                                                               \
+                case AggSlot::COUNT_COL:                                                                 \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1))                               \
+                        state.parallel_ungrouped_sum[a] += bcount;                                       \
+                    break;                                                                               \
+                case AggSlot::SUM_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        state.parallel_ungrouped_sum[a] += slot.vals[r] * bcount;                        \
+                        state.parallel_ungrouped_has[a] = 1;                                             \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::AVG_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        state.parallel_ungrouped_sum[a] += slot.vals[r] * bcount;                        \
+                        state.parallel_ungrouped_count[a] += bcount;                                     \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::MIN_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        auto v = slot.vals[r];                                                           \
+                        if (!state.parallel_ungrouped_has[a] || v < state.parallel_ungrouped_min[a]) {   \
+                            state.parallel_ungrouped_min[a] = v;                                         \
+                            state.parallel_ungrouped_has[a] = 1;                                         \
+                        }                                                                                \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::MAX_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        auto v = slot.vals[r];                                                           \
+                        if (!state.parallel_ungrouped_has[a] || v > state.parallel_ungrouped_max[a]) {   \
+                            state.parallel_ungrouped_max[a] = v;                                         \
+                            state.parallel_ungrouped_has[a] = 1;                                         \
+                        }                                                                                \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
+            }                                                                                            \
+        }                                                                                                \
+    }
+
+#define AGGJOIN_PARALLEL_DIRECT_GROUPED(KTYPE)                                                           \
+    {                                                                                                    \
+        auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
+        auto *sums = state.parallel_direct_sums.data();                                                  \
+        auto *counts = state.parallel_direct_counts.empty() ? nullptr : state.parallel_direct_counts.data(); \
+        auto *mins = state.parallel_direct_mins.empty() ? nullptr : state.parallel_direct_mins.data();   \
+        auto *maxs = state.parallel_direct_maxs.empty() ? nullptr : state.parallel_direct_maxs.data();   \
+        auto *has = state.parallel_direct_has.empty() ? nullptr : state.parallel_direct_has.data();      \
+        auto *seen = state.parallel_direct_key_seen.data();                                              \
+        for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
+            auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
+            if (k >= krange || bc[k] == 0) continue;                                                     \
+            if (!seen[k]) {                                                                              \
+                seen[k] = 1;                                                                             \
+                state.parallel_direct_active_keys.push_back(k);                                          \
+            }                                                                                            \
+            auto bcount = (double)bc[k];                                                                 \
+            for (idx_t a = 0; a < na; a++) {                                                             \
+                auto &slot = slots[a];                                                                   \
+                auto *validity = slot.validity;                                                          \
+                auto off = a * krange + k;                                                               \
+                switch (slot.kind) {                                                                     \
+                case AggSlot::COUNT_STAR:                                                                \
+                    sums[off] += bcount;                                                                 \
+                    break;                                                                               \
+                case AggSlot::COUNT_COL:                                                                 \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) sums[off] += bcount;         \
+                    break;                                                                               \
+                case AggSlot::SUM_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        sums[off] += slot.vals[r] * bcount;                                              \
+                        if (has) has[off] = 1;                                                           \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::AVG_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        sums[off] += slot.vals[r] * bcount;                                              \
+                        counts[off] += bcount;                                                           \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::MIN_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        auto v = slot.vals[r];                                                           \
+                        if (!has[off] || v < mins[off]) {                                                \
+                            mins[off] = v;                                                               \
+                            has[off] = 1;                                                                \
+                        }                                                                                \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::MAX_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        auto v = slot.vals[r];                                                           \
+                        if (!has[off] || v > maxs[off]) {                                                \
+                            maxs[off] = v;                                                               \
+                            has[off] = 1;                                                                \
+                        }                                                                                \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
+            }                                                                                            \
+        }                                                                                                \
+    }
+
+    switch (ptype) {
+    case PhysicalType::INT8:
+        if (grouped_by_key) AGGJOIN_PARALLEL_DIRECT_GROUPED(int8_t) else AGGJOIN_PARALLEL_DIRECT_UNGROUPED(int8_t);
+        break;
+    case PhysicalType::INT16:
+        if (grouped_by_key) AGGJOIN_PARALLEL_DIRECT_GROUPED(int16_t) else AGGJOIN_PARALLEL_DIRECT_UNGROUPED(int16_t);
+        break;
+    case PhysicalType::INT32:
+        if (grouped_by_key) AGGJOIN_PARALLEL_DIRECT_GROUPED(int32_t) else AGGJOIN_PARALLEL_DIRECT_UNGROUPED(int32_t);
+        break;
+    case PhysicalType::INT64:
+        if (grouped_by_key) AGGJOIN_PARALLEL_DIRECT_GROUPED(int64_t) else AGGJOIN_PARALLEL_DIRECT_UNGROUPED(int64_t);
+        break;
+    case PhysicalType::UINT8:
+        if (grouped_by_key) AGGJOIN_PARALLEL_DIRECT_GROUPED(uint8_t) else AGGJOIN_PARALLEL_DIRECT_UNGROUPED(uint8_t);
+        break;
+    case PhysicalType::UINT16:
+        if (grouped_by_key) AGGJOIN_PARALLEL_DIRECT_GROUPED(uint16_t) else AGGJOIN_PARALLEL_DIRECT_UNGROUPED(uint16_t);
+        break;
+    case PhysicalType::UINT32:
+        if (grouped_by_key) AGGJOIN_PARALLEL_DIRECT_GROUPED(uint32_t) else AGGJOIN_PARALLEL_DIRECT_UNGROUPED(uint32_t);
+        break;
+    default:
+        return false;
+    }
+#undef AGGJOIN_PARALLEL_DIRECT_GROUPED
+#undef AGGJOIN_PARALLEL_DIRECT_UNGROUPED
+
+    state.parallel_probe_rows_seen += n;
+    chunk.SetCardinality(0);
+    return true;
+}
+
 bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, DataChunk &chunk, AggJoinSinkState &sink,
                                 idx_t n, idx_t na) {
     auto &col = op.col;

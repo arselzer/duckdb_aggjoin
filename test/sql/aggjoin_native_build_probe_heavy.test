@@ -1,7 +1,8 @@
 # name: test/sql/aggjoin_native_build_probe_heavy.test
 # description: Probe-heavy low-fanout ungrouped SUM can be faster as native
-#              build/preaggregate in single-threaded runtimes, but should stay
-#              native for unique build keys and parallel DuckDB.
+#              build/preaggregate in single-threaded runtimes. Parallel planned
+#              direct can win for duplicate dense build keys, while unique build
+#              keys should stay native.
 # group: [aggjoin]
 # differential: skip
 #   Uses aggjoin_last_rewrite() fire-assertions.
@@ -65,4 +66,4 @@ FROM nb_fact JOIN nb_dim_dup ON nb_fact.x = nb_dim_dup.x;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-none
+fused

@@ -49,6 +49,22 @@ fused
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
 
+query IIIII
+SELECT COUNT(*), CAST(AVG(pd_probe.x) AS BIGINT),
+       CAST(MIN(pd_probe.x) AS BIGINT), CAST(MAX(pd_probe.x) AS BIGINT),
+       CAST(SUM(pd_probe.x) AS BIGINT)
+FROM pd_probe JOIN pd_build ON pd_probe.k = pd_build.k;
+----
+10000000	1	1	1	10000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
 query III rowsort
 SELECT CAST(pd_probe.k AS INTEGER), COUNT(*), CAST(SUM(pd_probe.x) AS BIGINT)
 FROM pd_probe JOIN pd_build ON pd_probe.k = pd_build.k

@@ -1,0 +1,192 @@
+# name: test/sql/aggjoin_planned_direct_hard.test
+# description: Adversarial planned-direct coverage. Each large case runs the
+#              fused planned-direct operator and compares the full result with
+#              native DuckDB after disabling the operator.
+# group: [aggjoin]
+# differential: skip
+#   Uses extension toggles and rewrite fire-assertions.
+
+require aggjoin
+
+statement ok
+PRAGMA threads=8;
+
+statement ok
+SELECT aggjoin_set_cascade_enabled(false);
+
+# ── Hard shared data set: negative SMALLINT key offsets, NULL join keys,
+#    unmatched probe/build key ranges, duplicate build keys, and NULL payloads.
+
+statement ok
+CREATE TABLE hard_pd_build AS
+SELECT CASE WHEN i % 37 = 0 THEN NULL
+            ELSE CAST((i % 83) - 41 AS SMALLINT)
+       END AS k
+FROM range(30000) t(i);
+
+statement ok
+CREATE TABLE hard_pd_probe AS
+SELECT CASE WHEN i % 43 = 0 THEN NULL
+            ELSE CAST((i % 101) - 50 AS SMALLINT)
+       END AS k,
+       CASE WHEN i % 11 = 0 THEN NULL
+            ELSE CAST((i % 17) - 8 AS DOUBLE)
+       END AS x,
+       CASE WHEN i % 13 = 0 THEN NULL
+            ELSE CAST(i % 5 AS DOUBLE)
+       END AS y
+FROM range(50000) t(i);
+
+# ── Ungrouped: merged scalar states for COUNT/SUM/AVG/MIN/MAX.
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE hard_pd_ungrouped_aj AS
+SELECT COUNT(*) AS c_all,
+       COUNT(x) AS c_x,
+       CAST(SUM(x) AS BIGINT) AS sum_x,
+       CAST(AVG(x) AS DECIMAL(18,6)) AS avg_x,
+       CAST(MIN(x) AS BIGINT) AS min_x,
+       CAST(MAX(x) AS BIGINT) AS max_x,
+       CAST(SUM(y) AS BIGINT) AS sum_y,
+       CAST(AVG(y) AS DECIMAL(18,6)) AS avg_y
+FROM hard_pd_probe JOIN hard_pd_build USING(k);
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+CREATE TEMP TABLE hard_pd_ungrouped_native AS
+SELECT COUNT(*) AS c_all,
+       COUNT(x) AS c_x,
+       CAST(SUM(x) AS BIGINT) AS sum_x,
+       CAST(AVG(x) AS DECIMAL(18,6)) AS avg_x,
+       CAST(MIN(x) AS BIGINT) AS min_x,
+       CAST(MAX(x) AS BIGINT) AS max_x,
+       CAST(SUM(y) AS BIGINT) AS sum_y,
+       CAST(AVG(y) AS DECIMAL(18,6)) AS avg_y
+FROM hard_pd_probe JOIN hard_pd_build USING(k);
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM hard_pd_ungrouped_aj EXCEPT ALL SELECT * FROM hard_pd_ungrouped_native)
+    UNION ALL
+    (SELECT * FROM hard_pd_ungrouped_native EXCEPT ALL SELECT * FROM hard_pd_ungrouped_aj)
+) diff;
+----
+0
+
+# ── Grouped by join key: dense local per-key arrays, local active-key tracking,
+#    and global active-key merge. Native comparison catches missed or phantom keys.
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE hard_pd_grouped_aj AS
+SELECT CAST(hard_pd_probe.k AS INTEGER) AS k,
+       COUNT(*) AS c_all,
+       COUNT(x) AS c_x,
+       CAST(SUM(x) AS BIGINT) AS sum_x,
+       CAST(AVG(x) AS DECIMAL(18,6)) AS avg_x,
+       CAST(MIN(x) AS BIGINT) AS min_x,
+       CAST(MAX(x) AS BIGINT) AS max_x
+FROM hard_pd_probe JOIN hard_pd_build USING(k)
+GROUP BY hard_pd_probe.k;
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+CREATE TEMP TABLE hard_pd_grouped_native AS
+SELECT CAST(hard_pd_probe.k AS INTEGER) AS k,
+       COUNT(*) AS c_all,
+       COUNT(x) AS c_x,
+       CAST(SUM(x) AS BIGINT) AS sum_x,
+       CAST(AVG(x) AS DECIMAL(18,6)) AS avg_x,
+       CAST(MIN(x) AS BIGINT) AS min_x,
+       CAST(MAX(x) AS BIGINT) AS max_x
+FROM hard_pd_probe JOIN hard_pd_build USING(k)
+GROUP BY hard_pd_probe.k;
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM hard_pd_grouped_aj EXCEPT ALL SELECT * FROM hard_pd_grouped_native)
+    UNION ALL
+    (SELECT * FROM hard_pd_grouped_native EXCEPT ALL SELECT * FROM hard_pd_grouped_aj)
+) diff;
+----
+0
+
+query I
+SELECT COUNT(*) FROM hard_pd_grouped_aj WHERE k IS NULL OR k < -41 OR k > 41;
+----
+0
+
+# ── Small exact edge case: all-NULL matched groups keep SUM/AVG/MIN/MAX NULL,
+#    build-only keys do not emit phantom groups, probe-only keys do not emit.
+
+statement ok
+CREATE TABLE hard_pd_edge_build(k SMALLINT);
+
+statement ok
+INSERT INTO hard_pd_edge_build VALUES (-2), (-2), (-1), (0), (1), (2), (3), (3);
+
+statement ok
+CREATE TABLE hard_pd_edge_probe(k SMALLINT, x DOUBLE);
+
+statement ok
+INSERT INTO hard_pd_edge_probe VALUES
+    (-2, NULL), (-2, NULL), (-1, 5.0), (0, NULL), (0, 1.0),
+    (3, NULL), (4, 7.0), (NULL, 9.0);
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IIIIIII rowsort
+SELECT CAST(hard_pd_edge_probe.k AS INTEGER) AS k,
+       COUNT(*) AS c_all,
+       COUNT(x) AS c_x,
+       CAST(SUM(x) AS BIGINT) AS sum_x,
+       CAST(AVG(x) AS BIGINT) AS avg_x,
+       CAST(MIN(x) AS BIGINT) AS min_x,
+       CAST(MAX(x) AS BIGINT) AS max_x
+FROM hard_pd_edge_probe JOIN hard_pd_edge_build USING(k)
+GROUP BY hard_pd_edge_probe.k;
+----
+-1	1	1	5	5	5	5
+-2	4	0	NULL	NULL	NULL	NULL
+0	2	1	1	1	1	1
+3	2	0	NULL	NULL	NULL	NULL
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_set_cascade_enabled(true);

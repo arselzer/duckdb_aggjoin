@@ -61,7 +61,147 @@ PhysicalAggJoin::PhysicalAggJoin(PhysicalPlan &plan, vector<LogicalType> types, 
 }
 
 unique_ptr<OperatorState> PhysicalAggJoin::GetOperatorState(ExecutionContext &ctx) const {
-    return make_uniq<CachingOperatorState>();
+    return make_uniq<AggJoinOperatorState>();
+}
+
+static bool SupportsParallelPlannedDirect(const PhysicalAggJoin &op) {
+    auto &col = op.col;
+    if (!col.planned_direct_mode || col.probe_key_cols.size() != 1 || col.build_key_cols.size() != 1) {
+        return false;
+    }
+    bool ungrouped = col.group_cols.empty();
+    bool grouped_by_key = col.group_cols.size() == 1 && col.group_cols[0] == col.probe_key_cols[0];
+    if (!ungrouped && !grouped_by_key) {
+        return false;
+    }
+    bool has_avg = false;
+    bool has_minmax = false;
+    bool has_sum = false;
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if (col.agg_on_build.size() > a && col.agg_on_build[a]) {
+            return false;
+        }
+        auto &fn = col.agg_funcs[a];
+        auto ai = a < col.agg_input_cols.size() ? col.agg_input_cols[a] : DConstants::INVALID_INDEX;
+        if (fn == "COUNT") {
+            if (ai != DConstants::INVALID_INDEX && ai >= col.probe_col_count) {
+                return false;
+            }
+            continue;
+        }
+        if (fn == "AVG") {
+            has_avg = true;
+        } else if (fn == "SUM") {
+            has_sum = true;
+        } else if (fn == "MIN" || fn == "MAX") {
+            has_minmax = true;
+        }
+        if (fn != "SUM" && fn != "AVG" && fn != "MIN" && fn != "MAX") {
+            return false;
+        }
+        if (ai == DConstants::INVALID_INDEX || ai >= col.probe_col_count) {
+            return false;
+        }
+        if (a >= op.payload_types.size() || op.payload_types[a].InternalType() != PhysicalType::DOUBLE) {
+            return false;
+        }
+    }
+    if (grouped_by_key) {
+        auto na = (idx_t)col.agg_funcs.size();
+        idx_t bytes_per_key = sizeof(double) * na + sizeof(uint8_t);
+        if (has_avg) {
+            bytes_per_key += sizeof(double) * na;
+        }
+        if (has_minmax) {
+            bytes_per_key += sizeof(double) * 2 * na + sizeof(uint8_t) * na;
+        } else if (has_sum) {
+            bytes_per_key += sizeof(uint8_t) * na;
+        }
+        __int128 local_bytes = (__int128)col.planned_direct_key_range * (__int128)bytes_per_key;
+        if (local_bytes > (__int128)16 * 1024 * 1024) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PhysicalAggJoin::ParallelOperator() const {
+    return SupportsParallelPlannedDirect(*this);
+}
+
+void AggJoinOperatorState::Finalize(const PhysicalOperator &op, ExecutionContext &context) {
+    if (!parallel_direct_active || parallel_direct_merged) {
+        return;
+    }
+    auto &physical = op.Cast<PhysicalAggJoin>();
+    if (!physical.sink_state) {
+        return;
+    }
+    auto &sink = physical.sink_state->Cast<AggJoinSinkState>();
+    lock_guard<mutex> guard(sink.direct_merge_lock);
+    sink.probe_rows_seen += parallel_probe_rows_seen;
+    auto na = physical.col.agg_funcs.size();
+    if (parallel_direct_grouped) {
+        auto krange = sink.key_range;
+        for (auto k : parallel_direct_active_keys) {
+            if (!sink.direct_key_seen[k]) {
+                sink.direct_key_seen[k] = 1;
+                sink.direct_active_keys.push_back(k);
+            }
+            for (idx_t a = 0; a < na; a++) {
+                auto &fn = physical.col.agg_funcs[a];
+                auto off = a * krange + k;
+                if (fn == "AVG") {
+                    sink.direct_sums[off] += parallel_direct_sums[off];
+                    sink.direct_counts[off] += parallel_direct_counts[off];
+                } else if (fn == "MIN") {
+                    if (parallel_direct_has[off] &&
+                        (!sink.direct_has[off] || parallel_direct_mins[off] < sink.direct_mins[off])) {
+                        sink.direct_mins[off] = parallel_direct_mins[off];
+                        sink.direct_has[off] = 1;
+                    }
+                } else if (fn == "MAX") {
+                    if (parallel_direct_has[off] &&
+                        (!sink.direct_has[off] || parallel_direct_maxs[off] > sink.direct_maxs[off])) {
+                        sink.direct_maxs[off] = parallel_direct_maxs[off];
+                        sink.direct_has[off] = 1;
+                    }
+                } else {
+                    sink.direct_sums[off] += parallel_direct_sums[off];
+                    if (fn == "SUM" && parallel_direct_has[off]) {
+                        sink.direct_has[off] = 1;
+                    }
+                }
+            }
+        }
+        parallel_direct_merged = true;
+        return;
+    }
+    for (idx_t a = 0; a < na; a++) {
+        auto &fn = physical.col.agg_funcs[a];
+        if (fn == "AVG") {
+            sink.ungrouped_sum[a] += parallel_ungrouped_sum[a];
+            sink.ungrouped_count[a] += parallel_ungrouped_count[a];
+        } else if (fn == "MIN") {
+            if (parallel_ungrouped_has[a] &&
+                (!sink.ungrouped_has[a] || parallel_ungrouped_min[a] < sink.ungrouped_min[a])) {
+                sink.ungrouped_min[a] = parallel_ungrouped_min[a];
+                sink.ungrouped_has[a] = 1;
+            }
+        } else if (fn == "MAX") {
+            if (parallel_ungrouped_has[a] &&
+                (!sink.ungrouped_has[a] || parallel_ungrouped_max[a] > sink.ungrouped_max[a])) {
+                sink.ungrouped_max[a] = parallel_ungrouped_max[a];
+                sink.ungrouped_has[a] = 1;
+            }
+        } else {
+            sink.ungrouped_sum[a] += parallel_ungrouped_sum[a];
+            if (fn == "SUM" && parallel_ungrouped_has[a]) {
+                sink.ungrouped_has[a] = 1;
+            }
+        }
+    }
+    parallel_direct_merged = true;
 }
 
 void PhysicalAggJoin::BuildPipelines(Pipeline &cur, MetaPipeline &mp) {

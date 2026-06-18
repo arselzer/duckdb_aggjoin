@@ -8,6 +8,9 @@ namespace duckdb {
 
 bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, DataChunk &chunk, AggJoinSinkState &sink,
                                 idx_t n, idx_t na);
+bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataChunk &input, DataChunk &chunk,
+                                               AggJoinSinkState &sink, AggJoinOperatorState &state,
+                                               idx_t n, idx_t na);
 bool TryExecuteSegmentedSourcePath(const PhysicalAggJoin &op, DataChunk &input, DataChunk &chunk, AggJoinSinkState &sink,
                                    idx_t n, idx_t na);
 OperatorResultType ExecuteResultHashSourcePath(const PhysicalAggJoin &op, ExecutionContext &ctx, DataChunk &input,
