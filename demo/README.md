@@ -62,8 +62,8 @@ prefer an absolute base.
 ```bash
 # from the repo root
 make wasm
-cp frontend/...  # or wherever build_wasm.sh deploys it
-cp <built>/aggjoin.duckdb_extension.wasm demo/public/aggjoin.duckdb_extension.wasm
+# or, after `make wasm-build-only`:
+cp duckdb-wasm/build/wasm_eh/extension/aggjoin/aggjoin.duckdb_extension.wasm demo/public/aggjoin.duckdb_extension.wasm
 ```
 
 ## Layout

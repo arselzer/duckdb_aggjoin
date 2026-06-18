@@ -41,9 +41,9 @@ test: all
 smoke: all
 	"$(CURDIR)/scripts/run_regression_smoke.sh" "$(CURDIR)/build/$(BUILD_TYPE)"
 
-# --- WASM build (for DuckDB-WASM frontend) ---
+# --- WASM build (for DuckDB-WASM demo) ---
 # Requires: Emscripten 3.1.71, DuckDB source in $(DUCKDB_DIR)
-# Builds a loadable .duckdb_extension.wasm, patches metadata, deploys to frontend.
+# Builds a loadable .duckdb_extension.wasm, patches metadata, deploys to demo/public.
 
 wasm:
 	DUCKDB_DIR="$(CURDIR)/$(WASM_DUCKDB_DIR)" DUCKDB_VERSION="$(DUCKDB_VERSION)" \

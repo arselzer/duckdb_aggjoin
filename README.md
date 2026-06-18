@@ -464,7 +464,7 @@ runtime (no static linking needed).
 **Quick build** (requires Emscripten 3.1.71 + DuckDB source):
 
 ```bash
-make wasm                     # Build + patch metadata + deploy to frontend
+make wasm                     # Build + patch metadata + deploy to demo/public
 make wasm-build-only          # Build only (no deploy)
 ```
 
@@ -486,7 +486,7 @@ The `make wasm` target runs `scripts/build_wasm.sh` which:
 2. Configures cmake with `WASM_LOADABLE_EXTENSIONS=1 BUILD_EXTENSIONS_ONLY=1`
 3. Builds with `emmake`
 4. Patches the metadata footer (via `scripts/patch_metadata.py`)
-5. Copies to `frontend/public/duckdb/extensions/v1.4.3/wasm_eh/`
+5. Copies to `demo/public/aggjoin.duckdb_extension.wasm`
 
 The browser build now defaults to `duckdb-wasm/` and refuses to compile if the
 checked-out DuckDB tag does not exactly match `DUCKDB_VERSION`. Metadata patching

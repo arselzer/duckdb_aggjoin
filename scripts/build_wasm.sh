@@ -16,13 +16,12 @@
 #
 # After building, the script:
 #   1. Patches the aggjoin metadata footer (platform, version, ABI type)
-#   2. Copies aggjoin plus standard wasm extensions to frontend/public/duckdb/extensions/v1.4.3/wasm_eh/
+#   2. Copies aggjoin to demo/public/aggjoin.duckdb_extension.wasm
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$EXT_DIR/.." && pwd)"
 DUCKDB_DIR="${DUCKDB_DIR:-$EXT_DIR/duckdb-wasm}"
 DUCKDB_VERSION="${DUCKDB_VERSION:-v1.4.3}"
 BUILD_DIR="$DUCKDB_DIR/build/wasm_eh"
@@ -121,18 +120,13 @@ python3 "$SCRIPT_DIR/patch_metadata.py" "$OUTPUT" \
 # --- Deploy ---
 
 if [[ "$BUILD_ONLY" == false ]]; then
-  DEPLOY_DIR="$REPO_ROOT/frontend/public/duckdb/extensions/$DUCKDB_VERSION/wasm_eh"
+  DEPLOY_DIR="$EXT_DIR/demo/public"
   mkdir -p "$DEPLOY_DIR"
   cp "$OUTPUT" "$DEPLOY_DIR/"
-  REPO_EXT_DIR="$BUILD_DIR/repository/$DUCKDB_VERSION/wasm_eh"
-  if [[ -d "$REPO_EXT_DIR" ]]; then
-    cp "$REPO_EXT_DIR/parquet.duckdb_extension.wasm" "$DEPLOY_DIR/"
-    cp "$REPO_EXT_DIR/core_functions.duckdb_extension.wasm" "$DEPLOY_DIR/"
-  fi
   echo "=== Deployed to $DEPLOY_DIR/aggjoin.duckdb_extension.wasm ==="
   echo ""
   echo "Next steps:"
-  echo "  1. Test locally: cd frontend && npm run dev"
+  echo "  1. Test locally: cd demo && npm run dev"
   echo "  2. Open SQL Console, run: SELECT * FROM duckdb_extensions() WHERE extension_name = 'aggjoin'"
   echo "  3. Commit: git add -f $DEPLOY_DIR/aggjoin.duckdb_extension.wasm"
 fi
