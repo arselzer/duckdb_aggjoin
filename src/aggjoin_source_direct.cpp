@@ -29,8 +29,11 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         if (fn != "SUM" && fn != "AVG" && fn != "MIN" && fn != "MAX") {
             return false;
         }
-        if (ai == DConstants::INVALID_INDEX || ai >= input.ColumnCount() ||
-            input.data[ai].GetType().InternalType() != PhysicalType::DOUBLE) {
+        if (ai == DConstants::INVALID_INDEX || ai >= input.ColumnCount()) {
+            return false;
+        }
+        auto payload_type = input.data[ai].GetType().InternalType();
+        if (payload_type != PhysicalType::DOUBLE && payload_type != PhysicalType::FLOAT) {
             return false;
         }
         input.data[ai].Flatten(n);
@@ -42,19 +45,47 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         state.parallel_direct_grouped = grouped_by_key;
         if (grouped_by_key) {
             auto krange = sink.key_range;
-            state.parallel_direct_sums.assign(na * krange, 0.0);
+            idx_t bytes_per_key = sizeof(double) * na + sizeof(uint8_t);
             if (sink.has_avg) {
-                state.parallel_direct_counts.assign(na * krange, 0.0);
+                bytes_per_key += sizeof(double) * na;
             }
             if (sink.has_min_max) {
-                state.parallel_direct_mins.assign(na * krange, std::numeric_limits<double>::max());
-                state.parallel_direct_maxs.assign(na * krange, std::numeric_limits<double>::lowest());
+                bytes_per_key += sizeof(double) * 2 * na + sizeof(uint8_t) * na;
+            } else if (sink.has_sum) {
+                bytes_per_key += sizeof(uint8_t) * na;
             }
-            if (sink.has_min_max || sink.has_sum) {
-                state.parallel_direct_has.assign(na * krange, 0);
+            __int128 local_bytes = (__int128)krange * (__int128)bytes_per_key;
+            state.parallel_direct_sparse_grouped = local_bytes > (__int128)16 * 1024 * 1024;
+            if (state.parallel_direct_sparse_grouped) {
+                auto reserve_keys = std::min<idx_t>(krange, n);
+                state.parallel_direct_sparse_slot_lookup.assign(krange, 0);
+                state.parallel_direct_sparse_keys.reserve(reserve_keys);
+                state.parallel_sparse_sums.reserve(reserve_keys * na);
+                if (sink.has_avg) {
+                    state.parallel_sparse_counts.reserve(reserve_keys * na);
+                }
+                if (sink.has_min_max) {
+                    state.parallel_sparse_mins.reserve(reserve_keys * na);
+                    state.parallel_sparse_maxs.reserve(reserve_keys * na);
+                }
+                if (sink.has_min_max || sink.has_sum) {
+                    state.parallel_sparse_has.reserve(reserve_keys * na);
+                }
+            } else {
+                state.parallel_direct_sums.assign(na * krange, 0.0);
+                if (sink.has_avg) {
+                    state.parallel_direct_counts.assign(na * krange, 0.0);
+                }
+                if (sink.has_min_max) {
+                    state.parallel_direct_mins.assign(na * krange, std::numeric_limits<double>::max());
+                    state.parallel_direct_maxs.assign(na * krange, std::numeric_limits<double>::lowest());
+                }
+                if (sink.has_min_max || sink.has_sum) {
+                    state.parallel_direct_has.assign(na * krange, 0);
+                }
+                state.parallel_direct_key_seen.assign(krange, 0);
+                state.parallel_direct_active_keys.reserve(std::min<idx_t>(krange, n));
             }
-            state.parallel_direct_key_seen.assign(krange, 0);
-            state.parallel_direct_active_keys.reserve(std::min<idx_t>(krange, n));
         } else {
             state.parallel_ungrouped_sum.assign(na, 0.0);
             state.parallel_ungrouped_count.assign(na, 0.0);
@@ -66,8 +97,13 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
 
     struct AggSlot {
         enum Kind { SUM_VAL, AVG_VAL, COUNT_STAR, COUNT_COL, MIN_VAL, MAX_VAL } kind;
-        const double *vals = nullptr;
+        const double *double_vals = nullptr;
+        const float *float_vals = nullptr;
         const uint64_t *validity = nullptr;
+
+        double Value(idx_t row) const {
+            return double_vals ? double_vals[row] : (double)float_vals[row];
+        }
     };
     vector<AggSlot> slots(na);
     for (idx_t a = 0; a < na; a++) {
@@ -79,7 +115,12 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
             slots[a].kind = AggSlot::COUNT_COL;
             slots[a].validity = FlatVector::Validity(input.data[ai]).GetData();
         } else {
-            slots[a].vals = FlatVector::GetData<double>(input.data[ai]);
+            auto payload_type = input.data[ai].GetType().InternalType();
+            if (payload_type == PhysicalType::DOUBLE) {
+                slots[a].double_vals = FlatVector::GetData<double>(input.data[ai]);
+            } else {
+                slots[a].float_vals = FlatVector::GetData<float>(input.data[ai]);
+            }
             slots[a].validity = FlatVector::Validity(input.data[ai]).GetData();
             if (fn == "SUM") {
                 slots[a].kind = AggSlot::SUM_VAL;
@@ -100,6 +141,29 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
     auto kmin = sink.key_min;
     auto krange = sink.key_range;
     auto *bc = sink.build_counts.data();
+
+    auto ensure_sparse_slot = [&](idx_t k) -> idx_t {
+        auto marker = state.parallel_direct_sparse_slot_lookup[k];
+        if (marker != 0) {
+            return (idx_t)(marker - 1);
+        }
+        auto slot = (idx_t)state.parallel_direct_sparse_keys.size();
+        state.parallel_direct_sparse_slot_lookup[k] = (uint32_t)(slot + 1);
+        state.parallel_direct_sparse_keys.push_back(k);
+        auto new_size = (slot + 1) * na;
+        state.parallel_sparse_sums.resize(new_size, 0.0);
+        if (sink.has_avg) {
+            state.parallel_sparse_counts.resize(new_size, 0.0);
+        }
+        if (sink.has_min_max) {
+            state.parallel_sparse_mins.resize(new_size, std::numeric_limits<double>::max());
+            state.parallel_sparse_maxs.resize(new_size, std::numeric_limits<double>::lowest());
+        }
+        if (sink.has_min_max || sink.has_sum) {
+            state.parallel_sparse_has.resize(new_size, 0);
+        }
+        return slot;
+    };
 
 #define AGGJOIN_PARALLEL_DIRECT_UNGROUPED(KTYPE)                                                         \
     {                                                                                                    \
@@ -122,19 +186,19 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                     break;                                                                               \
                 case AggSlot::SUM_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        state.parallel_ungrouped_sum[a] += slot.vals[r] * bcount;                        \
+                        state.parallel_ungrouped_sum[a] += slot.Value(r) * bcount;                        \
                         state.parallel_ungrouped_has[a] = 1;                                             \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::AVG_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        state.parallel_ungrouped_sum[a] += slot.vals[r] * bcount;                        \
+                        state.parallel_ungrouped_sum[a] += slot.Value(r) * bcount;                        \
                         state.parallel_ungrouped_count[a] += bcount;                                     \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::MIN_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        auto v = slot.vals[r];                                                           \
+                        auto v = slot.Value(r);                                                          \
                         if (!state.parallel_ungrouped_has[a] || v < state.parallel_ungrouped_min[a]) {   \
                             state.parallel_ungrouped_min[a] = v;                                         \
                             state.parallel_ungrouped_has[a] = 1;                                         \
@@ -143,7 +207,7 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                     break;                                                                               \
                 case AggSlot::MAX_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        auto v = slot.vals[r];                                                           \
+                        auto v = slot.Value(r);                                                          \
                         if (!state.parallel_ungrouped_has[a] || v > state.parallel_ungrouped_max[a]) {   \
                             state.parallel_ungrouped_max[a] = v;                                         \
                             state.parallel_ungrouped_has[a] = 1;                                         \
@@ -155,7 +219,7 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         }                                                                                                \
     }
 
-#define AGGJOIN_PARALLEL_DIRECT_GROUPED(KTYPE)                                                           \
+#define AGGJOIN_PARALLEL_DIRECT_GROUPED_DENSE(KTYPE)                                                     \
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         auto *sums = state.parallel_direct_sums.data();                                                  \
@@ -186,19 +250,19 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                     break;                                                                               \
                 case AggSlot::SUM_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        sums[off] += slot.vals[r] * bcount;                                              \
+                        sums[off] += slot.Value(r) * bcount;                                             \
                         if (has) has[off] = 1;                                                           \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::AVG_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        sums[off] += slot.vals[r] * bcount;                                              \
+                        sums[off] += slot.Value(r) * bcount;                                             \
                         counts[off] += bcount;                                                           \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::MIN_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        auto v = slot.vals[r];                                                           \
+                        auto v = slot.Value(r);                                                          \
                         if (!has[off] || v < mins[off]) {                                                \
                             mins[off] = v;                                                               \
                             has[off] = 1;                                                                \
@@ -207,7 +271,7 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                     break;                                                                               \
                 case AggSlot::MAX_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        auto v = slot.vals[r];                                                           \
+                        auto v = slot.Value(r);                                                          \
                         if (!has[off] || v > maxs[off]) {                                                \
                             maxs[off] = v;                                                               \
                             has[off] = 1;                                                                \
@@ -216,6 +280,71 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                     break;                                                                               \
                 }                                                                                        \
             }                                                                                            \
+        }                                                                                                \
+    }
+
+#define AGGJOIN_PARALLEL_DIRECT_GROUPED_SPARSE(KTYPE)                                                    \
+    {                                                                                                    \
+        auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
+        for (idx_t r = 0; r < n; r++) {                                                                  \
+            if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
+            auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
+            if (k >= krange || bc[k] == 0) continue;                                                     \
+            auto slot_idx = ensure_sparse_slot(k);                                                       \
+            auto bcount = (double)bc[k];                                                                 \
+            for (idx_t a = 0; a < na; a++) {                                                             \
+                auto &slot = slots[a];                                                                   \
+                auto *validity = slot.validity;                                                          \
+                auto off = slot_idx * na + a;                                                            \
+                switch (slot.kind) {                                                                     \
+                case AggSlot::COUNT_STAR:                                                                \
+                    state.parallel_sparse_sums[off] += bcount;                                           \
+                    break;                                                                               \
+                case AggSlot::COUNT_COL:                                                                 \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1))                               \
+                        state.parallel_sparse_sums[off] += bcount;                                       \
+                    break;                                                                               \
+                case AggSlot::SUM_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        state.parallel_sparse_sums[off] += slot.Value(r) * bcount;                       \
+                        if (!state.parallel_sparse_has.empty()) state.parallel_sparse_has[off] = 1;       \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::AVG_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        state.parallel_sparse_sums[off] += slot.Value(r) * bcount;                       \
+                        state.parallel_sparse_counts[off] += bcount;                                     \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::MIN_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        auto v = slot.Value(r);                                                          \
+                        if (!state.parallel_sparse_has[off] || v < state.parallel_sparse_mins[off]) {     \
+                            state.parallel_sparse_mins[off] = v;                                         \
+                            state.parallel_sparse_has[off] = 1;                                          \
+                        }                                                                                \
+                    }                                                                                    \
+                    break;                                                                               \
+                case AggSlot::MAX_VAL:                                                                   \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
+                        auto v = slot.Value(r);                                                          \
+                        if (!state.parallel_sparse_has[off] || v > state.parallel_sparse_maxs[off]) {     \
+                            state.parallel_sparse_maxs[off] = v;                                         \
+                            state.parallel_sparse_has[off] = 1;                                          \
+                        }                                                                                \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
+            }                                                                                            \
+        }                                                                                                \
+    }
+
+#define AGGJOIN_PARALLEL_DIRECT_GROUPED(KTYPE)                                                           \
+    {                                                                                                    \
+        if (state.parallel_direct_sparse_grouped) {                                                       \
+            AGGJOIN_PARALLEL_DIRECT_GROUPED_SPARSE(KTYPE);                                               \
+        } else {                                                                                         \
+            AGGJOIN_PARALLEL_DIRECT_GROUPED_DENSE(KTYPE);                                                \
         }                                                                                                \
     }
 
@@ -245,6 +374,8 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         return false;
     }
 #undef AGGJOIN_PARALLEL_DIRECT_GROUPED
+#undef AGGJOIN_PARALLEL_DIRECT_GROUPED_SPARSE
+#undef AGGJOIN_PARALLEL_DIRECT_GROUPED_DENSE
 #undef AGGJOIN_PARALLEL_DIRECT_UNGROUPED
 
     state.parallel_probe_rows_seen += n;

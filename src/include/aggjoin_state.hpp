@@ -135,6 +135,7 @@ struct AggJoinOperatorState : public CachingOperatorState {
     bool parallel_direct_initialized = false;
     bool parallel_direct_merged = false;
     bool parallel_direct_grouped = false;
+    bool parallel_direct_sparse_grouped = false;
     idx_t parallel_probe_rows_seen = 0;
     vector<double> parallel_ungrouped_sum;
     vector<double> parallel_ungrouped_count;
@@ -148,6 +149,13 @@ struct AggJoinOperatorState : public CachingOperatorState {
     vector<uint8_t> parallel_direct_has;
     vector<uint8_t> parallel_direct_key_seen;
     vector<idx_t> parallel_direct_active_keys;
+    vector<uint32_t> parallel_direct_sparse_slot_lookup;
+    vector<idx_t> parallel_direct_sparse_keys;
+    vector<double> parallel_sparse_sums;
+    vector<double> parallel_sparse_counts;
+    vector<double> parallel_sparse_mins;
+    vector<double> parallel_sparse_maxs;
+    vector<uint8_t> parallel_sparse_has;
 
     void Finalize(const PhysicalOperator &op, ExecutionContext &context) override;
 };

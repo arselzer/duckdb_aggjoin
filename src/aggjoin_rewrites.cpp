@@ -740,18 +740,24 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                     planned_direct_has_sum = true;
                 } else if (fn == "MIN" || fn == "MAX") {
                     planned_direct_has_minmax = true;
-                } else {
+                }
+                if (fn != "AVG" && fn != "SUM" && fn != "MIN" && fn != "MAX") {
                     planned_direct_parallel_shape = false;
                     break;
                 }
                 auto &ba = agg.expressions[a]->Cast<BoundAggregateExpression>();
-                if (ba.children.empty() ||
-                    ba.children[0]->return_type.InternalType() != PhysicalType::DOUBLE) {
+                if (ba.children.empty()) {
+                    planned_direct_parallel_shape = false;
+                    break;
+                }
+                auto payload_type = ba.children[0]->return_type.InternalType();
+                if (payload_type != PhysicalType::DOUBLE && payload_type != PhysicalType::FLOAT) {
                     planned_direct_parallel_shape = false;
                     break;
                 }
             }
         }
+        bool planned_direct_sparse_grouped = false;
         if (planned_direct_parallel_shape && !col.group_cols.empty()) {
             auto na = (idx_t)col.agg_funcs.size();
             idx_t bytes_per_key = sizeof(double) * na + sizeof(uint8_t);
@@ -764,13 +770,13 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                 bytes_per_key += sizeof(uint8_t) * na;
             }
             __int128 local_bytes = (__int128)col.planned_direct_key_range * (__int128)bytes_per_key;
-            if (local_bytes > (__int128)16 * 1024 * 1024) {
-                planned_direct_parallel_shape = false;
-            }
+            planned_direct_sparse_grouped = local_bytes > (__int128)16 * 1024 * 1024;
         }
         bool planned_direct_borderline_fanout = planned_direct_parallel_shape && join_known && probe_est > 0 &&
                                                 join_est >= probe_est &&
                                                 join_est - probe_est >= probe_est / 4;
+        bool planned_direct_sparse_high_fanout = planned_direct_sparse_grouped && join_known && probe_est > 0 &&
+                                                 join_est >= probe_est * 4;
         bool simple_varlen_hash_shape = false;
         if (has_varlen_key && !composite_shape && !has_build_aggs && col.probe_key_cols.size() == 1 &&
             (col.group_cols.empty() || group_matches_join_key)) {
@@ -828,6 +834,8 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                  !simple_varlen_hash_shape &&
                  group_matches_join_key && large_inputs)
             gate_reason = "non-integral single-key shape outside direct path";
+        else if (planned_direct_sparse_grouped && !planned_direct_sparse_high_fanout)
+            gate_reason = "wide planned-direct grouped shape needs high fanout";
         else if (!planned_direct_borderline_fanout && low_fanout_join_key_aggregate)
             gate_reason = "low-fanout join-key aggregate";
         else if (!planned_direct_borderline_fanout && low_fanout_ungrouped_payload)

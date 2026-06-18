@@ -185,6 +185,112 @@ SELECT aggjoin_last_rewrite();
 ----
 fused
 
+# ── FLOAT payload: non-DOUBLE payloads supported by parallel planned-direct.
+
+statement ok
+CREATE TABLE hard_pd_float_build AS
+SELECT i::INT AS k
+FROM range(50000) t(i);
+
+statement ok
+CREATE TABLE hard_pd_float_probe AS
+SELECT (i % 50000)::INT AS k,
+       CASE WHEN i % 19 = 0 THEN NULL
+            ELSE CAST(i % 17 AS FLOAT)
+       END AS x
+FROM range(150000) t(i);
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE hard_pd_float_aj AS
+SELECT hard_pd_float_probe.k AS k,
+       MIN(hard_pd_float_probe.x) AS min_x
+FROM hard_pd_float_probe JOIN hard_pd_float_build USING(k)
+GROUP BY hard_pd_float_probe.k;
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+CREATE TEMP TABLE hard_pd_float_native AS
+SELECT hard_pd_float_probe.k AS k,
+       MIN(hard_pd_float_probe.x) AS min_x
+FROM hard_pd_float_probe JOIN hard_pd_float_build USING(k)
+GROUP BY hard_pd_float_probe.k;
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM hard_pd_float_aj EXCEPT ALL SELECT * FROM hard_pd_float_native)
+    UNION ALL
+    (SELECT * FROM hard_pd_float_native EXCEPT ALL SELECT * FROM hard_pd_float_aj)
+) diff;
+----
+0
+
+# ── Wide grouped range: planned-direct still fits globally, but per-thread dense
+#    grouped state would exceed 16 MB. The planner should only choose the sparse
+#    local path when estimated fanout is high enough to pay for the extra lookup.
+
+statement ok
+CREATE TABLE hard_pd_wide_build AS
+SELECT (i % 1800000)::INT AS k
+FROM range(9000000) t(i);
+
+statement ok
+CREATE TABLE hard_pd_wide_probe AS
+SELECT ((i % 200000) * 7)::INT AS k,
+       CASE WHEN i % 19 = 0 THEN NULL
+            ELSE CAST(i % 17 AS DOUBLE)
+       END AS x
+FROM range(600000) t(i);
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE hard_pd_wide_sparse_aj AS
+SELECT hard_pd_wide_probe.k AS k,
+       SUM(hard_pd_wide_probe.x) AS sum_x
+FROM hard_pd_wide_probe JOIN hard_pd_wide_build USING(k)
+GROUP BY hard_pd_wide_probe.k;
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+CREATE TEMP TABLE hard_pd_wide_sparse_native AS
+SELECT hard_pd_wide_probe.k AS k,
+       SUM(hard_pd_wide_probe.x) AS sum_x
+FROM hard_pd_wide_probe JOIN hard_pd_wide_build USING(k)
+GROUP BY hard_pd_wide_probe.k;
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM hard_pd_wide_sparse_aj EXCEPT ALL SELECT * FROM hard_pd_wide_sparse_native)
+    UNION ALL
+    (SELECT * FROM hard_pd_wide_sparse_native EXCEPT ALL SELECT * FROM hard_pd_wide_sparse_aj)
+) diff;
+----
+0
+
 statement ok
 SELECT aggjoin_set_operator_enabled(true);
 

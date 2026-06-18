@@ -74,9 +74,6 @@ static bool SupportsParallelPlannedDirect(const PhysicalAggJoin &op) {
     if (!ungrouped && !grouped_by_key) {
         return false;
     }
-    bool has_avg = false;
-    bool has_minmax = false;
-    bool has_sum = false;
     for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
         if (col.agg_on_build.size() > a && col.agg_on_build[a]) {
             return false;
@@ -89,36 +86,17 @@ static bool SupportsParallelPlannedDirect(const PhysicalAggJoin &op) {
             }
             continue;
         }
-        if (fn == "AVG") {
-            has_avg = true;
-        } else if (fn == "SUM") {
-            has_sum = true;
-        } else if (fn == "MIN" || fn == "MAX") {
-            has_minmax = true;
-        }
         if (fn != "SUM" && fn != "AVG" && fn != "MIN" && fn != "MAX") {
             return false;
         }
         if (ai == DConstants::INVALID_INDEX || ai >= col.probe_col_count) {
             return false;
         }
-        if (a >= op.payload_types.size() || op.payload_types[a].InternalType() != PhysicalType::DOUBLE) {
+        if (a >= op.payload_types.size()) {
             return false;
         }
-    }
-    if (grouped_by_key) {
-        auto na = (idx_t)col.agg_funcs.size();
-        idx_t bytes_per_key = sizeof(double) * na + sizeof(uint8_t);
-        if (has_avg) {
-            bytes_per_key += sizeof(double) * na;
-        }
-        if (has_minmax) {
-            bytes_per_key += sizeof(double) * 2 * na + sizeof(uint8_t) * na;
-        } else if (has_sum) {
-            bytes_per_key += sizeof(uint8_t) * na;
-        }
-        __int128 local_bytes = (__int128)col.planned_direct_key_range * (__int128)bytes_per_key;
-        if (local_bytes > (__int128)16 * 1024 * 1024) {
+        auto payload_type = op.payload_types[a].InternalType();
+        if (payload_type != PhysicalType::DOUBLE && payload_type != PhysicalType::FLOAT) {
             return false;
         }
     }
@@ -143,6 +121,45 @@ void AggJoinOperatorState::Finalize(const PhysicalOperator &op, ExecutionContext
     auto na = physical.col.agg_funcs.size();
     if (parallel_direct_grouped) {
         auto krange = sink.key_range;
+        if (parallel_direct_sparse_grouped) {
+            for (idx_t slot = 0; slot < parallel_direct_sparse_keys.size(); slot++) {
+                auto k = parallel_direct_sparse_keys[slot];
+                if (!sink.direct_key_seen[k]) {
+                    sink.direct_key_seen[k] = 1;
+                    sink.direct_active_keys.push_back(k);
+                }
+                for (idx_t a = 0; a < na; a++) {
+                    auto &fn = physical.col.agg_funcs[a];
+                    auto global_off = a * krange + k;
+                    auto local_off = slot * na + a;
+                    if (fn == "AVG") {
+                        sink.direct_sums[global_off] += parallel_sparse_sums[local_off];
+                        sink.direct_counts[global_off] += parallel_sparse_counts[local_off];
+                    } else if (fn == "MIN") {
+                        if (parallel_sparse_has[local_off] &&
+                            (!sink.direct_has[global_off] ||
+                             parallel_sparse_mins[local_off] < sink.direct_mins[global_off])) {
+                            sink.direct_mins[global_off] = parallel_sparse_mins[local_off];
+                            sink.direct_has[global_off] = 1;
+                        }
+                    } else if (fn == "MAX") {
+                        if (parallel_sparse_has[local_off] &&
+                            (!sink.direct_has[global_off] ||
+                             parallel_sparse_maxs[local_off] > sink.direct_maxs[global_off])) {
+                            sink.direct_maxs[global_off] = parallel_sparse_maxs[local_off];
+                            sink.direct_has[global_off] = 1;
+                        }
+                    } else {
+                        sink.direct_sums[global_off] += parallel_sparse_sums[local_off];
+                        if (fn == "SUM" && parallel_sparse_has[local_off]) {
+                            sink.direct_has[global_off] = 1;
+                        }
+                    }
+                }
+            }
+            parallel_direct_merged = true;
+            return;
+        }
         for (auto k : parallel_direct_active_keys) {
             if (!sink.direct_key_seen[k]) {
                 sink.direct_key_seen[k] = 1;
