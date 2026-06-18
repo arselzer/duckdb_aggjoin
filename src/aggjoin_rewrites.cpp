@@ -485,6 +485,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         };
         auto probe_est = get_est(*(need_swap ? join->children[1] : join->children[0]));
         auto build_est = get_est(*(need_swap ? join->children[0] : join->children[1]));
+        auto join_est = join->has_estimated_cardinality ? join->estimated_cardinality : 0;
         auto group_est = agg.has_estimated_cardinality ? agg.estimated_cardinality : 0;
         col.probe_estimate = probe_est;
         col.build_estimate = build_est;
@@ -533,6 +534,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         bool large_inputs = probe_est >= 100000 && build_est >= 100000;
         bool huge_inputs = probe_est >= 500000 && build_est >= 500000;
         bool group_known = group_est > 0;
+        bool join_known = join_est > 0;
         bool low_probe_fanout = group_known && probe_est <= group_est * 2;
         bool low_build_fanout = group_known && build_est <= group_est * 2;
         bool low_fanout_shape = low_probe_fanout && low_build_fanout;
@@ -567,6 +569,18 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         bool composite_rollup = join->conditions.size() > 1 && !group_matches_join_key;
         bool native_ht_friendly = composite_shape && !has_varlen_key && !has_count_or_avg &&
                                   build_agg_count == 0 && join->conditions.size() <= 2;
+        bool join_close_to_probe = join_known && probe_est > 0 &&
+                                   (join_est <= probe_est || join_est - probe_est <= probe_est);
+        bool build_close_to_groups = group_known && build_est > 0 &&
+                                     (build_est <= group_est || build_est - group_est <= group_est / 2);
+        bool low_fanout_join_key_aggregate = !has_build_aggs && direct_like_shape && !composite_shape &&
+                                             large_inputs && join_close_to_probe &&
+                                             !col.group_cols.empty() && group_matches_join_key &&
+                                             build_close_to_groups;
+        bool low_fanout_ungrouped_payload = !has_build_aggs && direct_like_shape && !composite_shape &&
+                                             large_inputs && join_close_to_probe &&
+                                             col.group_cols.empty() && !has_count_or_avg;
+        bool estimated_sparse_join = !join_known || join_est <= probe_est + (probe_est / 2);
         const char *gate_reason = nullptr;
         if (has_varlen_key && !simple_varlen_hash_shape) gate_reason = "variable-width join/group key";
         else if (asym_build_heavy)
@@ -582,8 +596,12 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                  !simple_varlen_hash_shape &&
                  group_matches_join_key && large_inputs)
             gate_reason = "non-integral single-key shape outside direct path";
+        else if (low_fanout_join_key_aggregate)
+            gate_reason = "low-fanout join-key aggregate";
+        else if (low_fanout_ungrouped_payload)
+            gate_reason = "low-fanout ungrouped payload aggregate";
         else if (!has_build_aggs && !has_count_or_avg && !composite_shape &&
-                 large_inputs && low_fanout_shape)
+                 large_inputs && low_fanout_shape && estimated_sparse_join)
             gate_reason = "low estimated fanout";
         else if (!direct_like_shape && composite_shape && has_non_integral_key && large_inputs)
             gate_reason = "non-integral composite key";
@@ -594,17 +612,19 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         if (gate_reason) {
             if (AggJoinTraceEnabled()) {
                 fprintf(stderr,
-                        "[AGGJOIN] planner cost gate would bail: %s (join_conds=%zu, groups=%zu, build_aggs=%zu, probe_est=%llu, build_est=%llu, group_est=%llu)\n",
+                        "[AGGJOIN] planner cost gate would bail: %s (join_conds=%zu, groups=%zu, build_aggs=%zu, probe_est=%llu, build_est=%llu, join_est=%llu, group_est=%llu)\n",
                         gate_reason, join->conditions.size(), agg.groups.size(), build_agg_count,
-                        (unsigned long long)probe_est, (unsigned long long)build_est, (unsigned long long)group_est);
+                        (unsigned long long)probe_est, (unsigned long long)build_est,
+                        (unsigned long long)join_est, (unsigned long long)group_est);
             }
 #ifndef AGGJOIN_NO_PLANNER_GATE
             return;
 #else
             fprintf(stderr,
-                    "[AGGJOIN] planner cost gate would bail: %s (join_conds=%zu, groups=%zu, build_aggs=%zu, probe_est=%llu, build_est=%llu, group_est=%llu)\n",
+                    "[AGGJOIN] planner cost gate would bail: %s (join_conds=%zu, groups=%zu, build_aggs=%zu, probe_est=%llu, build_est=%llu, join_est=%llu, group_est=%llu)\n",
                     gate_reason, join->conditions.size(), agg.groups.size(), build_agg_count,
-                    (unsigned long long)probe_est, (unsigned long long)build_est, (unsigned long long)group_est);
+                    (unsigned long long)probe_est, (unsigned long long)build_est,
+                    (unsigned long long)join_est, (unsigned long long)group_est);
 #endif
         }
     }

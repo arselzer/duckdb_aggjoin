@@ -1,0 +1,50 @@
+# name: test/sql/aggjoin_low_fanout_gate.test
+# description: Low-fanout single-key joins where native DuckDB's hash join plus
+#              aggregate is faster than the fused operator. The planner should
+#              decline AGGJOIN when the estimated join output is close to the
+#              probe input and the build side looks unique.
+# group: [aggjoin]
+# differential: skip
+#   Uses aggjoin_last_rewrite() fire-assertions.
+
+require aggjoin
+
+statement ok
+CREATE TABLE lf_dim AS SELECT i AS x FROM range(100000) t(i);
+
+statement ok
+CREATE TABLE lf_fact AS
+SELECT (i % 100000) AS x, (i % 1000)::DOUBLE AS v
+FROM range(500000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT CAST(SUM(lf_fact.v) AS BIGINT)
+FROM lf_fact JOIN lf_dim ON lf_fact.x = lf_dim.x;
+----
+249750000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT CAST(SUM(s) AS BIGINT), COUNT(*)
+FROM (
+  SELECT lf_fact.x, SUM(lf_fact.v) AS s
+  FROM lf_fact JOIN lf_dim ON lf_fact.x = lf_dim.x
+  GROUP BY lf_fact.x
+) q;
+----
+249750000	100000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
