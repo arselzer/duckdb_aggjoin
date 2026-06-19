@@ -166,13 +166,13 @@ inline bool AggJoinTryGetStatsForGetColumn(ClientContext &context, LogicalGet &g
     if (get.function.statistics_extended) {
         TableFunctionGetStatisticsInput input(get.bind_data.get(), col_idx);
         stats = get.function.statistics_extended(context, input);
-    } else if (get.function.statistics && col_idx.HasPrimaryIndex()) {
+    } else if (get.function.statistics) {
         stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
     } else {
         return false;
     }
 #else
-    if (get.function.statistics && col_idx.HasPrimaryIndex()) {
+    if (get.function.statistics) {
         stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
     } else {
         return false;

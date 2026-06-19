@@ -47,6 +47,14 @@ export interface BenchResult {
   rowsMatch: boolean
 }
 
+export type ExportFormat = 'csv' | 'parquet'
+
+export interface QueryExport {
+  bytes: Uint8Array
+  filename: string
+  mime: string
+}
+
 export interface TableInfo {
   name: string
   rows: number
@@ -153,6 +161,26 @@ export class AggJoinEngine {
     const table = await this.c().query(sql)
     const ms = performance.now() - t0
     return this.toResult(table, ms)
+  }
+
+  async exportQuery(sql: string, format: ExportFormat): Promise<QueryExport> {
+    if (!this.db) throw new Error('engine not initialized')
+    const clean = sql.trim().replace(/;\s*$/, '')
+    if (!clean) throw new Error('no query to export')
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)
+    const filename = `aggjoin-result-${stamp}.${format === 'csv' ? 'csv' : 'parquet'}`
+    const out = filename.replace(/'/g, "''")
+    const copy =
+      format === 'csv'
+        ? `COPY (${clean}) TO '${out}' (HEADER, DELIMITER ',')`
+        : `COPY (${clean}) TO '${out}' (FORMAT PARQUET)`
+    await this.c().query(copy)
+    const bytes = await this.db.copyFileToBuffer(filename)
+    return {
+      bytes,
+      filename,
+      mime: format === 'csv' ? 'text/csv;charset=utf-8' : 'application/vnd.apache.parquet',
+    }
   }
 
   private async setOptimizer(enabled: boolean): Promise<void> {

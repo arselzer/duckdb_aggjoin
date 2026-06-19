@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import type { QueryResult } from '../engine'
 
-defineProps<{ result: QueryResult | null; error: string | null }>()
+defineProps<{ result: QueryResult | null; error: string | null; exportBusy: boolean }>()
+const emit = defineEmits<{
+  export: ['csv' | 'parquet']
+}>()
 
 function cell(v: unknown): string {
   if (v === null) return 'NULL'
@@ -13,9 +16,13 @@ function cell(v: unknown): string {
   <section class="panel results">
     <div class="bar">
       <span class="eyebrow">result</span>
-      <span v-if="result" class="meta mono">
-        {{ result.rowCount.toLocaleString() }} rows · {{ result.ms.toFixed(1) }} ms
-      </span>
+      <div v-if="result" class="meta-wrap">
+        <span class="meta mono">
+          {{ result.rowCount.toLocaleString() }} rows · {{ result.ms.toFixed(1) }} ms
+        </span>
+        <button class="mini" :disabled="exportBusy" @click="emit('export', 'csv')">CSV</button>
+        <button class="mini" :disabled="exportBusy" @click="emit('export', 'parquet')">Parquet</button>
+      </div>
     </div>
 
     <div v-if="error" class="err mono">
@@ -50,10 +57,23 @@ function cell(v: unknown): string {
 <style scoped>
 .results { display: flex; flex-direction: column; min-height: 0; }
 .bar {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 11px 16px; border-bottom: 1px solid var(--line);
 }
+.meta-wrap { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .meta { font-size: 11px; color: var(--text-dim); }
+.mini {
+  border: 1px solid var(--line-strong);
+  background: var(--panel-2);
+  color: var(--text-dim);
+  border-radius: var(--r);
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.mini:hover:not(:disabled) { color: var(--blue); border-color: var(--blue-line); }
+.mini:disabled { opacity: 0.45; }
 .empty { padding: 30px 16px; color: var(--text-faint); font-size: 12px; text-align: center; }
 
 .err { padding: 14px 16px; }

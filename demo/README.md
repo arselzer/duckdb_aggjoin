@@ -81,7 +81,13 @@ demo/
   public/
     aggjoin.duckdb_extension.wasm   # the 520 KB extension (ABI-pinned)
     dblp.parquet                    # 3.3 MB SNAP com-DBLP graph (the bundled-dataset example)
+    stats_ceb/*.parquet             # optional 7 MB STATS-CEB local bundle
 ```
 
 The `dblp.parquet` dataset is regenerated from the SNAP edge list with
 `../scripts/prepare_dblp_parquet.sh` (then copied into `public/`).
+
+For STATS-CEB-style local experiments, `../scripts/prepare_stats_ceb_parquet.sh`
+downloads the simplified CSV tables and converts them to parquet. The upstream
+benchmark repository does not appear to publish a license file, so verify
+redistribution terms before placing generated STATS parquet files in `public/`.

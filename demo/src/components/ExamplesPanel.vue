@@ -3,6 +3,20 @@ import { examples, KIND_LABEL, type Example } from '../data/examples'
 
 defineProps<{ activeId: string | null; busy: boolean }>()
 const emit = defineEmits<{ load: [Example] }>()
+
+function kindClass(kind: Example['kind']) {
+  if (kind === 'operator') return 'amber'
+  if (kind === 'guard') return 'slate'
+  if (kind === 'stress') return 'red'
+  return 'cyan'
+}
+
+function datasetLabel(ex: Example) {
+  if (!ex.dataset) return ''
+  const datasets = Array.isArray(ex.dataset) ? ex.dataset : [ex.dataset]
+  if (datasets.length === 1) return datasets[0].sizeLabel
+  return `${datasets.length} files · ${datasets.map((d) => d.sizeLabel).join(' + ')}`
+}
 </script>
 
 <template>
@@ -18,9 +32,13 @@ const emit = defineEmits<{ load: [Example] }>()
       >
         <div class="top">
           <span class="title">{{ ex.title }}</span>
-          <span class="tag" :class="ex.kind === 'operator' ? 'amber' : 'cyan'">{{ KIND_LABEL[ex.kind] }}</span>
+          <span
+            class="tag"
+            :class="kindClass(ex.kind)"
+          >{{ KIND_LABEL[ex.kind] }}</span>
         </div>
-        <p v-if="ex.dataset" class="ds mono">⤓ bundled dataset · {{ ex.dataset.sizeLabel }}</p>
+        <p v-if="ex.dataset" class="ds mono">⤓ bundled dataset · {{ datasetLabel(ex) }}</p>
+        <p v-if="ex.autoBenchmark === false" class="ds stress mono">loads query only · press Benchmark to run</p>
       </li>
     </ul>
   </section>
@@ -46,4 +64,5 @@ ul { list-style: none; margin: 0; padding: 10px; display: grid; gap: 8px; }
 .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .title { font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; color: var(--text); }
 .ds { margin: 8px 0 0; font-size: 10px; letter-spacing: 0.04em; color: var(--amber); opacity: 0.85; }
+.ds.stress { color: var(--red); }
 </style>

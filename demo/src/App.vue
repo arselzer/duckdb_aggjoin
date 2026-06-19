@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { AggJoinEngine, type BenchResult, type QueryResult, type TableInfo } from './engine'
+import { onMounted, ref, watch } from 'vue'
+import { AggJoinEngine, type BenchResult, type ExportFormat, type QueryResult, type TableInfo } from './engine'
 import { examples, type Example } from './data/examples'
+import type { BenchHistoryEntry, SavedSession } from './data/workspace'
 import AppHeader from './components/AppHeader.vue'
 import SqlPanel from './components/SqlPanel.vue'
 import BenchPanel from './components/BenchPanel.vue'
@@ -9,8 +10,42 @@ import ResultsTable from './components/ResultsTable.vue'
 import ImportPanel from './components/ImportPanel.vue'
 import ExamplesPanel from './components/ExamplesPanel.vue'
 import SchemaPanel from './components/SchemaPanel.vue'
+import ResourcesPanel from './components/ResourcesPanel.vue'
+import NativeCommandPanel from './components/NativeCommandPanel.vue'
+import WorkspacePanel from './components/WorkspacePanel.vue'
 
 const engine = new AggJoinEngine()
+
+const SQL_KEY = 'aggjoin.demo.sql'
+const SESSIONS_KEY = 'aggjoin.demo.sessions'
+const HISTORY_KEY = 'aggjoin.demo.history'
+const MAX_HISTORY = 24
+const MAX_SESSIONS = 24
+
+function readJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? (JSON.parse(raw) as T) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function writeJson<T>(key: string, value: T) {
+  localStorage.setItem(key, JSON.stringify(value))
+}
+
+function makeId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function sessionName(text: string) {
+  const firstSqlLine = text
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith('--'))
+  return (firstSqlLine ?? 'SQL query').replace(/\s+/g, ' ').slice(0, 72)
+}
 
 const ready = ref(false)
 const bootStatus = ref('starting…')
@@ -18,14 +53,18 @@ const bootError = ref<string | null>(null)
 const version = ref('')
 const aggjoinLoaded = ref(false)
 
-const sql = ref('-- pick an example to the left, or import data, then benchmark it.\nSELECT 1;')
+const restoredSql = readJson<string | null>(SQL_KEY, null)
+const sql = ref(restoredSql ?? '-- pick an example to the left, or import data, then benchmark it.\nSELECT 1;')
 const busy = ref(false)
 const importing = ref(false)
+const exporting = ref(false)
 const bench = ref<BenchResult | null>(null)
 const result = ref<QueryResult | null>(null)
 const error = ref<string | null>(null)
 const tables = ref<TableInfo[]>([])
 const activeExampleId = ref<string | null>(null)
+const sessions = ref<SavedSession[]>(readJson<SavedSession[]>(SESSIONS_KEY, []))
+const history = ref<BenchHistoryEntry[]>(readJson<BenchHistoryEntry[]>(HISTORY_KEY, []))
 
 const toast = ref<{ msg: string; kind: 'ok' | 'err' } | null>(null)
 let toastTimer: number | undefined
@@ -47,12 +86,23 @@ onMounted(async () => {
     version.value = engine.version
     aggjoinLoaded.value = engine.aggjoinLoaded
     ready.value = true
-    // Warm first impression: build + benchmark the lead example immediately.
-    await loadExample(examples[0], { silent: true })
+    if (restoredSql) {
+      await refreshTables()
+    } else {
+      // Warm first impression: build + benchmark the lead example immediately.
+      await loadExample(examples[0], { silent: true })
+    }
   } catch (e: any) {
     bootError.value = e?.message ?? String(e)
   }
 })
+
+watch(sql, (value) => {
+  localStorage.setItem(SQL_KEY, JSON.stringify(value))
+})
+
+watch(sessions, (value) => writeJson(SESSIONS_KEY, value), { deep: true })
+watch(history, (value) => writeJson(HISTORY_KEY, value), { deep: true })
 
 async function loadExample(ex: Example, opts: { silent?: boolean } = {}) {
   if (busy.value) return
@@ -61,15 +111,26 @@ async function loadExample(ex: Example, opts: { silent?: boolean } = {}) {
   error.value = null
   try {
     if (ex.dataset) {
-      if (!opts.silent) notify(`loading ${ex.dataset.file} · ${ex.dataset.sizeLabel}…`)
-      const url = new URL(import.meta.env.BASE_URL + ex.dataset.file, window.location.href).href
-      await engine.attachParquet(url, ex.dataset.table)
+      const datasets = Array.isArray(ex.dataset) ? ex.dataset : [ex.dataset]
+      if (!opts.silent) {
+        notify(`loading ${datasets.length === 1 ? datasets[0].file : `${datasets.length} parquet files`}…`)
+      }
+      for (const dataset of datasets) {
+        const url = new URL(import.meta.env.BASE_URL + dataset.file, window.location.href).href
+        await engine.attachParquet(url, dataset.table)
+      }
     }
     await engine.runScript(ex.setup)
     sql.value = ex.query
     await refreshTables()
-    if (!opts.silent) notify(`built data for “${ex.title}”`)
-    await runBenchmark()
+    if (ex.autoBenchmark === false) {
+      bench.value = null
+      result.value = null
+      if (!opts.silent) notify(`loaded “${ex.title}” · press Benchmark to run`)
+    } else {
+      if (!opts.silent) notify(`built data for “${ex.title}”`)
+      await runBenchmark()
+    }
   } catch (e: any) {
     error.value = e?.message ?? String(e)
     bench.value = null
@@ -87,6 +148,7 @@ async function runBenchmark() {
     const b = await engine.benchmark(sql.value)
     bench.value = b
     result.value = b.result
+    rememberBenchmark(b)
     if (!b.rowsMatch) notify('aggjoin and native returned different row counts', 'err')
   } catch (e: any) {
     error.value = e?.message ?? String(e)
@@ -94,6 +156,80 @@ async function runBenchmark() {
     result.value = null
   } finally {
     busy.value = false
+  }
+}
+
+function rememberBenchmark(b: BenchResult) {
+  const entry: BenchHistoryEntry = {
+    id: makeId(),
+    at: Date.now(),
+    sql: b.sql,
+    rewrite: b.rewrite || 'none',
+    speedup: b.speedup,
+    aggjoinMs: b.aggjoinMs,
+    nativeMs: b.nativeMs,
+    rowCount: b.result.rowCount,
+  }
+  history.value = [entry, ...history.value].slice(0, MAX_HISTORY)
+}
+
+function saveSession() {
+  const clean = sql.value.trim()
+  if (!clean) return
+  const session: SavedSession = {
+    id: makeId(),
+    name: sessionName(clean),
+    sql: clean,
+    updatedAt: Date.now(),
+  }
+  sessions.value = [session, ...sessions.value].slice(0, MAX_SESSIONS)
+  notify('query saved')
+}
+
+function loadSession(session: SavedSession) {
+  sql.value = session.sql
+  activeExampleId.value = null
+  bench.value = null
+  result.value = null
+  error.value = null
+}
+
+function deleteSession(id: string) {
+  sessions.value = sessions.value.filter((session) => session.id !== id)
+}
+
+function loadHistoryEntry(entry: BenchHistoryEntry) {
+  sql.value = entry.sql
+  activeExampleId.value = null
+  bench.value = null
+  result.value = null
+  error.value = null
+}
+
+function clearHistory() {
+  history.value = []
+}
+
+async function downloadResult(format: ExportFormat) {
+  if (!ready.value || exporting.value) return
+  exporting.value = true
+  try {
+    const exported = await engine.exportQuery(sql.value, format)
+    const blob = new Blob([exported.bytes.slice()], { type: exported.mime })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = exported.filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+    notify(`downloaded ${exported.filename}`)
+  } catch (e: any) {
+    notify('export failed', 'err')
+    error.value = e?.message ?? String(e)
+  } finally {
+    exporting.value = false
   }
 }
 
@@ -183,13 +319,25 @@ async function dropTable(name: string) {
       <aside class="rail">
         <ExamplesPanel :active-id="activeExampleId" :busy="busy" @load="loadExample" />
         <ImportPanel :busy="importing" @files="onFiles" />
+        <WorkspacePanel
+          :sessions="sessions"
+          :history="history"
+          :busy="busy"
+          @save="saveSession"
+          @load-session="loadSession"
+          @delete-session="deleteSession"
+          @load-history="loadHistoryEntry"
+          @clear-history="clearHistory"
+        />
+        <ResourcesPanel />
         <SchemaPanel :tables="tables" @use="useTable" @drop="dropTable" />
       </aside>
 
       <div class="main">
         <SqlPanel v-model="sql" :busy="busy" :ready="ready" @benchmark="runBenchmark" @new-query="newQuery" />
+        <NativeCommandPanel :sql="sql" />
         <BenchPanel :bench="bench" :busy="busy" />
-        <ResultsTable :result="result" :error="error" />
+        <ResultsTable :result="result" :error="error" :export-busy="exporting" @export="downloadResult" />
       </div>
     </main>
 

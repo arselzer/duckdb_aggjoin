@@ -26,6 +26,7 @@ DUCKDB_DIR="${DUCKDB_DIR:-$EXT_DIR/duckdb-wasm}"
 DUCKDB_VERSION="${DUCKDB_VERSION:-v1.4.3}"
 BUILD_DIR="$DUCKDB_DIR/build/wasm_eh"
 BUILD_ONLY=false
+JOBS="${JOBS:-2}"
 
 for arg in "$@"; do
   case $arg in
@@ -96,7 +97,7 @@ emcmake cmake -G "Unix Makefiles" \
 # --- Build ---
 
 echo "=== Building WASM extension ==="
-emmake make -j"$(nproc)" -Cbuild/wasm_eh
+emmake make -j"$JOBS" -Cbuild/wasm_eh
 
 # --- Find output ---
 

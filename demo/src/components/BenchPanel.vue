@@ -33,6 +33,42 @@ const rewriteLabel = computed(() => {
   if (marker && marker !== 'none') return `${marker.replace(/_/g, ' ')} rewrite`
   return 'native plan'
 })
+
+const decision = computed(() => {
+  const bench = props.bench
+  if (!bench) return null
+  const marker = bench.rewrite || 'none'
+  if (bench.planHasAggjoin || marker === 'fused') {
+    return {
+      tone: 'amber',
+      title: 'Fused operator',
+      text: 'The extension selected a physical AGGJOIN operator for the optimized run.',
+      facts: [`marker=${marker}`, 'optimized plan contains AGGJOIN', `rows=${bench.result.rowCount.toLocaleString()}`],
+    }
+  }
+  if (marker === 'agg_propagation') {
+    return {
+      tone: 'cyan',
+      title: 'Aggregate propagation',
+      text: 'The logical rewrite fired and lowered back to native DuckDB operators.',
+      facts: [`marker=${marker}`, 'no physical AGGJOIN node expected', `rows=${bench.result.rowCount.toLocaleString()}`],
+    }
+  }
+  if (marker && marker !== 'none') {
+    return {
+      tone: 'cyan',
+      title: 'Native logical rewrite',
+      text: 'The extension rewrote the query into an alternative native DuckDB plan.',
+      facts: [`marker=${marker}`, `rows=${bench.result.rowCount.toLocaleString()}`],
+    }
+  }
+  return {
+    tone: 'slate',
+    title: 'Native DuckDB',
+    text: 'No aggjoin rewrite marker was recorded for the optimized run.',
+    facts: ['marker=none', 'extension plan and native baseline are both DuckDB plans', `rows=${bench.result.rowCount.toLocaleString()}`],
+  }
+})
 </script>
 
 <template>
@@ -75,6 +111,17 @@ const rewriteLabel = computed(() => {
           <div class="lbl"><span class="swatch slate" /> NATIVE</div>
           <div class="track"><div class="fill slate" :style="{ width: natPct + '%' }" /></div>
           <div class="val mono">{{ fmtMs(bench.nativeMs) }}</div>
+        </div>
+      </div>
+
+      <div v-if="decision" class="decision">
+        <div class="decision-copy">
+          <span class="eyebrow">planner decision</span>
+          <strong>{{ decision.title }}</strong>
+          <p class="mono">{{ decision.text }}</p>
+        </div>
+        <div class="decision-facts">
+          <span v-for="fact in decision.facts" :key="fact" class="tag" :class="decision.tone">{{ fact }}</span>
         </div>
       </div>
 
@@ -158,6 +205,33 @@ const rewriteLabel = computed(() => {
 .fill.slate { background: repeating-linear-gradient(45deg, var(--slate) 0 8px, #54616b 8px 16px); }
 .val { text-align: right; font-size: 12px; color: var(--text); font-weight: 500; }
 
+.decision {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, auto);
+  gap: 14px;
+  padding: 16px 20px 18px;
+  border-top: 1px solid var(--line);
+  background: rgba(15, 105, 134, 0.045);
+}
+.decision-copy strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 14px;
+}
+.decision-copy p {
+  margin: 4px 0 0;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+.decision-facts {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
 .plans {
   border-top: 1px solid var(--line);
   display: grid;
@@ -183,6 +257,8 @@ const rewriteLabel = computed(() => {
   .multiplier .num { font-size: 52px; }
   .bars { padding: 6px 16px 18px; }
   .row { grid-template-columns: 78px 1fr 66px; gap: 8px; }
+  .decision { grid-template-columns: 1fr; padding: 15px 16px 17px; }
+  .decision-facts { justify-content: flex-start; }
   .plan-head { align-items: flex-start; gap: 8px; flex-wrap: wrap; }
   .plans { grid-template-columns: 1fr; }
   .plan-pane + .plan-pane { border-left: 0; border-top: 1px solid var(--line); }
