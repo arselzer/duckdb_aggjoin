@@ -86,6 +86,41 @@ static bool IsDirectPlannableInteger(PhysicalType type) {
     }
 }
 
+static bool IsDoubleExactMinMaxPayload(const LogicalType &type) {
+    switch (type.id()) {
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::UTINYINT:
+    case LogicalTypeId::USMALLINT:
+    case LogicalTypeId::UINTEGER:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool TryGetDomainFromMinMax(int64_t min_value, int64_t max_value, idx_t &domain) {
+    if (max_value < min_value) {
+        return false;
+    }
+    __int128 range_wide = (__int128)max_value - (__int128)min_value + 1;
+    if (range_wide <= 0 || range_wide > (__int128)std::numeric_limits<idx_t>::max()) {
+        return false;
+    }
+    domain = (idx_t)range_wide;
+    return domain > 0;
+}
+
+static bool AtLeastRatio(idx_t value, idx_t base, idx_t numerator, idx_t denominator) {
+    if (base == 0 || denominator == 0) {
+        return false;
+    }
+    return (__int128)value * (__int128)denominator >= (__int128)base * (__int128)numerator;
+}
+
 static bool StatsValueToInt64(const Value &value, int64_t &out) {
     if (value.IsNull()) {
         return false;
@@ -498,7 +533,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         if (ra.scan_idx != DConstants::INVALID_INDEX && !ra.is_probe) build_agg_count++;
     }
 
-    bool has_nonnumeric_minmax = false;
+    bool has_unsupported_minmax = false;
     {
         idx_t ra_idx = 0;
         for (auto &e : agg.expressions) {
@@ -507,8 +542,9 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
             if (ra_idx < resolved_aggs.size()) {
                 auto &ra = resolved_aggs[ra_idx];
                 if (ra.scan_idx != DConstants::INVALID_INDEX && (fn == "MIN" || fn == "MAX")) {
-                    if (!ba.children.empty() && !ba.children[0]->return_type.IsNumeric()) {
-                        has_nonnumeric_minmax = true;
+                    if (ba.children.empty() ||
+                        !IsDoubleExactMinMaxPayload(ba.children[0]->return_type)) {
+                        has_unsupported_minmax = true;
                         break;
                     }
                 }
@@ -599,7 +635,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         return;
     }
 
-    if (has_nonnumeric_minmax) {
+    if (has_unsupported_minmax) {
         return;
     }
 
@@ -658,7 +694,13 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         bool direct_like_shape = !has_varlen_key && !has_non_integral_key &&
                                  col.probe_key_cols.size() == 1 &&
                                  (col.group_cols.empty() || group_matches_join_key);
-        if (direct_like_shape && !composite_shape && build_agg_count == 0 && !has_nonnumeric_minmax) {
+        bool stats_planned_direct_borderline_fanout = false;
+        bool stats_planned_direct_build_fanout = false;
+        bool stats_planned_direct_build_strong_fanout = false;
+        bool stats_planned_direct_high_fanout = false;
+        idx_t stats_build_key_domain = 0;
+        idx_t stats_probe_key_domain = 0;
+        if (direct_like_shape && !composite_shape && !has_unsupported_minmax) {
             auto &probe_child = *(need_swap ? join->children[1] : join->children[0]);
             auto &build_child = *(need_swap ? join->children[0] : join->children[1]);
             auto probe_key_idx = col.probe_key_cols[0];
@@ -675,25 +717,57 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                     TryGetIntegerKeyMinMaxFromStats(context, build_child,
                                                     build_plan_bindings[build_key_idx],
                                                     build_key_min, build_key_max)) {
-                    __int128 range_wide = (__int128)build_key_max - (__int128)build_key_min + 1;
-                    if (range_wide > 0 &&
-                        range_wide <= (__int128)std::numeric_limits<idx_t>::max()) {
-                        auto planned_range = (idx_t)range_wide;
+                    idx_t planned_range = 0;
+                    if (TryGetDomainFromMinMax(build_key_min, build_key_max, planned_range)) {
+                        stats_build_key_domain = planned_range;
+                        int64_t probe_key_min = 0;
+                        int64_t probe_key_max = 0;
+                        if (TryGetIntegerKeyMinMaxFromStats(context, probe_child,
+                                                            probe_plan_bindings[probe_key_idx],
+                                                            probe_key_min, probe_key_max) &&
+                            TryGetDomainFromMinMax(probe_key_min, probe_key_max, stats_probe_key_domain)) {
+                            bool probe_range_covered = probe_key_min >= build_key_min && probe_key_max <= build_key_max;
+                            bool build_density_at_least_1_5x = AtLeastRatio(build_est, stats_build_key_domain, 3, 2);
+                            bool build_density_at_least_3x = AtLeastRatio(build_est, stats_build_key_domain, 3, 1);
+                            bool build_density_at_least_4x = AtLeastRatio(build_est, stats_build_key_domain, 4, 1);
+                            bool build_density_at_least_32x = AtLeastRatio(build_est, stats_build_key_domain, 32, 1);
+                            stats_planned_direct_borderline_fanout =
+                                probe_range_covered && build_density_at_least_1_5x;
+                            stats_planned_direct_build_fanout =
+                                probe_range_covered && build_density_at_least_3x;
+                            stats_planned_direct_build_strong_fanout =
+                                probe_range_covered && build_density_at_least_32x;
+                            stats_planned_direct_high_fanout =
+                                probe_range_covered && build_density_at_least_4x;
+                            if (AggJoinTraceEnabled()) {
+                                fprintf(stderr,
+                                        "[AGGJOIN] planned direct stats: build_domain=%llu probe_domain=%llu probe_covered=%d build_density_1_5x=%d build_density_3x=%d build_density_4x=%d build_density_32x=%d\n",
+                                        (unsigned long long)stats_build_key_domain,
+                                        (unsigned long long)stats_probe_key_domain,
+                                        probe_range_covered ? 1 : 0,
+                                        build_density_at_least_1_5x ? 1 : 0,
+                                        build_density_at_least_3x ? 1 : 0,
+                                        build_density_at_least_4x ? 1 : 0,
+                                        build_density_at_least_32x ? 1 : 0);
+                            }
+                        }
                         auto na_total = (idx_t)col.agg_funcs.size();
                         bool would_have_minmax = false;
                         bool would_have_avg = false;
+                        idx_t n_build_aggs_est = build_agg_count;
                         for (idx_t a = 0; a < na_total; a++) {
                             if (col.agg_funcs[a] == "MIN" || col.agg_funcs[a] == "MAX") would_have_minmax = true;
                             if (col.agg_funcs[a] == "AVG") would_have_avg = true;
                         }
                         idx_t bytes_per_key = sizeof(idx_t) + sizeof(double) * na_total +
                                              (would_have_minmax ? (sizeof(double) * 2 + sizeof(uint8_t)) * na_total : 0) +
-                                             (would_have_avg ? sizeof(double) * na_total : 0);
+                                             (would_have_avg ? sizeof(double) * na_total : 0) +
+                                             (n_build_aggs_est > 0 ? (sizeof(double) * 4 + sizeof(uint8_t)) * n_build_aggs_est : 0);
                         idx_t max_working_set = (col.group_cols.empty() || group_matches_join_key)
                                                     ? 32 * 1024 * 1024
                                                     : 16 * 1024 * 1024;
                         if (group_matches_join_key && !col.group_cols.empty() && na_total == 1 &&
-                            !would_have_minmax && !would_have_avg) {
+                            !would_have_minmax && !would_have_avg && n_build_aggs_est == 0) {
                             max_working_set = 48 * 1024 * 1024;
                         }
                         idx_t direct_limit = bytes_per_key > 0 ? max_working_set / bytes_per_key : 2000000;
@@ -723,14 +797,15 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         bool low_build_fanout = group_known && build_est <= group_est * 2;
         bool low_fanout_shape = low_probe_fanout && low_build_fanout;
         bool has_build_aggs = build_agg_count > 0;
-        bool planned_direct_parallel_shape = col.planned_direct_mode && !has_build_aggs && direct_like_shape &&
-                                             !composite_shape && !has_nonnumeric_minmax;
+        bool planned_direct_parallel_shape = col.planned_direct_mode && direct_like_shape &&
+                                             !composite_shape && !has_unsupported_minmax;
         bool planned_direct_has_avg = false;
         bool planned_direct_has_minmax = false;
         bool planned_direct_has_sum = false;
         if (planned_direct_parallel_shape) {
             for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
                 auto &fn = col.agg_funcs[a];
+                bool on_build = col.agg_on_build.size() > a && col.agg_on_build[a];
                 if (fn == "COUNT") {
                     continue;
                 }
@@ -751,7 +826,15 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                     break;
                 }
                 auto payload_type = ba.children[0]->return_type.InternalType();
-                if (payload_type != PhysicalType::DOUBLE && payload_type != PhysicalType::FLOAT) {
+                bool payload_ok = payload_type == PhysicalType::DOUBLE || payload_type == PhysicalType::FLOAT;
+                if (on_build) {
+                    payload_ok = payload_ok || payload_type == PhysicalType::INT8 ||
+                                 payload_type == PhysicalType::INT16 || payload_type == PhysicalType::INT32 ||
+                                 payload_type == PhysicalType::INT64 || payload_type == PhysicalType::UINT8 ||
+                                 payload_type == PhysicalType::UINT16 || payload_type == PhysicalType::UINT32 ||
+                                 payload_type == PhysicalType::UINT64;
+                }
+                if (!payload_ok) {
                     planned_direct_parallel_shape = false;
                     break;
                 }
@@ -775,8 +858,28 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         bool planned_direct_borderline_fanout = planned_direct_parallel_shape && join_known && probe_est > 0 &&
                                                 join_est >= probe_est &&
                                                 join_est - probe_est >= probe_est / 4;
+        planned_direct_borderline_fanout =
+            planned_direct_borderline_fanout ||
+            (planned_direct_parallel_shape && stats_planned_direct_borderline_fanout);
+        bool planned_direct_build_side_fanout = planned_direct_parallel_shape && has_build_aggs &&
+                                                join_known && probe_est > 0 &&
+                                                AtLeastRatio(join_est, probe_est, 3, 1);
+        planned_direct_build_side_fanout =
+            planned_direct_build_side_fanout ||
+            (planned_direct_parallel_shape && has_build_aggs && stats_planned_direct_build_fanout);
+        bool planned_direct_build_side_strong_fanout = planned_direct_parallel_shape && has_build_aggs &&
+                                                       join_known && probe_est > 0 &&
+                                                       AtLeastRatio(join_est, probe_est, 32, 1);
+        planned_direct_build_side_strong_fanout =
+            planned_direct_build_side_strong_fanout ||
+            (planned_direct_parallel_shape && has_build_aggs && stats_planned_direct_build_strong_fanout);
+        bool planned_direct_build_side_required_fanout =
+            col.group_cols.empty() ? planned_direct_build_side_strong_fanout : planned_direct_build_side_fanout;
         bool planned_direct_sparse_high_fanout = planned_direct_sparse_grouped && join_known && probe_est > 0 &&
                                                  join_est >= probe_est * 4;
+        planned_direct_sparse_high_fanout =
+            planned_direct_sparse_high_fanout ||
+            (planned_direct_sparse_grouped && stats_planned_direct_high_fanout);
         bool simple_varlen_hash_shape = false;
         if (has_varlen_key && !composite_shape && !has_build_aggs && col.probe_key_cols.size() == 1 &&
             (col.group_cols.empty() || group_matches_join_key)) {
@@ -823,13 +926,17 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         if (has_varlen_key && !simple_varlen_hash_shape) gate_reason = "variable-width join/group key";
         else if (asym_build_heavy)
             gate_reason = "build-heavy aggregate shape better handled natively";
-        else if (build_rollup && large_inputs && (build_agg_count >= 2 || group_est == 0 || group_est >= 256))
+        else if (build_rollup && !planned_direct_parallel_shape && large_inputs &&
+                 (build_agg_count >= 2 || group_est == 0 || group_est >= 256))
             gate_reason = "build-side rollup outside fast path";
         else if (has_build_aggs && heavy_build_aggs && large_inputs && !direct_like_shape)
             gate_reason = "build-side aggregate fanout outside direct path";
-        else if (has_build_aggs && large_inputs && group_matches_join_key &&
+        else if (has_build_aggs && !planned_direct_parallel_shape && large_inputs && group_matches_join_key &&
                  build_agg_count >= 4 && has_count_or_avg)
             gate_reason = "build-side aggregate mix outside direct fast path";
+        else if (has_build_aggs && planned_direct_parallel_shape && large_inputs &&
+                 !planned_direct_build_side_required_fanout)
+            gate_reason = "build-side planned-direct needs fanout";
         else if (!has_build_aggs && !composite_shape && has_non_integral_key &&
                  !simple_varlen_hash_shape &&
                  group_matches_join_key && large_inputs)

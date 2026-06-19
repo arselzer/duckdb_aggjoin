@@ -31,6 +31,65 @@ SELECT aggjoin_last_rewrite();
 ----
 none
 
+# Build-side planned-direct has a higher fixed cost than the probe-only direct
+# path because it materializes per-key build payload arrays. A unique build side
+# should still bail even though the integer key range is direct-plannable.
+
+statement ok
+SELECT aggjoin_set_cascade_enabled(false);
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT CAST(SUM(CAST(lf_dim.x AS DOUBLE)) AS BIGINT)
+FROM lf_fact JOIN lf_dim ON lf_fact.x = lf_dim.x;
+----
+24999750000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+statement ok
+SELECT aggjoin_set_cascade_enabled(true);
+
+# The same shape with duplicate build keys should not be gated only because
+# DuckDB's join estimate is close to the probe estimate: build key min/max stats
+# imply at least 1.5x build-side fanout across the covered key domain.
+
+statement ok
+CREATE TABLE lf_dup_dim AS
+SELECT (i % 100000)::INT AS x
+FROM range(150000) t(i);
+
+statement ok
+CREATE TABLE lf_dup_fact AS
+SELECT (i % 100000)::INT AS x, (i % 1000)::DOUBLE AS v
+FROM range(500000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT CAST(SUM(s) AS BIGINT), COUNT(*)
+FROM (
+  SELECT lf_dup_fact.x, SUM(lf_dup_fact.v) AS s
+  FROM lf_dup_fact JOIN lf_dup_dim ON lf_dup_fact.x = lf_dup_dim.x
+  GROUP BY lf_dup_fact.x
+) q;
+----
+374625000	100000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+fused
+
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
 

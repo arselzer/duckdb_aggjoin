@@ -335,6 +335,26 @@ Representative trace for the grouped mixed case:
 - `native-build-preagg candidate: groups=1 aggs=3 build_aggs=3`
 - `planner rewrite: native build preagg`
 
+### Planned-direct build-side operator follow-up
+
+The physical planned-direct operator now has a narrow build-side numeric
+aggregate path for `SUM/COUNT/AVG/MIN/MAX`. The dedicated
+[bench_planned_direct_build_side.sql](./bench_planned_direct_build_side.sql)
+benchmark disables cascade rewrites deliberately, so it measures the fused
+operator's build-side per-key arrays rather than the native preaggregation
+lowerings.
+
+The planner guard is intentionally stricter than the probe-side direct guard:
+grouped build-side direct needs about `3x` build-key duplication, while scalar
+build-side direct needs a much stronger signal. Lower-fanout scalar and unique
+key cases were measured at parity or worse and now stay native.
+
+| Query shape | Fused direct | Native baseline | Result |
+|-------------|--------------|-----------------|--------|
+| Grouped by join key, build `SUM+COUNT+AVG+MIN+MAX`, 50K keys, `3M x 1M` | 0.237s | 0.369s | **1.6x faster**, marker `fused` |
+| Scalar build `SUM+COUNT+AVG+MIN+MAX`, 5K keys, `250K x 200K` | 0.035s | 0.095s | **2.7x faster**, marker `fused` |
+| Unique-key low-fanout grouped build aggregates, `100K x 100K` | 0.027s | native path | planner guard bails, marker `none` |
+
 ### Composite build-side subset-key follow-up
 
 The native build-preaggregation rewrite now also covers a narrow composite-key
@@ -808,6 +828,9 @@ be treated as a fresh regression by itself.
   disabled-extension baseline via a native preaggregation rewrite, but that
   path is still much narrower than the build-side-only lowerings and is
   currently limited to single-key balanced shapes.
+- Build-side numeric aggregates now also have a physical planned-direct path
+  for dense integer keys, but it is deliberately gated to duplicated-key cases
+  where the direct arrays beat native hash join plus aggregate.
 - A later follow-up extended that same idea to one narrow composite-key grouped
   mixed shape, where it is also a real win over the disabled-extension baseline.
 - The operator is still blocking, so it does not help latency-sensitive `LIMIT`

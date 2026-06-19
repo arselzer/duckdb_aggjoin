@@ -12,11 +12,18 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         return false;
     }
     for (idx_t a = 0; a < na; a++) {
-        if (col.agg_on_build.size() > a && col.agg_on_build[a]) {
+        bool on_build = col.agg_on_build.size() > a && col.agg_on_build[a];
+        if (on_build && sink.direct_build_sums.empty()) {
             return false;
         }
         auto &fn = col.agg_funcs[a];
         auto ai = col.agg_input_cols[a];
+        if (on_build) {
+            if (fn == "COUNT" || fn == "SUM" || fn == "AVG" || fn == "MIN" || fn == "MAX") {
+                continue;
+            }
+            return false;
+        }
         if (fn == "COUNT") {
             if (ai != DConstants::INVALID_INDEX && ai >= input.ColumnCount()) {
                 return false;
@@ -96,20 +103,48 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
     }
 
     struct AggSlot {
-        enum Kind { SUM_VAL, AVG_VAL, COUNT_STAR, COUNT_COL, MIN_VAL, MAX_VAL } kind;
+        enum Kind {
+            SUM_VAL,
+            AVG_VAL,
+            COUNT_STAR,
+            COUNT_COL,
+            MIN_VAL,
+            MAX_VAL,
+            BUILD_SUM,
+            BUILD_AVG,
+            BUILD_COUNT,
+            BUILD_MIN,
+            BUILD_MAX
+        } kind;
         const double *double_vals = nullptr;
         const float *float_vals = nullptr;
         const uint64_t *validity = nullptr;
+        idx_t build_index = DConstants::INVALID_INDEX;
 
         double Value(idx_t row) const {
             return double_vals ? double_vals[row] : (double)float_vals[row];
         }
     };
     vector<AggSlot> slots(na);
+    idx_t build_agg_index = 0;
     for (idx_t a = 0; a < na; a++) {
         auto &fn = col.agg_funcs[a];
         auto ai = col.agg_input_cols[a];
-        if (fn == "COUNT" && ai == DConstants::INVALID_INDEX) {
+        bool on_build = col.agg_on_build.size() > a && col.agg_on_build[a];
+        if (on_build) {
+            slots[a].build_index = build_agg_index++;
+            if (fn == "SUM") {
+                slots[a].kind = AggSlot::BUILD_SUM;
+            } else if (fn == "AVG") {
+                slots[a].kind = AggSlot::BUILD_AVG;
+            } else if (fn == "COUNT") {
+                slots[a].kind = AggSlot::BUILD_COUNT;
+            } else if (fn == "MIN") {
+                slots[a].kind = AggSlot::BUILD_MIN;
+            } else {
+                slots[a].kind = AggSlot::BUILD_MAX;
+            }
+        } else if (fn == "COUNT" && ai == DConstants::INVALID_INDEX) {
             slots[a].kind = AggSlot::COUNT_STAR;
         } else if (fn == "COUNT") {
             slots[a].kind = AggSlot::COUNT_COL;
@@ -141,6 +176,11 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
     auto kmin = sink.key_min;
     auto krange = sink.key_range;
     auto *bc = sink.build_counts.data();
+    auto *build_sums = sink.direct_build_sums.empty() ? nullptr : sink.direct_build_sums.data();
+    auto *build_counts = sink.direct_build_counts.empty() ? nullptr : sink.direct_build_counts.data();
+    auto *build_mins = sink.direct_build_mins.empty() ? nullptr : sink.direct_build_mins.data();
+    auto *build_maxs = sink.direct_build_maxs.empty() ? nullptr : sink.direct_build_maxs.data();
+    auto *build_has = sink.direct_build_has.empty() ? nullptr : sink.direct_build_has.data();
 
     auto ensure_sparse_slot = [&](idx_t k) -> idx_t {
         auto marker = state.parallel_direct_sparse_slot_lookup[k];
@@ -214,6 +254,41 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                         }                                                                                \
                     }                                                                                    \
                     break;                                                                               \
+                case AggSlot::BUILD_SUM: {                                                               \
+                    auto off = slot.build_index * krange + k;                                            \
+                    state.parallel_ungrouped_sum[a] += build_sums[off];                                  \
+                    if (build_counts[off] > 0) state.parallel_ungrouped_has[a] = 1;                      \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_AVG: {                                                               \
+                    auto off = slot.build_index * krange + k;                                            \
+                    state.parallel_ungrouped_sum[a] += build_sums[off];                                  \
+                    state.parallel_ungrouped_count[a] += build_counts[off];                              \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_COUNT: {                                                             \
+                    auto off = slot.build_index * krange + k;                                            \
+                    state.parallel_ungrouped_sum[a] += build_counts[off];                                \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_MIN: {                                                               \
+                    auto off = slot.build_index * krange + k;                                            \
+                    if (build_has[off] &&                                                                 \
+                        (!state.parallel_ungrouped_has[a] || build_mins[off] < state.parallel_ungrouped_min[a])) { \
+                        state.parallel_ungrouped_min[a] = build_mins[off];                              \
+                        state.parallel_ungrouped_has[a] = 1;                                             \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_MAX: {                                                               \
+                    auto off = slot.build_index * krange + k;                                            \
+                    if (build_has[off] &&                                                                 \
+                        (!state.parallel_ungrouped_has[a] || build_maxs[off] > state.parallel_ungrouped_max[a])) { \
+                        state.parallel_ungrouped_max[a] = build_maxs[off];                              \
+                        state.parallel_ungrouped_has[a] = 1;                                             \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
                 }                                                                                        \
             }                                                                                            \
         }                                                                                                \
@@ -278,6 +353,39 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                         }                                                                                \
                     }                                                                                    \
                     break;                                                                               \
+                case AggSlot::BUILD_SUM: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    sums[off] += build_sums[build_off];                                                  \
+                    if (has && build_counts[build_off] > 0) has[off] = 1;                                \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_AVG: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    sums[off] += build_sums[build_off];                                                  \
+                    counts[off] += build_counts[build_off];                                              \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_COUNT: {                                                             \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    sums[off] += build_counts[build_off];                                                \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_MIN: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    if (build_has[build_off] && (!has[off] || build_mins[build_off] < mins[off])) {      \
+                        mins[off] = build_mins[build_off];                                               \
+                        has[off] = 1;                                                                    \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_MAX: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    if (build_has[build_off] && (!has[off] || build_maxs[build_off] > maxs[off])) {      \
+                        maxs[off] = build_maxs[build_off];                                               \
+                        has[off] = 1;                                                                    \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
                 }                                                                                        \
             }                                                                                            \
         }                                                                                                \
@@ -334,6 +442,42 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                         }                                                                                \
                     }                                                                                    \
                     break;                                                                               \
+                case AggSlot::BUILD_SUM: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    state.parallel_sparse_sums[off] += build_sums[build_off];                            \
+                    if (!state.parallel_sparse_has.empty() && build_counts[build_off] > 0)                \
+                        state.parallel_sparse_has[off] = 1;                                              \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_AVG: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    state.parallel_sparse_sums[off] += build_sums[build_off];                            \
+                    state.parallel_sparse_counts[off] += build_counts[build_off];                        \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_COUNT: {                                                             \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    state.parallel_sparse_sums[off] += build_counts[build_off];                          \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_MIN: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    if (build_has[build_off] &&                                                          \
+                        (!state.parallel_sparse_has[off] || build_mins[build_off] < state.parallel_sparse_mins[off])) { \
+                        state.parallel_sparse_mins[off] = build_mins[build_off];                        \
+                        state.parallel_sparse_has[off] = 1;                                              \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
+                case AggSlot::BUILD_MAX: {                                                               \
+                    auto build_off = slot.build_index * krange + k;                                      \
+                    if (build_has[build_off] &&                                                          \
+                        (!state.parallel_sparse_has[off] || build_maxs[build_off] > state.parallel_sparse_maxs[off])) { \
+                        state.parallel_sparse_maxs[off] = build_maxs[build_off];                        \
+                        state.parallel_sparse_has[off] = 1;                                              \
+                    }                                                                                    \
+                    break;                                                                               \
+                }                                                                                        \
                 }                                                                                        \
             }                                                                                            \
         }                                                                                                \

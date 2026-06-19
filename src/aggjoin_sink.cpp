@@ -55,11 +55,6 @@ static bool TryInitializePlannedDirectMode(AggJoinSinkState &state, const AggJoi
     if (!col.planned_direct_mode || col.planned_direct_key_range == 0) {
         return false;
     }
-    for (idx_t a = 0; a < col.agg_on_build.size(); a++) {
-        if (col.agg_on_build[a]) {
-            return false;
-        }
-    }
     for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
         if ((col.agg_funcs[a] == "MIN" || col.agg_funcs[a] == "MAX") &&
             a < col.agg_is_numeric.size() && !col.agg_is_numeric[a]) {
@@ -76,6 +71,12 @@ static bool TryInitializePlannedDirectMode(AggJoinSinkState &state, const AggJoi
     state.build_counts.assign(range, 0);
     state.direct_sums.assign(range * state.num_aggs, 0.0);
     state.all_bc_one = true;
+    idx_t n_build_aggs = 0;
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if (col.agg_on_build.size() > a && col.agg_on_build[a]) {
+            n_build_aggs++;
+        }
+    }
 
     for (auto &f : col.agg_funcs) {
         if (f == "MIN" || f == "MAX") state.has_min_max = true;
@@ -91,6 +92,13 @@ static bool TryInitializePlannedDirectMode(AggJoinSinkState &state, const AggJoi
     }
     if (state.has_avg) {
         state.direct_counts.assign(range * state.num_aggs, 0.0);
+    }
+    if (n_build_aggs > 0) {
+        state.direct_build_sums.assign(n_build_aggs * range, 0.0);
+        state.direct_build_mins.assign(n_build_aggs * range, std::numeric_limits<double>::max());
+        state.direct_build_maxs.assign(n_build_aggs * range, std::numeric_limits<double>::lowest());
+        state.direct_build_counts.assign(n_build_aggs * range, 0.0);
+        state.direct_build_has.assign(n_build_aggs * range, 0);
     }
     if (col.group_cols.empty()) {
         auto na = col.agg_funcs.size();
@@ -110,7 +118,100 @@ static bool TryInitializePlannedDirectMode(AggJoinSinkState &state, const AggJoi
     return true;
 }
 
-static void PopulatePlannedDirectBuildCounts(AggJoinSinkState &sink, DataChunk &chunk, idx_t key_col) {
+static bool PlannedDirectBuildValueIsValid(DataChunk &chunk, idx_t col_idx, idx_t row) {
+    if (col_idx == DConstants::INVALID_INDEX || col_idx >= chunk.ColumnCount()) {
+        return false;
+    }
+    auto *validity = FlatVector::Validity(chunk.data[col_idx]).GetData();
+    return !validity || ((validity[row / 64] >> (row % 64)) & 1);
+}
+
+static bool ReadPlannedDirectBuildPayload(DataChunk &chunk, idx_t col_idx, idx_t row, double &value) {
+    if (!PlannedDirectBuildValueIsValid(chunk, col_idx, row)) {
+        return false;
+    }
+    switch (chunk.data[col_idx].GetType().InternalType()) {
+    case PhysicalType::DOUBLE:
+        value = FlatVector::GetData<double>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::FLOAT:
+        value = FlatVector::GetData<float>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::INT8:
+        value = (double)FlatVector::GetData<int8_t>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::INT16:
+        value = (double)FlatVector::GetData<int16_t>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::INT32:
+        value = (double)FlatVector::GetData<int32_t>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::INT64:
+        value = (double)FlatVector::GetData<int64_t>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::UINT8:
+        value = (double)FlatVector::GetData<uint8_t>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::UINT16:
+        value = (double)FlatVector::GetData<uint16_t>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::UINT32:
+        value = (double)FlatVector::GetData<uint32_t>(chunk.data[col_idx])[row];
+        return true;
+    case PhysicalType::UINT64:
+        value = (double)FlatVector::GetData<uint64_t>(chunk.data[col_idx])[row];
+        return true;
+    default:
+        value = chunk.data[col_idx].GetValue(row).GetValue<double>();
+        return true;
+    }
+}
+
+static void AccumulatePlannedDirectBuildAggs(AggJoinSinkState &sink, DataChunk &chunk, const AggJoinColInfo &col,
+                                            idx_t row, idx_t offset) {
+    if (sink.direct_build_sums.empty()) {
+        return;
+    }
+    auto range = sink.key_range;
+    idx_t ba = 0;
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if (!(col.agg_on_build.size() > a && col.agg_on_build[a])) {
+            continue;
+        }
+        auto &f = col.agg_funcs[a];
+        auto bci = col.build_agg_cols[a];
+        auto arr_offset = ba * range + offset;
+        if (f == "COUNT") {
+            if (PlannedDirectBuildValueIsValid(chunk, bci, row)) {
+                sink.direct_build_counts[arr_offset] += 1.0;
+            }
+        } else {
+            double value = 0.0;
+            if (!ReadPlannedDirectBuildPayload(chunk, bci, row, value)) {
+                ba++;
+                continue;
+            }
+            if (f == "SUM" || f == "AVG") {
+                sink.direct_build_sums[arr_offset] += value;
+                sink.direct_build_counts[arr_offset] += 1.0;
+            } else if (f == "MIN") {
+                if (!sink.direct_build_has[arr_offset] || value < sink.direct_build_mins[arr_offset]) {
+                    sink.direct_build_mins[arr_offset] = value;
+                    sink.direct_build_has[arr_offset] = 1;
+                }
+            } else if (f == "MAX") {
+                if (!sink.direct_build_has[arr_offset] || value > sink.direct_build_maxs[arr_offset]) {
+                    sink.direct_build_maxs[arr_offset] = value;
+                    sink.direct_build_has[arr_offset] = 1;
+                }
+            }
+        }
+        ba++;
+    }
+}
+
+static void PopulatePlannedDirectBuildCounts(AggJoinSinkState &sink, DataChunk &chunk, const AggJoinColInfo &col,
+                                             idx_t key_col) {
     auto n = chunk.size();
     auto ptype = chunk.data[key_col].GetType().InternalType();
     auto *validity = FlatVector::Validity(chunk.data[key_col]).GetData();
@@ -131,6 +232,7 @@ static void PopulatePlannedDirectBuildCounts(AggJoinSinkState &sink, DataChunk &
             count++;                                                                                     \
             if (count != 1) sink.all_bc_one = false;                                                     \
             sink.build_rows_kept++;                                                                      \
+            AccumulatePlannedDirectBuildAggs(sink, chunk, col, r, offset);                               \
         }                                                                                                \
     }
     switch (ptype) {
@@ -209,7 +311,7 @@ SinkResultType PhysicalAggJoin::Sink(ExecutionContext &ctx, DataChunk &chunk, Op
             }
         }
         if (sink.direct_build_without_ht) {
-            PopulatePlannedDirectBuildCounts(sink, chunk, col.build_key_cols[0]);
+            PopulatePlannedDirectBuildCounts(sink, chunk, col, col.build_key_cols[0]);
             return SinkResultType::NEED_MORE_INPUT;
         }
         Vector hv(LogicalType::HASH, n); hv.Flatten(n);

@@ -1,0 +1,39 @@
+# name: test/sql/aggjoin_precision_guard.test
+# description: Numeric MIN/MAX payloads that cannot be represented exactly by
+#              the double-backed fused accumulators must stay on native DuckDB.
+# group: [aggjoin]
+# differential: skip
+#   Uses aggjoin_last_rewrite() fire-assertions.
+
+require aggjoin
+
+statement ok
+SELECT aggjoin_set_cascade_enabled(false);
+
+statement ok
+CREATE TABLE precision_guard_build AS
+SELECT 1::INT AS k;
+
+statement ok
+CREATE TABLE precision_guard_probe AS
+SELECT 1::INT AS k, 9007199254740993::BIGINT AS x;
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT MIN(x), MAX(x)
+FROM precision_guard_probe JOIN precision_guard_build USING(k);
+----
+9007199254740993	9007199254740993
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+statement ok
+SELECT aggjoin_set_cascade_enabled(true);

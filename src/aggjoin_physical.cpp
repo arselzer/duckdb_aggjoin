@@ -75,13 +75,11 @@ static bool SupportsParallelPlannedDirect(const PhysicalAggJoin &op) {
         return false;
     }
     for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
-        if (col.agg_on_build.size() > a && col.agg_on_build[a]) {
-            return false;
-        }
+        bool on_build = col.agg_on_build.size() > a && col.agg_on_build[a];
         auto &fn = col.agg_funcs[a];
         auto ai = a < col.agg_input_cols.size() ? col.agg_input_cols[a] : DConstants::INVALID_INDEX;
         if (fn == "COUNT") {
-            if (ai != DConstants::INVALID_INDEX && ai >= col.probe_col_count) {
+            if (!on_build && ai != DConstants::INVALID_INDEX && ai >= col.probe_col_count) {
                 return false;
             }
             continue;
@@ -89,14 +87,20 @@ static bool SupportsParallelPlannedDirect(const PhysicalAggJoin &op) {
         if (fn != "SUM" && fn != "AVG" && fn != "MIN" && fn != "MAX") {
             return false;
         }
-        if (ai == DConstants::INVALID_INDEX || ai >= col.probe_col_count) {
+        if (!on_build && (ai == DConstants::INVALID_INDEX || ai >= col.probe_col_count)) {
             return false;
         }
         if (a >= op.payload_types.size()) {
             return false;
         }
         auto payload_type = op.payload_types[a].InternalType();
-        if (payload_type != PhysicalType::DOUBLE && payload_type != PhysicalType::FLOAT) {
+        bool payload_ok = payload_type == PhysicalType::DOUBLE || payload_type == PhysicalType::FLOAT;
+        if (on_build && (fn == "MIN" || fn == "MAX")) {
+            payload_ok = payload_ok || payload_type == PhysicalType::INT8 || payload_type == PhysicalType::INT16 ||
+                         payload_type == PhysicalType::INT32 || payload_type == PhysicalType::UINT8 ||
+                         payload_type == PhysicalType::UINT16 || payload_type == PhysicalType::UINT32;
+        }
+        if (!payload_ok) {
             return false;
         }
     }
