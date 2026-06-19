@@ -21,7 +21,7 @@ function datasetLabel(ex: Example) {
 
 <template>
   <section class="panel ex">
-    <div class="bar"><span class="eyebrow">examples</span><span class="hint mono">self-contained · builds its own data</span></div>
+    <div class="bar"><span class="eyebrow">examples</span><span class="hint mono">selects SQL · run loads data</span></div>
     <ul>
       <li
         v-for="ex in examples"
@@ -37,8 +37,8 @@ function datasetLabel(ex: Example) {
             :class="kindClass(ex.kind)"
           >{{ KIND_LABEL[ex.kind] }}</span>
         </div>
-        <p v-if="ex.dataset" class="ds mono">⤓ bundled dataset · {{ datasetLabel(ex) }}</p>
-        <p v-if="ex.autoBenchmark === false" class="ds stress mono">manual run · choose a mode</p>
+        <p v-if="ex.dataset" class="ds mono">bundled data on run · {{ datasetLabel(ex) }}</p>
+        <p v-if="ex.autoBenchmark === false" class="ds stress mono">large query · choose a mode</p>
       </li>
     </ul>
   </section>

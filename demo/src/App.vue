@@ -64,6 +64,8 @@ const result = ref<QueryResult | null>(null)
 const error = ref<string | null>(null)
 const tables = ref<TableInfo[]>([])
 const activeExampleId = ref<string | null>(null)
+const selectedExample = ref<Example | null>(null)
+const preparedExampleId = ref<string | null>(null)
 const timeoutSeconds = ref(readJson<number>(TIMEOUT_KEY, 30))
 const sessions = ref<SavedSession[]>(readJson<SavedSession[]>(SESSIONS_KEY, []))
 const history = ref<BenchHistoryEntry[]>(readJson<BenchHistoryEntry[]>(HISTORY_KEY, []))
@@ -107,39 +109,46 @@ function queryTimeoutMs() {
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined
 }
 
-async function loadExample(ex: Example, opts: { silent?: boolean } = {}) {
-  if (busy.value) return
+function clearSelectedExample() {
+  activeExampleId.value = null
+  selectedExample.value = null
+  preparedExampleId.value = null
+}
+
+function selectExample(ex: Example) {
+  if (selectedExample.value?.id !== ex.id) preparedExampleId.value = null
   activeExampleId.value = ex.id
-  busy.value = true
+  selectedExample.value = ex
+  sql.value = ex.query
+  bench.value = null
+  result.value = null
   error.value = null
+  notify(ex.dataset || ex.setup.trim() ? `selected “${ex.title}” · choose a run mode to load data` : `selected “${ex.title}”`)
+}
+
+async function prepareSelectedExample() {
+  const ex = selectedExample.value
+  if (!ex) return
+  if (preparedExampleId.value === ex.id) return
   try {
     if (ex.dataset) {
       const datasets = Array.isArray(ex.dataset) ? ex.dataset : [ex.dataset]
-      if (!opts.silent) {
-        notify(`loading ${datasets.length === 1 ? datasets[0].file : `${datasets.length} parquet files`}…`)
-      }
+      notify(`loading ${datasets.length === 1 ? datasets[0].file : `${datasets.length} parquet files`}…`)
       for (const dataset of datasets) {
         const url = new URL(import.meta.env.BASE_URL + dataset.file, window.location.href).href
         await engine.attachParquet(url, dataset.table)
       }
     }
     await engine.runScript(ex.setup)
-    sql.value = ex.query
     await refreshTables()
-    if (ex.autoBenchmark === false) {
-      bench.value = null
-      result.value = null
-      if (!opts.silent) notify(`loaded “${ex.title}” · use Optimized only or Benchmark`)
-    } else {
-      if (!opts.silent) notify(`built data for “${ex.title}”`)
-      await runBenchmark()
-    }
+    preparedExampleId.value = ex.id
   } catch (e: any) {
+    preparedExampleId.value = null
     error.value = e?.message ?? String(e)
     bench.value = null
-    if (!opts.silent) notify('failed to build example', 'err')
-  } finally {
-    busy.value = false
+    result.value = null
+    notify('failed to load example data', 'err')
+    throw e
   }
 }
 
@@ -148,6 +157,7 @@ async function runBenchmark() {
   busy.value = true
   error.value = null
   try {
+    await prepareSelectedExample()
     const b = await engine.benchmark(sql.value, 3, queryTimeoutMs())
     bench.value = b
     result.value = b.result
@@ -167,6 +177,7 @@ async function runOptimizedOnly() {
   busy.value = true
   error.value = null
   try {
+    await prepareSelectedExample()
     const b = await engine.runOptimized(sql.value, 3, queryTimeoutMs())
     bench.value = b
     result.value = b.result
@@ -184,6 +195,7 @@ async function runNativeOnly() {
   busy.value = true
   error.value = null
   try {
+    await prepareSelectedExample()
     const b = await engine.runNative(sql.value, 3, queryTimeoutMs())
     bench.value = b
     result.value = b.result
@@ -231,7 +243,7 @@ function saveSession() {
 
 function loadSession(session: SavedSession) {
   sql.value = session.sql
-  activeExampleId.value = null
+  clearSelectedExample()
   bench.value = null
   result.value = null
   error.value = null
@@ -243,7 +255,7 @@ function deleteSession(id: string) {
 
 function loadHistoryEntry(entry: BenchHistoryEntry) {
   sql.value = entry.sql
-  activeExampleId.value = null
+  clearSelectedExample()
   bench.value = null
   result.value = null
   error.value = null
@@ -281,7 +293,7 @@ async function runOnce() {
   busy.value = true
   error.value = null
   bench.value = null
-  activeExampleId.value = null
+  clearSelectedExample()
   try {
     result.value = await engine.run(sql.value)
   } catch (e: any) {
@@ -304,7 +316,7 @@ async function onFiles(files: File[]) {
     await refreshTables()
     if (last && last.columns.length) {
       sql.value = `SELECT * FROM "${last.name}" LIMIT 100;`
-      activeExampleId.value = null
+      clearSelectedExample()
       await runOnce()
     }
   } catch (e: any) {
@@ -318,13 +330,13 @@ async function onFiles(files: File[]) {
 
 function useTable(name: string) {
   sql.value = `SELECT * FROM "${name}" LIMIT 100;`
-  activeExampleId.value = null
+  clearSelectedExample()
   runOnce()
 }
 
 function newQuery() {
   sql.value = '-- write a new aggregate-over-join query\nSELECT 1;'
-  activeExampleId.value = null
+  clearSelectedExample()
   bench.value = null
   result.value = null
   error.value = null
@@ -332,6 +344,7 @@ function newQuery() {
 
 async function dropTable(name: string) {
   await engine.dropTable(name)
+  preparedExampleId.value = null
   await refreshTables()
   notify(`dropped ${name}`)
 }
@@ -360,7 +373,7 @@ async function dropTable(name: string) {
 
     <main v-else class="grid reveal">
       <aside class="rail">
-        <ExamplesPanel :active-id="activeExampleId" :busy="busy" @load="loadExample" />
+        <ExamplesPanel :active-id="activeExampleId" :busy="busy" @load="selectExample" />
         <ImportPanel :busy="importing" @files="onFiles" />
         <WorkspacePanel
           :sessions="sessions"
