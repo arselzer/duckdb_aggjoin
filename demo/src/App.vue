@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
 import { AggJoinEngine, type BenchResult, type ExportFormat, type QueryResult, type TableInfo } from './engine'
-import { examples, type Example } from './data/examples'
+import type { Example } from './data/examples'
 import type { BenchHistoryEntry, SavedSession } from './data/workspace'
 import AppHeader from './components/AppHeader.vue'
 import SqlPanel from './components/SqlPanel.vue'
@@ -88,12 +88,7 @@ onMounted(async () => {
     version.value = engine.version
     aggjoinLoaded.value = engine.aggjoinLoaded
     ready.value = true
-    if (restoredSql) {
-      await refreshTables()
-    } else {
-      // Warm first impression: build + benchmark the lead example immediately.
-      await loadExample(examples[0], { silent: true })
-    }
+    await refreshTables()
   } catch (e: any) {
     bootError.value = e?.message ?? String(e)
   }

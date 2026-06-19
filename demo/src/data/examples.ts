@@ -28,7 +28,7 @@ export const KIND_LABEL: Record<ExampleKind, string> = {
   operator: 'Fused operator',
   propagation: 'Native rewrite · aggregate propagation',
   guard: 'Planner guard',
-  stress: 'Stress query · load only',
+  stress: 'Large workload',
 }
 
 export const examples: Example[] = [

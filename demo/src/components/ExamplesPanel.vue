@@ -38,7 +38,7 @@ function datasetLabel(ex: Example) {
           >{{ KIND_LABEL[ex.kind] }}</span>
         </div>
         <p v-if="ex.dataset" class="ds mono">⤓ bundled dataset · {{ datasetLabel(ex) }}</p>
-        <p v-if="ex.autoBenchmark === false" class="ds stress mono">loads query only · press Benchmark to run</p>
+        <p v-if="ex.autoBenchmark === false" class="ds stress mono">manual run · choose a mode</p>
       </li>
     </ul>
   </section>
