@@ -1,17 +1,17 @@
 # name: test/sql/aggjoin_path_toggle.test
 # group: [aggjoin]
 # description: Per-path enable/disable.  The extension bundles two mechanisms in
-#   one optimizer pass: the native-lowering Yannakakis frequency CASCADE and the
-#   fused PhysicalAggJoin OPERATOR.  aggjoin_set_cascade_enabled /
+#   one optimizer pass: native-lowering LOGICAL REWRITES and the fused
+#   PhysicalAggJoin OPERATOR. aggjoin_set_logical_rewrites_enabled /
 #   aggjoin_set_operator_enabled toggle them independently, so a deployment can
-#   run the proven exact cascade while keeping the fused operator off.
+#   run the proven exact logical rewrites while keeping the fused operator off.
 # differential: skip
 #   Uses fire-assertion markers + the runtime toggles, both extension-only.
 
 require aggjoin
 
 # A 3-table blow-up chain: 60k x 60k is 1:1 on k, then x100 fan-out on j, so the
-# join blows up to 6,000,000 rows and the chain-count cascade fires by default.
+# join blows up to 6,000,000 rows and the chain-count logical rewrite fires by default.
 statement ok
 CREATE TABLE pt0(k INT);
 
@@ -30,7 +30,7 @@ INSERT INTO pt1 SELECT i, i % 600 FROM range(60000) t(i);
 statement ok
 INSERT INTO pt2 SELECT i % 600 FROM range(60000) t(i);
 
-# --- default: the cascade fires ---
+# --- default: the logical rewrite fires ---
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
 
@@ -44,10 +44,10 @@ SELECT aggjoin_last_rewrite();
 ----
 chain_count
 
-# --- disable the cascade: SAME correct count, no longer via the cascade (the
+# --- disable logical rewrites: SAME correct count, no longer via logical rewrites (the
 #     fused operator picks it up) ---
 statement ok
-SELECT aggjoin_set_cascade_enabled(false);
+SELECT aggjoin_set_logical_rewrites_enabled(false);
 
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
@@ -79,9 +79,9 @@ SELECT aggjoin_last_rewrite();
 ----
 none
 
-# --- re-enable the cascade only: it fires again, operator still off ---
+# --- re-enable logical rewrites only: they fire again, operator still off ---
 statement ok
-SELECT aggjoin_set_cascade_enabled(true);
+SELECT aggjoin_set_logical_rewrites_enabled(true);
 
 statement ok
 SELECT aggjoin_reset_rewrite_marker();

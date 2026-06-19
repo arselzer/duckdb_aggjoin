@@ -18,7 +18,7 @@
 require aggjoin
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(false);
+SELECT aggjoin_set_logical_rewrites_enabled(false);
 
 statement ok
 CREATE TABLE lg_build(k INT);
@@ -75,4 +75,4 @@ SELECT aggjoin_last_rewrite();
 fused
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(true);
+SELECT aggjoin_set_logical_rewrites_enabled(true);

@@ -23,11 +23,18 @@ struct AggJoinSinkState : public GlobalSinkState {
     idx_t build_agg_slots = 0;                    // number of build-side aggregates
 
     // ── Build-side aggregate values for direct mode (transferred in Finalize) ──
-    vector<double> direct_build_sums;    // [ba * range + key_offset]
-    vector<double> direct_build_mins;
-    vector<double> direct_build_maxs;
-    vector<double> direct_build_counts;
-    vector<uint8_t> direct_build_has;    // validity: was MIN/MAX initialized for this key?
+    // Build aggregate ordinals map to per-kind storage slots, so SUM/AVG/COUNT/
+    // MIN/MAX only allocate the per-key arrays they actually read.
+    vector<double> direct_build_sums;    // [sum_slot * range + key_offset]
+    vector<double> direct_build_mins;    // [min_slot * range + key_offset]
+    vector<double> direct_build_maxs;    // [max_slot * range + key_offset]
+    vector<double> direct_build_counts;  // [count_slot * range + key_offset]
+    vector<uint8_t> direct_build_has;    // [has_slot * range + key_offset]
+    vector<idx_t> direct_build_sum_index;
+    vector<idx_t> direct_build_count_index;
+    vector<idx_t> direct_build_min_index;
+    vector<idx_t> direct_build_max_index;
+    vector<idx_t> direct_build_has_index;
 
     // ── Direct mode: flat arrays indexed by integer key ──
     // Eliminates ALL hash table lookups when keys are dense integers.
@@ -37,15 +44,26 @@ struct AggJoinSinkState : public GlobalSinkState {
     int64_t key_min = 0;        // Min key value (offset for array indexing)
     idx_t key_range = 0;        // key_max - key_min + 1
     vector<idx_t> build_counts; // [key - key_min] → frequency count (0 = no match)
-    vector<double> direct_sums; // [key_offset * num_aggs + agg] → accumulated sum
-    vector<double> direct_counts; // [key_offset * num_aggs + agg] → count for AVG
+    // Aggregate ordinals map to compact per-kind slots. SUM/COUNT/AVG share
+    // direct_sums as the numeric accumulator; AVG has a separate count slot.
+    vector<double> direct_sums;   // [accum_slot * key_range + key_offset]
+    vector<double> direct_counts; // [avg_slot * key_range + key_offset]
     bool has_avg = false;         // Whether any aggregate is AVG
-    // Direct mode MIN/MAX: flat arrays indexed by key offset
-    vector<double> direct_mins; // [key_offset * num_aggs + agg]
-    vector<double> direct_maxs;
-    // [agg * key_range + key_offset] — MIN/MAX initialized, or (for SUM) a
-    // non-NULL input value was seen. SUM over an all-NULL group must emit NULL.
+    vector<double> direct_mins;   // [min_slot * key_range + key_offset]
+    vector<double> direct_maxs;   // [max_slot * key_range + key_offset]
+    // [has_slot * key_range + key_offset] — MIN/MAX initialized, or (for SUM)
+    // a non-NULL input value was seen. SUM over an all-NULL group emits NULL.
     vector<uint8_t> direct_has;
+    vector<idx_t> direct_accum_index; // [agg] -> SUM/COUNT/AVG slot or INVALID_INDEX
+    vector<idx_t> direct_avg_index;   // [agg] -> AVG count slot or INVALID_INDEX
+    vector<idx_t> direct_min_index;   // [agg] -> MIN slot or INVALID_INDEX
+    vector<idx_t> direct_max_index;   // [agg] -> MAX slot or INVALID_INDEX
+    vector<idx_t> direct_has_index;   // [agg] -> SUM/MIN/MAX validity slot or INVALID_INDEX
+    idx_t direct_accum_slots = 0;
+    idx_t direct_avg_slots = 0;
+    idx_t direct_min_slots = 0;
+    idx_t direct_max_slots = 0;
+    idx_t direct_has_slots = 0;
     bool has_min_max = false;   // Whether any aggregate is MIN or MAX
     bool has_sum = false;       // Whether any aggregate is SUM (needs direct_has)
     idx_t num_aggs = 0;
@@ -162,10 +180,12 @@ struct AggJoinOperatorState : public CachingOperatorState {
 
 struct AggJoinSourceState : public GlobalSourceState {
     vector<idx_t> slot_indices; // For HT mode
-    vector<idx_t> direct_keys;  // For direct mode: key offsets with data
+    vector<idx_t> direct_keys;  // Owned fallback direct keys
+    const vector<idx_t> *direct_keys_ref = nullptr; // Borrowed finalized active-key vector
     idx_t pos = 0;
     bool initialized = false;
     AggregateHTScanState scan_state;
+    const vector<idx_t> &DirectKeys() const { return direct_keys_ref ? *direct_keys_ref : direct_keys; }
     idx_t MaxThreads() override { return 1; }
 };
 

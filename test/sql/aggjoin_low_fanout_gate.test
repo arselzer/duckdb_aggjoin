@@ -36,7 +36,7 @@ none
 # should still bail even though the integer key range is direct-plannable.
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(false);
+SELECT aggjoin_set_logical_rewrites_enabled(false);
 
 statement ok
 SELECT aggjoin_set_operator_enabled(true);
@@ -56,7 +56,7 @@ SELECT aggjoin_last_rewrite();
 none
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(true);
+SELECT aggjoin_set_logical_rewrites_enabled(true);
 
 # The same shape with duplicate build keys should not be gated only because
 # DuckDB's join estimate is close to the probe estimate: build key min/max stats

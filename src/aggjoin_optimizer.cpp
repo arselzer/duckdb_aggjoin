@@ -74,14 +74,14 @@ void SetAggJoinTestHTCapacity(int64_t capacity) {
 
 // ── Per-path enable/disable ─────────────────────────────────────────────────
 // The extension bundles two independent mechanisms in one optimizer pass:
-//   * the "cascade"  — the Yannakakis frequency cascade, lowered ENTIRELY to
-//                      native operators (chain-count / final-bag / mixed /
-//                      build).  No custom execution code; the safe half.
-//   * the "operator" — the fused PhysicalAggJoin (custom in-memory execution).
+//   * logical rewrites — preaggregation/join-tree rewrites lowered entirely to
+//                        native DuckDB operators (chain-count / final-bag /
+//                        mixed / build). No custom execution code.
+//   * the operator     — the fused PhysicalAggJoin (custom in-memory execution).
 // These flags let a deployment run one without the other (e.g. ship the proven
-// exact cascade while keeping the fused operator off).  -1 = "use env default";
+// logical rewrites while keeping the fused operator off). -1 = "use env default";
 // 0/1 = explicit runtime override (set via the aggjoin_set_*_enabled SQL fns).
-static std::atomic<int> aggjoin_cascade_enabled {-1};
+static std::atomic<int> aggjoin_logical_rewrites_enabled {-1};
 static std::atomic<int> aggjoin_operator_enabled {-1};
 
 static bool AggJoinPathDisabledByEnv(const char *name) {
@@ -89,13 +89,19 @@ static bool AggJoinPathDisabledByEnv(const char *name) {
     return env && env[0] && env[0] != '0';
 }
 
-bool AggJoinCascadeEnabled() {
-    auto v = aggjoin_cascade_enabled.load();
+bool AggJoinLogicalRewritesEnabled() {
+    auto v = aggjoin_logical_rewrites_enabled.load();
     if (v >= 0) {
         return v != 0;
     }
-    static int env_disabled = AggJoinPathDisabledByEnv("AGGJOIN_DISABLE_CASCADE") ? 1 : 0;
+    static int env_disabled =
+        (AggJoinPathDisabledByEnv("AGGJOIN_DISABLE_LOGICAL_REWRITES") ||
+         AggJoinPathDisabledByEnv("AGGJOIN_DISABLE_CASCADE")) ? 1 : 0;
     return env_disabled == 0;
+}
+
+bool AggJoinCascadeEnabled() {
+    return AggJoinLogicalRewritesEnabled();
 }
 
 bool AggJoinOperatorEnabled() {
@@ -107,8 +113,12 @@ bool AggJoinOperatorEnabled() {
     return env_disabled == 0;
 }
 
+void SetAggJoinLogicalRewritesEnabled(bool enabled) {
+    aggjoin_logical_rewrites_enabled.store(enabled ? 1 : 0);
+}
+
 void SetAggJoinCascadeEnabled(bool enabled) {
-    aggjoin_cascade_enabled.store(enabled ? 1 : 0);
+    SetAggJoinLogicalRewritesEnabled(enabled);
 }
 
 void SetAggJoinOperatorEnabled(bool enabled) {

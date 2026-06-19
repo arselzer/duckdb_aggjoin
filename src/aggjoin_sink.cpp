@@ -51,6 +51,168 @@
 
 namespace duckdb {
 
+static bool IsBuildAgg(const AggJoinColInfo &col, idx_t agg_idx) {
+    return col.agg_on_build.size() > agg_idx && col.agg_on_build[agg_idx];
+}
+
+static idx_t DirectBuildAggBytesPerKey(const AggJoinColInfo &col) {
+    idx_t sum_slots = 0;
+    idx_t count_slots = 0;
+    idx_t min_slots = 0;
+    idx_t max_slots = 0;
+    idx_t has_slots = 0;
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if (!IsBuildAgg(col, a)) {
+            continue;
+        }
+        auto &f = col.agg_funcs[a];
+        if (f == "SUM") {
+            sum_slots++;
+            has_slots++;
+        } else if (f == "AVG") {
+            sum_slots++;
+            count_slots++;
+        } else if (f == "COUNT") {
+            count_slots++;
+        } else if (f == "MIN") {
+            min_slots++;
+            has_slots++;
+        } else if (f == "MAX") {
+            max_slots++;
+            has_slots++;
+        }
+    }
+    return sizeof(double) * (sum_slots + count_slots + min_slots + max_slots) +
+           sizeof(uint8_t) * has_slots;
+}
+
+static idx_t DirectAggBytesPerKey(const AggJoinColInfo &col) {
+    idx_t accum_slots = 0;
+    idx_t avg_slots = 0;
+    idx_t min_slots = 0;
+    idx_t max_slots = 0;
+    idx_t has_slots = 0;
+    for (auto &f : col.agg_funcs) {
+        if (f == "SUM") {
+            accum_slots++;
+            has_slots++;
+        } else if (f == "AVG") {
+            accum_slots++;
+            avg_slots++;
+        } else if (f == "COUNT") {
+            accum_slots++;
+        } else if (f == "MIN") {
+            min_slots++;
+            has_slots++;
+        } else if (f == "MAX") {
+            max_slots++;
+            has_slots++;
+        }
+    }
+    return sizeof(double) * (accum_slots + avg_slots + min_slots + max_slots) +
+           sizeof(uint8_t) * has_slots;
+}
+
+static void InitializeDirectAggLayout(AggJoinSinkState &state, const AggJoinColInfo &col, idx_t range) {
+    auto na = (idx_t)col.agg_funcs.size();
+    state.direct_accum_index.assign(na, DConstants::INVALID_INDEX);
+    state.direct_avg_index.assign(na, DConstants::INVALID_INDEX);
+    state.direct_min_index.assign(na, DConstants::INVALID_INDEX);
+    state.direct_max_index.assign(na, DConstants::INVALID_INDEX);
+    state.direct_has_index.assign(na, DConstants::INVALID_INDEX);
+    state.direct_accum_slots = 0;
+    state.direct_avg_slots = 0;
+    state.direct_min_slots = 0;
+    state.direct_max_slots = 0;
+    state.direct_has_slots = 0;
+    state.has_avg = false;
+    state.has_min_max = false;
+    state.has_sum = false;
+
+    for (idx_t a = 0; a < na; a++) {
+        auto &f = col.agg_funcs[a];
+        if (f == "SUM") {
+            state.direct_accum_index[a] = state.direct_accum_slots++;
+            state.direct_has_index[a] = state.direct_has_slots++;
+            state.has_sum = true;
+        } else if (f == "AVG") {
+            state.direct_accum_index[a] = state.direct_accum_slots++;
+            state.direct_avg_index[a] = state.direct_avg_slots++;
+            state.has_avg = true;
+        } else if (f == "COUNT") {
+            state.direct_accum_index[a] = state.direct_accum_slots++;
+        } else if (f == "MIN") {
+            state.direct_min_index[a] = state.direct_min_slots++;
+            state.direct_has_index[a] = state.direct_has_slots++;
+            state.has_min_max = true;
+        } else if (f == "MAX") {
+            state.direct_max_index[a] = state.direct_max_slots++;
+            state.direct_has_index[a] = state.direct_has_slots++;
+            state.has_min_max = true;
+        }
+    }
+
+    state.direct_sums.assign(state.direct_accum_slots * range, 0.0);
+    state.direct_counts.assign(state.direct_avg_slots * range, 0.0);
+    state.direct_mins.assign(state.direct_min_slots * range, std::numeric_limits<double>::max());
+    state.direct_maxs.assign(state.direct_max_slots * range, std::numeric_limits<double>::lowest());
+    state.direct_has.assign(state.direct_has_slots * range, 0);
+}
+
+static void InitializeDirectBuildAggLayout(AggJoinSinkState &state, const AggJoinColInfo &col, idx_t range) {
+    idx_t build_aggs = 0;
+    idx_t sum_slots = 0;
+    idx_t count_slots = 0;
+    idx_t min_slots = 0;
+    idx_t max_slots = 0;
+    idx_t has_slots = 0;
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if (!IsBuildAgg(col, a)) {
+            continue;
+        }
+        build_aggs++;
+    }
+    if (build_aggs == 0) {
+        return;
+    }
+
+    state.direct_build_sum_index.assign(build_aggs, DConstants::INVALID_INDEX);
+    state.direct_build_count_index.assign(build_aggs, DConstants::INVALID_INDEX);
+    state.direct_build_min_index.assign(build_aggs, DConstants::INVALID_INDEX);
+    state.direct_build_max_index.assign(build_aggs, DConstants::INVALID_INDEX);
+    state.direct_build_has_index.assign(build_aggs, DConstants::INVALID_INDEX);
+
+    idx_t ba = 0;
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if (!IsBuildAgg(col, a)) {
+            continue;
+        }
+        auto &f = col.agg_funcs[a];
+        if (f == "SUM") {
+            state.direct_build_sum_index[ba] = sum_slots++;
+            state.direct_build_has_index[ba] = has_slots++;
+        } else if (f == "AVG") {
+            state.direct_build_sum_index[ba] = sum_slots++;
+            state.direct_build_count_index[ba] = count_slots++;
+        } else if (f == "COUNT") {
+            state.direct_build_count_index[ba] = count_slots++;
+        } else if (f == "MIN") {
+            state.direct_build_min_index[ba] = min_slots++;
+            state.direct_build_has_index[ba] = has_slots++;
+        } else if (f == "MAX") {
+            state.direct_build_max_index[ba] = max_slots++;
+            state.direct_build_has_index[ba] = has_slots++;
+        }
+        ba++;
+    }
+
+    state.direct_build_sums.assign(sum_slots * range, 0.0);
+    state.direct_build_counts.assign(count_slots * range, 0.0);
+    state.direct_build_mins.assign(min_slots * range, std::numeric_limits<double>::max());
+    state.direct_build_maxs.assign(max_slots * range, std::numeric_limits<double>::lowest());
+    state.direct_build_has.assign(has_slots * range, 0);
+}
+
 static bool TryInitializePlannedDirectMode(AggJoinSinkState &state, const AggJoinColInfo &col) {
     if (!col.planned_direct_mode || col.planned_direct_key_range == 0) {
         return false;
@@ -69,37 +231,9 @@ static bool TryInitializePlannedDirectMode(AggJoinSinkState &state, const AggJoi
     state.key_range = range;
     state.num_aggs = col.agg_funcs.size();
     state.build_counts.assign(range, 0);
-    state.direct_sums.assign(range * state.num_aggs, 0.0);
     state.all_bc_one = true;
-    idx_t n_build_aggs = 0;
-    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
-        if (col.agg_on_build.size() > a && col.agg_on_build[a]) {
-            n_build_aggs++;
-        }
-    }
-
-    for (auto &f : col.agg_funcs) {
-        if (f == "MIN" || f == "MAX") state.has_min_max = true;
-        if (f == "AVG") state.has_avg = true;
-        if (f == "SUM") state.has_sum = true;
-    }
-    if (state.has_min_max) {
-        state.direct_mins.assign(range * state.num_aggs, std::numeric_limits<double>::max());
-        state.direct_maxs.assign(range * state.num_aggs, std::numeric_limits<double>::lowest());
-    }
-    if (state.has_min_max || state.has_sum) {
-        state.direct_has.assign(range * state.num_aggs, 0);
-    }
-    if (state.has_avg) {
-        state.direct_counts.assign(range * state.num_aggs, 0.0);
-    }
-    if (n_build_aggs > 0) {
-        state.direct_build_sums.assign(n_build_aggs * range, 0.0);
-        state.direct_build_mins.assign(n_build_aggs * range, std::numeric_limits<double>::max());
-        state.direct_build_maxs.assign(n_build_aggs * range, std::numeric_limits<double>::lowest());
-        state.direct_build_counts.assign(n_build_aggs * range, 0.0);
-        state.direct_build_has.assign(n_build_aggs * range, 0);
-    }
+    InitializeDirectAggLayout(state, col, range);
+    InitializeDirectBuildAggLayout(state, col, range);
     if (col.group_cols.empty()) {
         auto na = col.agg_funcs.size();
         state.ungrouped_sum.assign(na, 0.0);
@@ -169,7 +303,8 @@ static bool ReadPlannedDirectBuildPayload(DataChunk &chunk, idx_t col_idx, idx_t
 
 static void AccumulatePlannedDirectBuildAggs(AggJoinSinkState &sink, DataChunk &chunk, const AggJoinColInfo &col,
                                             idx_t row, idx_t offset) {
-    if (sink.direct_build_sums.empty()) {
+    if (sink.direct_build_sum_index.empty() && sink.direct_build_count_index.empty() &&
+        sink.direct_build_min_index.empty() && sink.direct_build_max_index.empty()) {
         return;
     }
     auto range = sink.key_range;
@@ -180,10 +315,10 @@ static void AccumulatePlannedDirectBuildAggs(AggJoinSinkState &sink, DataChunk &
         }
         auto &f = col.agg_funcs[a];
         auto bci = col.build_agg_cols[a];
-        auto arr_offset = ba * range + offset;
         if (f == "COUNT") {
             if (PlannedDirectBuildValueIsValid(chunk, bci, row)) {
-                sink.direct_build_counts[arr_offset] += 1.0;
+                auto count_idx = sink.direct_build_count_index[ba];
+                sink.direct_build_counts[count_idx * range + offset] += 1.0;
             }
         } else {
             double value = 0.0;
@@ -192,17 +327,33 @@ static void AccumulatePlannedDirectBuildAggs(AggJoinSinkState &sink, DataChunk &
                 continue;
             }
             if (f == "SUM" || f == "AVG") {
-                sink.direct_build_sums[arr_offset] += value;
-                sink.direct_build_counts[arr_offset] += 1.0;
+                auto sum_idx = sink.direct_build_sum_index[ba];
+                sink.direct_build_sums[sum_idx * range + offset] += value;
+                auto count_idx = sink.direct_build_count_index[ba];
+                if (count_idx != DConstants::INVALID_INDEX) {
+                    sink.direct_build_counts[count_idx * range + offset] += 1.0;
+                }
+                auto has_idx = sink.direct_build_has_index[ba];
+                if (has_idx != DConstants::INVALID_INDEX) {
+                    sink.direct_build_has[has_idx * range + offset] = 1;
+                }
             } else if (f == "MIN") {
-                if (!sink.direct_build_has[arr_offset] || value < sink.direct_build_mins[arr_offset]) {
-                    sink.direct_build_mins[arr_offset] = value;
-                    sink.direct_build_has[arr_offset] = 1;
+                auto min_idx = sink.direct_build_min_index[ba];
+                auto has_idx = sink.direct_build_has_index[ba];
+                auto min_off = min_idx * range + offset;
+                auto has_off = has_idx * range + offset;
+                if (!sink.direct_build_has[has_off] || value < sink.direct_build_mins[min_off]) {
+                    sink.direct_build_mins[min_off] = value;
+                    sink.direct_build_has[has_off] = 1;
                 }
             } else if (f == "MAX") {
-                if (!sink.direct_build_has[arr_offset] || value > sink.direct_build_maxs[arr_offset]) {
-                    sink.direct_build_maxs[arr_offset] = value;
-                    sink.direct_build_has[arr_offset] = 1;
+                auto max_idx = sink.direct_build_max_index[ba];
+                auto has_idx = sink.direct_build_has_index[ba];
+                auto max_off = max_idx * range + offset;
+                auto has_off = has_idx * range + offset;
+                if (!sink.direct_build_has[has_off] || value > sink.direct_build_maxs[max_off]) {
+                    sink.direct_build_maxs[max_off] = value;
+                    sink.direct_build_has[has_off] = 1;
                 }
             }
         }
@@ -415,24 +566,22 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
             // still wins beyond the old 16MB heuristic.
             auto na_total = (idx_t)col.agg_funcs.size();
             bool would_have_minmax = false, would_have_avg = false;
-            idx_t n_build_aggs_est = 0;
+            bool has_build_aggs_est = false;
             for (idx_t a = 0; a < na_total; a++) {
                 if (col.agg_funcs[a] == "MIN" || col.agg_funcs[a] == "MAX") would_have_minmax = true;
                 if (col.agg_funcs[a] == "AVG") would_have_avg = true;
-                if (col.agg_on_build.size() > a && col.agg_on_build[a]) n_build_aggs_est++;
+                if (IsBuildAgg(col, a)) has_build_aggs_est = true;
             }
-            // Memory per key: build_counts(8) + sums(8*na) + optional mins/maxs/has + optional counts + build arrays
+            // Memory per key: build_counts plus compact per-kind aggregate arrays.
             idx_t bytes_per_key = sizeof(idx_t)                          // build_counts
-                                + sizeof(double) * na_total              // direct_sums
-                                + (would_have_minmax ? (sizeof(double) * 2 + sizeof(uint8_t)) * na_total : 0) // mins+maxs+has
-                                + (would_have_avg ? sizeof(double) * na_total : 0)   // direct_counts
-                                + (n_build_aggs_est > 0 ? (sizeof(double) * 4 + sizeof(uint8_t)) * n_build_aggs_est : 0); // build arrays
+                                + DirectAggBytesPerKey(col)
+                                + DirectBuildAggBytesPerKey(col); // build arrays
             idx_t max_working_set = 16 * 1024 * 1024; // default target
             if (ungrouped_agg || group_is_key_candidate) {
                 max_working_set = 32 * 1024 * 1024;
             }
             if (group_is_key_candidate && !ungrouped_agg && na_total == 1 &&
-                !would_have_minmax && !would_have_avg && n_build_aggs_est == 0) {
+                !would_have_minmax && !would_have_avg && !has_build_aggs_est) {
                 max_working_set = 48 * 1024 * 1024;
             }
             idx_t direct_limit = bytes_per_key > 0 ? max_working_set / bytes_per_key : 2000000;
@@ -462,24 +611,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                 sink.key_range = range;
                 sink.num_aggs = col.agg_funcs.size();
                 sink.build_counts.resize(range, 0);
-                sink.direct_sums.resize(range * sink.num_aggs, 0.0);
-                // Check if any aggregates are MIN/MAX/SUM or AVG and allocate flat arrays
-                for (auto &f : col.agg_funcs) {
-                    if (f == "MIN" || f == "MAX") sink.has_min_max = true;
-                    if (f == "AVG") sink.has_avg = true;
-                    if (f == "SUM") sink.has_sum = true;
-                }
-                if (sink.has_min_max) {
-                    sink.direct_mins.resize(range * sink.num_aggs, std::numeric_limits<double>::max());
-                    sink.direct_maxs.resize(range * sink.num_aggs, std::numeric_limits<double>::lowest());
-                }
-                if (sink.has_min_max || sink.has_sum) {
-                    // SUM shares direct_has so all-NULL groups emit NULL.
-                    sink.direct_has.resize(range * sink.num_aggs, false);
-                }
-                if (sink.has_avg) {
-                    sink.direct_counts.resize(range * sink.num_aggs, 0.0);
-                }
+                InitializeDirectAggLayout(sink, col, range);
                 // Initialize ungrouped running accumulators
                 if (col.group_cols.empty()) {
                     auto na = col.agg_funcs.size();
@@ -488,6 +620,9 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                     sink.ungrouped_min.resize(na, std::numeric_limits<double>::max());
                     sink.ungrouped_max.resize(na, std::numeric_limits<double>::lowest());
                     sink.ungrouped_has.resize(na, 0);
+                    sink.track_active_keys = true;
+                    sink.direct_key_seen.assign(range, 0);
+                    sink.direct_active_keys.reserve(std::min<idx_t>(range, sink.build_ht.count));
                 }
                 // Detect group_is_key: single group column == probe key column
                 // In this case, the group value IS the key: k + kmin. No storage needed.
@@ -509,12 +644,6 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
                 }
                 // Populate build_counts and detect all-ones (PK join)
                 sink.all_bc_one = true;
-                // Check if there are build-side aggs that need direct mode arrays
-                bool has_build_aggs_dm = false;
-                idx_t n_build_aggs = 0;
-                for (idx_t a = 0; a < col.agg_funcs.size(); a++)
-                    if (col.agg_on_build.size() > a && col.agg_on_build[a]) { has_build_aggs_dm = true; n_build_aggs++; }
-
                 sink.build_ht.ForEach([&](BuildEntry &b) {
                     auto offset = (idx_t)(b.int_key - kmin);
                     sink.build_counts[offset] = b.count;
@@ -523,23 +652,36 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
 
                 // Transfer build-side agg values from BuildEntry to direct mode.
                 // Store per-key build-side sums/mins/maxs that can be looked up during probe.
-                if (has_build_aggs_dm) {
-                    sink.direct_build_sums.resize(n_build_aggs * range, 0.0);
-                    sink.direct_build_mins.resize(n_build_aggs * range, std::numeric_limits<double>::max());
-                    sink.direct_build_maxs.resize(n_build_aggs * range, std::numeric_limits<double>::lowest());
-                    sink.direct_build_counts.resize(n_build_aggs * range, 0.0);
-                    sink.direct_build_has.resize(n_build_aggs * range, 0);
+                if (has_build_aggs_est) {
+                    InitializeDirectBuildAggLayout(sink, col, range);
                     sink.build_ht.ForEach([&](BuildEntry &b) {
                         auto offset = (idx_t)(b.int_key - kmin);
                         auto &bav = b.bav;
                         idx_t ba = 0;
                         for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
                             if (!(col.agg_on_build.size() > a && col.agg_on_build[a])) continue;
-                            sink.direct_build_sums[ba * range + offset] = bav.agg_sum[ba];
-                            sink.direct_build_mins[ba * range + offset] = bav.agg_min[ba];
-                            sink.direct_build_maxs[ba * range + offset] = bav.agg_max[ba];
-                            sink.direct_build_counts[ba * range + offset] = bav.agg_count[ba];
-                            sink.direct_build_has[ba * range + offset] = bav.agg_init[ba];
+                            auto &f = col.agg_funcs[a];
+                            auto sum_idx = sink.direct_build_sum_index[ba];
+                            if (sum_idx != DConstants::INVALID_INDEX) {
+                                sink.direct_build_sums[sum_idx * range + offset] = bav.agg_sum[ba];
+                            }
+                            auto min_idx = sink.direct_build_min_index[ba];
+                            if (min_idx != DConstants::INVALID_INDEX) {
+                                sink.direct_build_mins[min_idx * range + offset] = bav.agg_min[ba];
+                            }
+                            auto max_idx = sink.direct_build_max_index[ba];
+                            if (max_idx != DConstants::INVALID_INDEX) {
+                                sink.direct_build_maxs[max_idx * range + offset] = bav.agg_max[ba];
+                            }
+                            auto count_idx = sink.direct_build_count_index[ba];
+                            if (count_idx != DConstants::INVALID_INDEX) {
+                                sink.direct_build_counts[count_idx * range + offset] = bav.agg_count[ba];
+                            }
+                            auto has_idx = sink.direct_build_has_index[ba];
+                            if (has_idx != DConstants::INVALID_INDEX) {
+                                sink.direct_build_has[has_idx * range + offset] =
+                                    (f == "SUM") ? (bav.agg_count[ba] > 0) : bav.agg_init[ba];
+                            }
                             ba++;
                         }
                     });
@@ -551,7 +693,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
             // This extends direct-mode behavior beyond the flat-array cutoff
             // without widening the main direct path for every query shape.
             bool segmented_simple_shape = group_is_key_candidate && !ungrouped_agg &&
-                                          na_total == 1 && n_build_aggs_est == 0 &&
+                                          na_total == 1 && !has_build_aggs_est &&
                                           !would_have_minmax;
             if (!sink.direct_mode && all_int && segmented_simple_shape) {
                 auto &f0 = col.agg_funcs[0];
@@ -595,7 +737,7 @@ SinkFinalizeType PhysicalAggJoin::Finalize(Pipeline &p, Event &e, ClientContext 
             // segmented fast path intact and only handles a narrow, well-behaved shape.
             bool segmented_multi_shape = group_is_key_candidate && !ungrouped_agg &&
                                          na_total >= 2 && na_total <= 4 &&
-                                         n_build_aggs_est == 0;
+                                         !has_build_aggs_est;
             if (!sink.direct_mode && !sink.segmented_direct_mode && all_int && segmented_multi_shape) {
                 bool segmented_multi_supported = true;
                 bool segmented_multi_has_sum = false;

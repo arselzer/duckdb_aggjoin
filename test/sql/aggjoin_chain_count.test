@@ -1,16 +1,16 @@
 # name: test/sql/aggjoin_chain_count.test
-# description: N-relation linear-chain COUNT(*) frequency-propagation cascade (MVP)
+# description: N-relation linear-chain COUNT(*) frequency-propagation logical rewrite (MVP)
 # group: [aggjoin]
 # differential: skip
 #   Uses aggjoin_last_rewrite() fire-assertions, which require the optimizer to be
 #   live (disabled, the marker is always 'none'). Every expected count was taken
 #   from a native (extension-disabled) run, so the differential pass adds nothing.
 #
-# The cascade fires only on large chains with an estimated multiplicity BLOWUP
+# The logical rewrite fires only on large chains with an estimated multiplicity BLOWUP
 # (join product >> inputs); on near-1:1 chains it bails to native (the extra
-# GROUP-BYs would lose). FIRE cases assert BOTH the value AND that the cascade
+# GROUP-BYs would lose). FIRE cases assert BOTH the value AND that the logical rewrite
 # fired (aggjoin_last_rewrite() = 'chain_count'); BAIL cases assert the value is
-# still correct via native AND that the cascade did NOT fire. All fixtures are
+# still correct via native AND that the logical rewrite did NOT fire. All fixtures are
 # >= 50K rows. The fire-assertion is the only way to test these rewrites — they
 # lower to native HASH_GROUP_BY/HASH_JOIN and are invisible in EXPLAIN.
 
@@ -93,7 +93,7 @@ SELECT aggjoin_last_rewrite();
 chain_count
 
 # ============================================================================
-# BAIL (1:1 PK-FK chain): no blowup -> native; correct value, cascade did NOT fire.
+# BAIL (1:1 PK-FK chain): no blowup -> native; correct value, logical rewrite did NOT fire.
 # ============================================================================
 statement ok
 CREATE TABLE pf3(d INT);
@@ -196,6 +196,40 @@ SELECT aggjoin_last_rewrite();
 ----
 chain_count
 
+# Grouped by columns on two sibling dimensions. The GROUP BY columns must be
+# carried from separate child folds back to the fact root without collapsing.
+statement ok
+ALTER TABLE sd1 ADD COLUMN g1 INT;
+
+statement ok
+UPDATE sd1 SET g1 = k % 2;
+
+statement ok
+ALTER TABLE sd2 ADD COLUMN g2 INT;
+
+statement ok
+UPDATE sd2 SET g2 = k % 3;
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query III
+SELECT sd1.g1, sd2.g2, COUNT(*) FROM sf, sd1, sd2, sd3
+WHERE sf.k1 = sd1.k AND sf.k2 = sd2.k AND sf.k3 = sd3.k
+GROUP BY sd1.g1, sd2.g2 ORDER BY sd1.g1, sd2.g2;
+----
+0	0	5208750
+0	1	5208125
+0	2	5208125
+1	0	5208125
+1	1	5208750
+1	2	5208125
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+chain_count
+
 # ============================================================================
 # FIRE (grouped): GROUP BY a column on the root endpoint. The group column is
 # low-cardinality so CompressedMaterialization wraps it -> exercises the compress
@@ -243,7 +277,7 @@ SELECT aggjoin_last_rewrite();
 ----
 chain_count
 
-# BAIL (grouped): multi-column GROUP BY is not in the single-guard MVP.
+# FIRE (grouped): GROUP BY columns can live on different tree nodes.
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
 
@@ -257,9 +291,9 @@ GROUP BY gc_t0.g, gc_t2.c ORDER BY gc_t0.g, gc_t2.c LIMIT 3;
 0	20	10000
 
 query T
-SELECT aggjoin_last_rewrite() != 'chain_count';
+SELECT aggjoin_last_rewrite();
 ----
-true
+chain_count
 
 # ============================================================================
 # BAIL (empty endpoint): COALESCE -> 0 path is only reachable when fired, but the
@@ -290,7 +324,7 @@ WHERE em0.b = em1.b AND em1.c = em2.c;
 0
 
 # ============================================================================
-# BAIL (cycle / triangle): not a chain; correct via native, cascade did NOT fire.
+# BAIL (cycle / triangle): not a chain; correct via native, logical rewrite did NOT fire.
 # ============================================================================
 statement ok
 CREATE TABLE cy_a(x INT, z INT);
@@ -368,7 +402,7 @@ true
 # ============================================================================
 # SUM / MIN / MAX / AVG / COUNT(col) — piecewise aggregate propagation.
 # Fact-center star: 5 rows/key over 50000 keys on every side -> 31,250,000-row
-# join. The aggregate cascade threads each aggregate's partial state through the
+# join. The aggregate logical rewrite threads each aggregate's partial state through the
 # fold (_freq for COUNT/SUM, set-safe pass-through for MIN/MAX, sum+count pair
 # for AVG). All ground-truth values were taken from a native run. dv is DOUBLE
 # (integer SUM binds sum_no_overflow/HUGEINT and bails -> see the last BAIL).
@@ -492,7 +526,7 @@ SELECT aggjoin_last_rewrite();
 chain_count
 
 # FIRE: integer SUM (HUGEINT result) is accumulated EXACTLY in HUGEINT through the
-# cascade. Small-value case over af.iv (INT) -- fires and matches native.
+# logical rewrite. Small-value case over af.iv (INT) -- fires and matches native.
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
 
@@ -629,7 +663,7 @@ chain_count
 
 # ============================================================================
 # EXACT-DECIMAL GUARD: SUM over a DECIMAL(18,2) money column. DuckDB SUM(decimal)
-# returns DECIMAL(38,s); the cascade accumulates in DECIMAL(38,s), not DOUBLE.
+# returns DECIMAL(38,s); the logical rewrite accumulates in DECIMAL(38,s), not DOUBLE.
 # One fact row carries an odd cent (+0.01), so the join-multiplied total has an odd
 # unscaled value above 2^53 -- non-DOUBLE-representable, so a DOUBLE-accumulator
 # regression would round (the .25 / odd cents would not survive). Values are the
@@ -696,10 +730,9 @@ SELECT aggjoin_last_rewrite();
 chain_count
 
 # ============================================================================
-# MULTI-COLUMN GROUP BY: two (or more) GROUP BY columns that all live on the SAME
-# tree node ride through every fold as persistent kept columns (the common
-# "GROUP BY dim.a, dim.b" shape, e.g. TPC-H Q1). Columns spanning DIFFERENT nodes
-# bail (later stage). 3-table chain with a 100x fan-out -> 6,000,000 join rows.
+# MULTI-COLUMN GROUP BY: GROUP BY columns ride through every fold as persistent
+# kept columns, including when they live on different tree nodes. 3-table chain
+# with a 100x fan-out -> 6,000,000 join rows.
 # ============================================================================
 statement ok
 CREATE TABLE mc_t2(c INT, g3 INT);
@@ -740,27 +773,26 @@ SELECT aggjoin_last_rewrite();
 ----
 chain_count
 
-# BAIL: GROUP BY columns on DIFFERENT nodes (mc_t0.g1 + mc_t2.g3) -> stays native;
-# value still correct.
+# FIRE: GROUP BY columns on DIFFERENT nodes (mc_t0.g1 + mc_t2.g3).
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
 
-query III
-SELECT mc_t0.g1, mc_t2.g3, COUNT(*) FROM mc_t0, mc_t1, mc_t2
+query IIII
+SELECT mc_t0.g1, mc_t2.g3, COUNT(*), SUM(mc_t1.b) FROM mc_t0, mc_t1, mc_t2
 WHERE mc_t0.b = mc_t1.b AND mc_t1.c = mc_t2.c
 GROUP BY mc_t0.g1, mc_t2.g3 ORDER BY mc_t0.g1, mc_t2.g3;
 ----
-0	0	1000000
-0	1	1000000
-1	0	1000000
-1	1	1000000
-2	0	1000000
-2	1	1000000
+0	0	1000000	29997000000
+0	1	1000000	30000000000
+1	0	1000000	30001000000
+1	1	1000000	29998000000
+2	0	1000000	29999000000
+2	1	1000000	30002000000
 
 query T
-SELECT aggjoin_last_rewrite() != 'chain_count';
+SELECT aggjoin_last_rewrite();
 ----
-true
+chain_count
 
 # ============================================================================
 # SET-SAFE AGGREGATES: BOOL_AND / BOOL_OR / BIT_AND / BIT_OR are idempotent under
@@ -839,8 +871,8 @@ true
 # an exact non-negative integer for integer x, so the cancellation that plagues the
 # DOUBLE moment form vanishes -- and the result is DETERMINISTIC and the correctly-
 # rounded true value (native var_pop is thread-dependent: parallel Welford). So the
-# cascade is the more accurate AND reproducible answer; we ROUND for the assertion
-# (cascade and native agree to ~7 digits). Gated to <= 32-bit integer inputs to stay
+# logical rewrite is the more accurate AND reproducible answer; we ROUND for the assertion
+# (logical rewrite and native agree to ~7 digits). Gated to <= 32-bit integer inputs to stay
 # overflow-safe (n·Σx² << HUGEINT max). 3-chain, 100x fan-out -> 6,000,000 rows.
 # ============================================================================
 statement ok

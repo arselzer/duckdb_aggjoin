@@ -2,6 +2,45 @@
 
 namespace duckdb {
 
+static bool HasDirectBuildAggStorage(const AggJoinSinkState &sink) {
+    return sink.build_agg_slots > 0 &&
+           (!sink.direct_build_sums.empty() || !sink.direct_build_counts.empty() ||
+            !sink.direct_build_mins.empty() || !sink.direct_build_maxs.empty());
+}
+
+static const double *DirectBuildDoublePtr(const vector<double> &values, const vector<idx_t> &indexes,
+                                          idx_t build_agg_index, idx_t range) {
+    if (build_agg_index >= indexes.size()) {
+        return nullptr;
+    }
+    auto slot = indexes[build_agg_index];
+    return slot == DConstants::INVALID_INDEX ? nullptr : values.data() + slot * range;
+}
+
+static const uint8_t *DirectBuildHasPtr(const AggJoinSinkState &sink, idx_t build_agg_index, idx_t range) {
+    if (build_agg_index >= sink.direct_build_has_index.size()) {
+        return nullptr;
+    }
+    auto slot = sink.direct_build_has_index[build_agg_index];
+    return slot == DConstants::INVALID_INDEX ? nullptr : sink.direct_build_has.data() + slot * range;
+}
+
+static double *DirectDoublePtr(vector<double> &values, const vector<idx_t> &indexes, idx_t agg_index, idx_t range) {
+    if (agg_index >= indexes.size()) {
+        return nullptr;
+    }
+    auto slot = indexes[agg_index];
+    return slot == DConstants::INVALID_INDEX ? nullptr : values.data() + slot * range;
+}
+
+static uint8_t *DirectHasPtr(vector<uint8_t> &values, const vector<idx_t> &indexes, idx_t agg_index, idx_t range) {
+    if (agg_index >= indexes.size()) {
+        return nullptr;
+    }
+    auto slot = indexes[agg_index];
+    return slot == DConstants::INVALID_INDEX ? nullptr : values.data() + slot * range;
+}
+
 bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataChunk &input, DataChunk &chunk,
                                                AggJoinSinkState &sink, AggJoinOperatorState &state,
                                                idx_t n, idx_t na) {
@@ -13,7 +52,7 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
     }
     for (idx_t a = 0; a < na; a++) {
         bool on_build = col.agg_on_build.size() > a && col.agg_on_build[a];
-        if (on_build && sink.direct_build_sums.empty()) {
+        if (on_build && !HasDirectBuildAggStorage(sink)) {
             return false;
         }
         auto &fn = col.agg_funcs[a];
@@ -52,43 +91,42 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         state.parallel_direct_grouped = grouped_by_key;
         if (grouped_by_key) {
             auto krange = sink.key_range;
-            idx_t bytes_per_key = sizeof(double) * na + sizeof(uint8_t);
-            if (sink.has_avg) {
-                bytes_per_key += sizeof(double) * na;
-            }
-            if (sink.has_min_max) {
-                bytes_per_key += sizeof(double) * 2 * na + sizeof(uint8_t) * na;
-            } else if (sink.has_sum) {
-                bytes_per_key += sizeof(uint8_t) * na;
-            }
+            idx_t bytes_per_key = sizeof(double) * sink.direct_accum_slots +
+                                  sizeof(double) * sink.direct_avg_slots +
+                                  sizeof(double) * (sink.direct_min_slots + sink.direct_max_slots) +
+                                  sizeof(uint8_t) * sink.direct_has_slots;
             __int128 local_bytes = (__int128)krange * (__int128)bytes_per_key;
             state.parallel_direct_sparse_grouped = local_bytes > (__int128)16 * 1024 * 1024;
             if (state.parallel_direct_sparse_grouped) {
                 auto reserve_keys = std::min<idx_t>(krange, n);
                 state.parallel_direct_sparse_slot_lookup.assign(krange, 0);
                 state.parallel_direct_sparse_keys.reserve(reserve_keys);
-                state.parallel_sparse_sums.reserve(reserve_keys * na);
-                if (sink.has_avg) {
-                    state.parallel_sparse_counts.reserve(reserve_keys * na);
+                state.parallel_sparse_sums.reserve(reserve_keys * sink.direct_accum_slots);
+                if (sink.direct_avg_slots) {
+                    state.parallel_sparse_counts.reserve(reserve_keys * sink.direct_avg_slots);
                 }
-                if (sink.has_min_max) {
-                    state.parallel_sparse_mins.reserve(reserve_keys * na);
-                    state.parallel_sparse_maxs.reserve(reserve_keys * na);
+                if (sink.direct_min_slots) {
+                    state.parallel_sparse_mins.reserve(reserve_keys * sink.direct_min_slots);
                 }
-                if (sink.has_min_max || sink.has_sum) {
-                    state.parallel_sparse_has.reserve(reserve_keys * na);
+                if (sink.direct_max_slots) {
+                    state.parallel_sparse_maxs.reserve(reserve_keys * sink.direct_max_slots);
+                }
+                if (sink.direct_has_slots) {
+                    state.parallel_sparse_has.reserve(reserve_keys * sink.direct_has_slots);
                 }
             } else {
-                state.parallel_direct_sums.assign(na * krange, 0.0);
-                if (sink.has_avg) {
-                    state.parallel_direct_counts.assign(na * krange, 0.0);
+                state.parallel_direct_sums.assign(sink.direct_accum_slots * krange, 0.0);
+                if (sink.direct_avg_slots) {
+                    state.parallel_direct_counts.assign(sink.direct_avg_slots * krange, 0.0);
                 }
-                if (sink.has_min_max) {
-                    state.parallel_direct_mins.assign(na * krange, std::numeric_limits<double>::max());
-                    state.parallel_direct_maxs.assign(na * krange, std::numeric_limits<double>::lowest());
+                if (sink.direct_min_slots) {
+                    state.parallel_direct_mins.assign(sink.direct_min_slots * krange, std::numeric_limits<double>::max());
                 }
-                if (sink.has_min_max || sink.has_sum) {
-                    state.parallel_direct_has.assign(na * krange, 0);
+                if (sink.direct_max_slots) {
+                    state.parallel_direct_maxs.assign(sink.direct_max_slots * krange, std::numeric_limits<double>::lowest());
+                }
+                if (sink.direct_has_slots) {
+                    state.parallel_direct_has.assign(sink.direct_has_slots * krange, 0);
                 }
                 state.parallel_direct_key_seen.assign(krange, 0);
                 state.parallel_direct_active_keys.reserve(std::min<idx_t>(krange, n));
@@ -119,7 +157,16 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         const double *double_vals = nullptr;
         const float *float_vals = nullptr;
         const uint64_t *validity = nullptr;
-        idx_t build_index = DConstants::INVALID_INDEX;
+        const double *build_sums = nullptr;
+        const double *build_counts = nullptr;
+        const double *build_mins = nullptr;
+        const double *build_maxs = nullptr;
+        const uint8_t *build_has = nullptr;
+        idx_t accum_idx = DConstants::INVALID_INDEX;
+        idx_t avg_idx = DConstants::INVALID_INDEX;
+        idx_t min_idx = DConstants::INVALID_INDEX;
+        idx_t max_idx = DConstants::INVALID_INDEX;
+        idx_t has_idx = DConstants::INVALID_INDEX;
 
         double Value(idx_t row) const {
             return double_vals ? double_vals[row] : (double)float_vals[row];
@@ -131,18 +178,33 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         auto &fn = col.agg_funcs[a];
         auto ai = col.agg_input_cols[a];
         bool on_build = col.agg_on_build.size() > a && col.agg_on_build[a];
+        slots[a].accum_idx = sink.direct_accum_index.size() > a ? sink.direct_accum_index[a] : DConstants::INVALID_INDEX;
+        slots[a].avg_idx = sink.direct_avg_index.size() > a ? sink.direct_avg_index[a] : DConstants::INVALID_INDEX;
+        slots[a].min_idx = sink.direct_min_index.size() > a ? sink.direct_min_index[a] : DConstants::INVALID_INDEX;
+        slots[a].max_idx = sink.direct_max_index.size() > a ? sink.direct_max_index[a] : DConstants::INVALID_INDEX;
+        slots[a].has_idx = sink.direct_has_index.size() > a ? sink.direct_has_index[a] : DConstants::INVALID_INDEX;
         if (on_build) {
-            slots[a].build_index = build_agg_index++;
+            auto ba = build_agg_index++;
+            slots[a].build_sums = DirectBuildDoublePtr(sink.direct_build_sums, sink.direct_build_sum_index, ba, sink.key_range);
+            slots[a].build_counts = DirectBuildDoublePtr(sink.direct_build_counts, sink.direct_build_count_index, ba, sink.key_range);
+            slots[a].build_mins = DirectBuildDoublePtr(sink.direct_build_mins, sink.direct_build_min_index, ba, sink.key_range);
+            slots[a].build_maxs = DirectBuildDoublePtr(sink.direct_build_maxs, sink.direct_build_max_index, ba, sink.key_range);
+            slots[a].build_has = DirectBuildHasPtr(sink, ba, sink.key_range);
             if (fn == "SUM") {
                 slots[a].kind = AggSlot::BUILD_SUM;
+                if (!slots[a].build_sums || !slots[a].build_has) return false;
             } else if (fn == "AVG") {
                 slots[a].kind = AggSlot::BUILD_AVG;
+                if (!slots[a].build_sums || !slots[a].build_counts) return false;
             } else if (fn == "COUNT") {
                 slots[a].kind = AggSlot::BUILD_COUNT;
+                if (!slots[a].build_counts) return false;
             } else if (fn == "MIN") {
                 slots[a].kind = AggSlot::BUILD_MIN;
+                if (!slots[a].build_mins || !slots[a].build_has) return false;
             } else {
                 slots[a].kind = AggSlot::BUILD_MAX;
+                if (!slots[a].build_maxs || !slots[a].build_has) return false;
             }
         } else if (fn == "COUNT" && ai == DConstants::INVALID_INDEX) {
             slots[a].kind = AggSlot::COUNT_STAR;
@@ -176,11 +238,6 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
     auto kmin = sink.key_min;
     auto krange = sink.key_range;
     auto *bc = sink.build_counts.data();
-    auto *build_sums = sink.direct_build_sums.empty() ? nullptr : sink.direct_build_sums.data();
-    auto *build_counts = sink.direct_build_counts.empty() ? nullptr : sink.direct_build_counts.data();
-    auto *build_mins = sink.direct_build_mins.empty() ? nullptr : sink.direct_build_mins.data();
-    auto *build_maxs = sink.direct_build_maxs.empty() ? nullptr : sink.direct_build_maxs.data();
-    auto *build_has = sink.direct_build_has.empty() ? nullptr : sink.direct_build_has.data();
 
     auto ensure_sparse_slot = [&](idx_t k) -> idx_t {
         auto marker = state.parallel_direct_sparse_slot_lookup[k];
@@ -190,17 +247,21 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
         auto slot = (idx_t)state.parallel_direct_sparse_keys.size();
         state.parallel_direct_sparse_slot_lookup[k] = (uint32_t)(slot + 1);
         state.parallel_direct_sparse_keys.push_back(k);
-        auto new_size = (slot + 1) * na;
-        state.parallel_sparse_sums.resize(new_size, 0.0);
-        if (sink.has_avg) {
-            state.parallel_sparse_counts.resize(new_size, 0.0);
+        auto active_count = slot + 1;
+        if (sink.direct_accum_slots) {
+            state.parallel_sparse_sums.resize(active_count * sink.direct_accum_slots, 0.0);
         }
-        if (sink.has_min_max) {
-            state.parallel_sparse_mins.resize(new_size, std::numeric_limits<double>::max());
-            state.parallel_sparse_maxs.resize(new_size, std::numeric_limits<double>::lowest());
+        if (sink.direct_avg_slots) {
+            state.parallel_sparse_counts.resize(active_count * sink.direct_avg_slots, 0.0);
         }
-        if (sink.has_min_max || sink.has_sum) {
-            state.parallel_sparse_has.resize(new_size, 0);
+        if (sink.direct_min_slots) {
+            state.parallel_sparse_mins.resize(active_count * sink.direct_min_slots, std::numeric_limits<double>::max());
+        }
+        if (sink.direct_max_slots) {
+            state.parallel_sparse_maxs.resize(active_count * sink.direct_max_slots, std::numeric_limits<double>::lowest());
+        }
+        if (sink.direct_has_slots) {
+            state.parallel_sparse_has.resize(active_count * sink.direct_has_slots, 0);
         }
         return slot;
     };
@@ -255,36 +316,31 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::BUILD_SUM: {                                                               \
-                    auto off = slot.build_index * krange + k;                                            \
-                    state.parallel_ungrouped_sum[a] += build_sums[off];                                  \
-                    if (build_counts[off] > 0) state.parallel_ungrouped_has[a] = 1;                      \
+                    state.parallel_ungrouped_sum[a] += slot.build_sums[k];                               \
+                    if (slot.build_has[k]) state.parallel_ungrouped_has[a] = 1;                          \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_AVG: {                                                               \
-                    auto off = slot.build_index * krange + k;                                            \
-                    state.parallel_ungrouped_sum[a] += build_sums[off];                                  \
-                    state.parallel_ungrouped_count[a] += build_counts[off];                              \
+                    state.parallel_ungrouped_sum[a] += slot.build_sums[k];                               \
+                    state.parallel_ungrouped_count[a] += slot.build_counts[k];                           \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_COUNT: {                                                             \
-                    auto off = slot.build_index * krange + k;                                            \
-                    state.parallel_ungrouped_sum[a] += build_counts[off];                                \
+                    state.parallel_ungrouped_sum[a] += slot.build_counts[k];                             \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_MIN: {                                                               \
-                    auto off = slot.build_index * krange + k;                                            \
-                    if (build_has[off] &&                                                                 \
-                        (!state.parallel_ungrouped_has[a] || build_mins[off] < state.parallel_ungrouped_min[a])) { \
-                        state.parallel_ungrouped_min[a] = build_mins[off];                              \
+                    if (slot.build_has[k] &&                                                             \
+                        (!state.parallel_ungrouped_has[a] || slot.build_mins[k] < state.parallel_ungrouped_min[a])) { \
+                        state.parallel_ungrouped_min[a] = slot.build_mins[k];                            \
                         state.parallel_ungrouped_has[a] = 1;                                             \
                     }                                                                                    \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_MAX: {                                                               \
-                    auto off = slot.build_index * krange + k;                                            \
-                    if (build_has[off] &&                                                                 \
-                        (!state.parallel_ungrouped_has[a] || build_maxs[off] > state.parallel_ungrouped_max[a])) { \
-                        state.parallel_ungrouped_max[a] = build_maxs[off];                              \
+                    if (slot.build_has[k] &&                                                             \
+                        (!state.parallel_ungrouped_has[a] || slot.build_maxs[k] > state.parallel_ungrouped_max[a])) { \
+                        state.parallel_ungrouped_max[a] = slot.build_maxs[k];                            \
                         state.parallel_ungrouped_has[a] = 1;                                             \
                     }                                                                                    \
                     break;                                                                               \
@@ -315,74 +371,77 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
             for (idx_t a = 0; a < na; a++) {                                                             \
                 auto &slot = slots[a];                                                                   \
                 auto *validity = slot.validity;                                                          \
-                auto off = a * krange + k;                                                               \
                 switch (slot.kind) {                                                                     \
                 case AggSlot::COUNT_STAR:                                                                \
-                    sums[off] += bcount;                                                                 \
+                    sums[slot.accum_idx * krange + k] += bcount;                                         \
                     break;                                                                               \
                 case AggSlot::COUNT_COL:                                                                 \
-                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) sums[off] += bcount;         \
+                    if (!validity || ((validity[r / 64] >> (r % 64)) & 1))                               \
+                        sums[slot.accum_idx * krange + k] += bcount;                                     \
                     break;                                                                               \
                 case AggSlot::SUM_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        sums[off] += slot.Value(r) * bcount;                                             \
-                        if (has) has[off] = 1;                                                           \
+                        sums[slot.accum_idx * krange + k] += slot.Value(r) * bcount;                     \
+                        if (has) has[slot.has_idx * krange + k] = 1;                                     \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::AVG_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        sums[off] += slot.Value(r) * bcount;                                             \
-                        counts[off] += bcount;                                                           \
+                        sums[slot.accum_idx * krange + k] += slot.Value(r) * bcount;                     \
+                        counts[slot.avg_idx * krange + k] += bcount;                                     \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::MIN_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
                         auto v = slot.Value(r);                                                          \
-                        if (!has[off] || v < mins[off]) {                                                \
-                            mins[off] = v;                                                               \
-                            has[off] = 1;                                                                \
+                        auto mm_off = slot.min_idx * krange + k;                                         \
+                        auto has_off = slot.has_idx * krange + k;                                        \
+                        if (!has[has_off] || v < mins[mm_off]) {                                         \
+                            mins[mm_off] = v;                                                            \
+                            has[has_off] = 1;                                                            \
                         }                                                                                \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::MAX_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
                         auto v = slot.Value(r);                                                          \
-                        if (!has[off] || v > maxs[off]) {                                                \
-                            maxs[off] = v;                                                               \
-                            has[off] = 1;                                                                \
+                        auto mm_off = slot.max_idx * krange + k;                                         \
+                        auto has_off = slot.has_idx * krange + k;                                        \
+                        if (!has[has_off] || v > maxs[mm_off]) {                                         \
+                            maxs[mm_off] = v;                                                            \
+                            has[has_off] = 1;                                                            \
                         }                                                                                \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::BUILD_SUM: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    sums[off] += build_sums[build_off];                                                  \
-                    if (has && build_counts[build_off] > 0) has[off] = 1;                                \
+                    sums[slot.accum_idx * krange + k] += slot.build_sums[k];                             \
+                    if (has && slot.build_has[k]) has[slot.has_idx * krange + k] = 1;                    \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_AVG: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    sums[off] += build_sums[build_off];                                                  \
-                    counts[off] += build_counts[build_off];                                              \
+                    sums[slot.accum_idx * krange + k] += slot.build_sums[k];                             \
+                    counts[slot.avg_idx * krange + k] += slot.build_counts[k];                           \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_COUNT: {                                                             \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    sums[off] += build_counts[build_off];                                                \
+                    sums[slot.accum_idx * krange + k] += slot.build_counts[k];                           \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_MIN: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    if (build_has[build_off] && (!has[off] || build_mins[build_off] < mins[off])) {      \
-                        mins[off] = build_mins[build_off];                                               \
-                        has[off] = 1;                                                                    \
+                    auto mm_off = slot.min_idx * krange + k;                                             \
+                    auto has_off = slot.has_idx * krange + k;                                            \
+                    if (slot.build_has[k] && (!has[has_off] || slot.build_mins[k] < mins[mm_off])) {     \
+                        mins[mm_off] = slot.build_mins[k];                                               \
+                        has[has_off] = 1;                                                                \
                     }                                                                                    \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_MAX: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    if (build_has[build_off] && (!has[off] || build_maxs[build_off] > maxs[off])) {      \
-                        maxs[off] = build_maxs[build_off];                                               \
-                        has[off] = 1;                                                                    \
+                    auto mm_off = slot.max_idx * krange + k;                                             \
+                    auto has_off = slot.has_idx * krange + k;                                            \
+                    if (slot.build_has[k] && (!has[has_off] || slot.build_maxs[k] > maxs[mm_off])) {     \
+                        maxs[mm_off] = slot.build_maxs[k];                                               \
+                        has[has_off] = 1;                                                                \
                     }                                                                                    \
                     break;                                                                               \
                 }                                                                                        \
@@ -403,78 +462,81 @@ bool TryExecutePlannedDirectParallelSourcePath(const PhysicalAggJoin &op, DataCh
             for (idx_t a = 0; a < na; a++) {                                                             \
                 auto &slot = slots[a];                                                                   \
                 auto *validity = slot.validity;                                                          \
-                auto off = slot_idx * na + a;                                                            \
                 switch (slot.kind) {                                                                     \
                 case AggSlot::COUNT_STAR:                                                                \
-                    state.parallel_sparse_sums[off] += bcount;                                           \
+                    state.parallel_sparse_sums[slot_idx * sink.direct_accum_slots + slot.accum_idx] += bcount; \
                     break;                                                                               \
                 case AggSlot::COUNT_COL:                                                                 \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1))                               \
-                        state.parallel_sparse_sums[off] += bcount;                                       \
+                        state.parallel_sparse_sums[slot_idx * sink.direct_accum_slots + slot.accum_idx] += bcount; \
                     break;                                                                               \
                 case AggSlot::SUM_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        state.parallel_sparse_sums[off] += slot.Value(r) * bcount;                       \
-                        if (!state.parallel_sparse_has.empty()) state.parallel_sparse_has[off] = 1;       \
+                        state.parallel_sparse_sums[slot_idx * sink.direct_accum_slots + slot.accum_idx] += slot.Value(r) * bcount; \
+                        if (!state.parallel_sparse_has.empty())                                          \
+                            state.parallel_sparse_has[slot_idx * sink.direct_has_slots + slot.has_idx] = 1; \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::AVG_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
-                        state.parallel_sparse_sums[off] += slot.Value(r) * bcount;                       \
-                        state.parallel_sparse_counts[off] += bcount;                                     \
+                        state.parallel_sparse_sums[slot_idx * sink.direct_accum_slots + slot.accum_idx] += slot.Value(r) * bcount; \
+                        state.parallel_sparse_counts[slot_idx * sink.direct_avg_slots + slot.avg_idx] += bcount; \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::MIN_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
                         auto v = slot.Value(r);                                                          \
-                        if (!state.parallel_sparse_has[off] || v < state.parallel_sparse_mins[off]) {     \
-                            state.parallel_sparse_mins[off] = v;                                         \
-                            state.parallel_sparse_has[off] = 1;                                          \
+                        auto mm_off = slot_idx * sink.direct_min_slots + slot.min_idx;                   \
+                        auto has_off = slot_idx * sink.direct_has_slots + slot.has_idx;                  \
+                        if (!state.parallel_sparse_has[has_off] || v < state.parallel_sparse_mins[mm_off]) { \
+                            state.parallel_sparse_mins[mm_off] = v;                                      \
+                            state.parallel_sparse_has[has_off] = 1;                                      \
                         }                                                                                \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::MAX_VAL:                                                                   \
                     if (!validity || ((validity[r / 64] >> (r % 64)) & 1)) {                             \
                         auto v = slot.Value(r);                                                          \
-                        if (!state.parallel_sparse_has[off] || v > state.parallel_sparse_maxs[off]) {     \
-                            state.parallel_sparse_maxs[off] = v;                                         \
-                            state.parallel_sparse_has[off] = 1;                                          \
+                        auto mm_off = slot_idx * sink.direct_max_slots + slot.max_idx;                   \
+                        auto has_off = slot_idx * sink.direct_has_slots + slot.has_idx;                  \
+                        if (!state.parallel_sparse_has[has_off] || v > state.parallel_sparse_maxs[mm_off]) { \
+                            state.parallel_sparse_maxs[mm_off] = v;                                      \
+                            state.parallel_sparse_has[has_off] = 1;                                      \
                         }                                                                                \
                     }                                                                                    \
                     break;                                                                               \
                 case AggSlot::BUILD_SUM: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    state.parallel_sparse_sums[off] += build_sums[build_off];                            \
-                    if (!state.parallel_sparse_has.empty() && build_counts[build_off] > 0)                \
-                        state.parallel_sparse_has[off] = 1;                                              \
+                    state.parallel_sparse_sums[slot_idx * sink.direct_accum_slots + slot.accum_idx] += slot.build_sums[k]; \
+                    if (!state.parallel_sparse_has.empty() && slot.build_has[k])                          \
+                        state.parallel_sparse_has[slot_idx * sink.direct_has_slots + slot.has_idx] = 1;  \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_AVG: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    state.parallel_sparse_sums[off] += build_sums[build_off];                            \
-                    state.parallel_sparse_counts[off] += build_counts[build_off];                        \
+                    state.parallel_sparse_sums[slot_idx * sink.direct_accum_slots + slot.accum_idx] += slot.build_sums[k]; \
+                    state.parallel_sparse_counts[slot_idx * sink.direct_avg_slots + slot.avg_idx] += slot.build_counts[k]; \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_COUNT: {                                                             \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    state.parallel_sparse_sums[off] += build_counts[build_off];                          \
+                    state.parallel_sparse_sums[slot_idx * sink.direct_accum_slots + slot.accum_idx] += slot.build_counts[k]; \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_MIN: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    if (build_has[build_off] &&                                                          \
-                        (!state.parallel_sparse_has[off] || build_mins[build_off] < state.parallel_sparse_mins[off])) { \
-                        state.parallel_sparse_mins[off] = build_mins[build_off];                        \
-                        state.parallel_sparse_has[off] = 1;                                              \
+                    auto mm_off = slot_idx * sink.direct_min_slots + slot.min_idx;                       \
+                    auto has_off = slot_idx * sink.direct_has_slots + slot.has_idx;                      \
+                    if (slot.build_has[k] &&                                                             \
+                        (!state.parallel_sparse_has[has_off] || slot.build_mins[k] < state.parallel_sparse_mins[mm_off])) { \
+                        state.parallel_sparse_mins[mm_off] = slot.build_mins[k];                         \
+                        state.parallel_sparse_has[has_off] = 1;                                          \
                     }                                                                                    \
                     break;                                                                               \
                 }                                                                                        \
                 case AggSlot::BUILD_MAX: {                                                               \
-                    auto build_off = slot.build_index * krange + k;                                      \
-                    if (build_has[build_off] &&                                                          \
-                        (!state.parallel_sparse_has[off] || build_maxs[build_off] > state.parallel_sparse_maxs[off])) { \
-                        state.parallel_sparse_maxs[off] = build_maxs[build_off];                        \
-                        state.parallel_sparse_has[off] = 1;                                              \
+                    auto mm_off = slot_idx * sink.direct_max_slots + slot.max_idx;                       \
+                    auto has_off = slot_idx * sink.direct_has_slots + slot.has_idx;                      \
+                    if (slot.build_has[k] &&                                                             \
+                        (!state.parallel_sparse_has[has_off] || slot.build_maxs[k] > state.parallel_sparse_maxs[mm_off])) { \
+                        state.parallel_sparse_maxs[mm_off] = slot.build_maxs[k];                         \
+                        state.parallel_sparse_has[has_off] = 1;                                          \
                     }                                                                                    \
                     break;                                                                               \
                 }                                                                                        \
@@ -703,14 +765,16 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
         }
 #undef UNGROUPED_EXTRACT
 
-        if (!sink.direct_build_sums.empty()) {
+        if (HasDirectBuildAggStorage(sink)) {
             idx_t ba = 0;
             for (idx_t a = 0; a < na; a++) {
                 if (!(col.agg_on_build.size() > a && col.agg_on_build[a])) continue;
                 auto &f = col.agg_funcs[a];
-                auto *bsums = sink.direct_build_sums.data() + ba * krange;
-                auto *bcnts = sink.direct_build_counts.data() + ba * krange;
-                auto *bhas = sink.direct_build_has.empty() ? nullptr : sink.direct_build_has.data() + ba * krange;
+                auto *bsums = DirectBuildDoublePtr(sink.direct_build_sums, sink.direct_build_sum_index, ba, krange);
+                auto *bcnts = DirectBuildDoublePtr(sink.direct_build_counts, sink.direct_build_count_index, ba, krange);
+                auto *bmins = DirectBuildDoublePtr(sink.direct_build_mins, sink.direct_build_min_index, ba, krange);
+                auto *bmaxs = DirectBuildDoublePtr(sink.direct_build_maxs, sink.direct_build_max_index, ba, krange);
+                auto *bhas = DirectBuildHasPtr(sink, ba, krange);
 #define UNGROUPED_BUILD_AGG(KTYPE)                                                                       \
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
@@ -718,22 +782,22 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
             if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= krange || !bc[k]) continue;                                                         \
-            if (f == "SUM") {                                                                            \
+            if (f == "SUM" && bsums && bhas) {                                                           \
                 sink.ungrouped_sum[a] += bsums[k];                                                       \
-                if (bcnts[k] > 0) sink.ungrouped_has[a] = 1;                                             \
+                if (bhas[k]) sink.ungrouped_has[a] = 1;                                                  \
             }                                                                                            \
-            else if (f == "AVG") {                                                                       \
+            else if (f == "AVG" && bsums && bcnts) {                                                     \
                 sink.ungrouped_sum[a] += bsums[k];                                                       \
                 sink.ungrouped_count[a] += bcnts[k];                                                     \
-            } else if (f == "COUNT") sink.ungrouped_sum[a] += bcnts[k];                                  \
-            else if (f == "MIN" && bhas && bhas[k]) {                                                    \
-                auto bv = sink.direct_build_mins[ba * krange + k];                                       \
+            } else if (f == "COUNT" && bcnts) sink.ungrouped_sum[a] += bcnts[k];                         \
+            else if (f == "MIN" && bmins && bhas && bhas[k]) {                                           \
+                auto bv = bmins[k];                                                                      \
                 if (!sink.ungrouped_has[a] || bv < sink.ungrouped_min[a]) {                              \
                     sink.ungrouped_min[a] = bv;                                                          \
                     sink.ungrouped_has[a] = 1;                                                           \
                 }                                                                                        \
-            } else if (f == "MAX" && bhas && bhas[k]) {                                                  \
-                auto bv = sink.direct_build_maxs[ba * krange + k];                                       \
+            } else if (f == "MAX" && bmaxs && bhas && bhas[k]) {                                         \
+                auto bv = bmaxs[k];                                                                      \
                 if (!sink.ungrouped_has[a] || bv > sink.ungrouped_max[a]) {                              \
                     sink.ungrouped_max[a] = bv;                                                          \
                     sink.ungrouped_has[a] = 1;                                                           \
@@ -822,9 +886,10 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
 
         for (idx_t a = 0; a < na; a++) {
             auto &slot = agg_slots[a];
-            double *agg_sums = sums + a * krange;
+            double *agg_sums = DirectDoublePtr(sink.direct_sums, sink.direct_accum_index, a, krange);
             switch (slot.kind) {
             case AggSlot::COUNT_STAR:
+                if (!agg_sums) break;
                 if (pkfk) {
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
@@ -838,7 +903,8 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 break;
             case AggSlot::SUM_VAL: {
                 auto *v = slot.validity;
-                uint8_t *agg_has = has_arr + a * krange;
+                uint8_t *agg_has = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
+                if (!agg_sums || !agg_has) break;
                 if (pkfk) {
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
@@ -858,8 +924,9 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 break;
             }
             case AggSlot::AVG_VAL: {
-                double *agg_counts = avg_counts + a * krange;
+                double *agg_counts = DirectDoublePtr(sink.direct_counts, sink.direct_avg_index, a, krange);
                 auto *v = slot.validity;
+                if (!agg_sums || !agg_counts) break;
                 if (pkfk) {
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
@@ -880,6 +947,7 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
             }
             case AggSlot::COUNT_COL: {
                 auto *v = slot.validity;
+                if (!agg_sums) break;
                 if (pkfk) {
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
@@ -897,9 +965,10 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 break;
             }
             case AggSlot::MIN_VAL: {
-                double *agg_mins = mins + a * krange;
-                uint8_t *agg_has = has_arr + a * krange;
+                double *agg_mins = DirectDoublePtr(sink.direct_mins, sink.direct_min_index, a, krange);
+                uint8_t *agg_has = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
                 auto *v = slot.validity;
+                if (!agg_mins || !agg_has) break;
                 for (idx_t r = 0; r < n; r++) {
                     auto k = key_buf[r];
                     if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
@@ -913,9 +982,10 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 break;
             }
             case AggSlot::MAX_VAL: {
-                double *agg_maxs = maxs + a * krange;
-                uint8_t *agg_has = has_arr + a * krange;
+                double *agg_maxs = DirectDoublePtr(sink.direct_maxs, sink.direct_max_index, a, krange);
+                uint8_t *agg_has = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
                 auto *v = slot.validity;
+                if (!agg_maxs || !agg_has) break;
                 for (idx_t r = 0; r < n; r++) {
                     auto k = key_buf[r];
                     if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
@@ -933,27 +1003,29 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
             }
         }
 
-        if (!sink.direct_build_sums.empty()) {
+        if (HasDirectBuildAggStorage(sink)) {
             idx_t ba = 0;
             for (idx_t a = 0; a < na; a++) {
                 if (!(col.agg_on_build.size() > a && col.agg_on_build[a])) continue;
                 auto &f = col.agg_funcs[a];
-                double *agg_sums_a = sums + a * krange;
+                double *agg_sums_a = DirectDoublePtr(sink.direct_sums, sink.direct_accum_index, a, krange);
                 if (f == "SUM") {
-                    double *bsums = sink.direct_build_sums.data() + ba * krange;
-                    double *bcnts = sink.direct_build_counts.data() + ba * krange;
-                    uint8_t *agg_has = has_arr + a * krange;
+                    auto *bsums = DirectBuildDoublePtr(sink.direct_build_sums, sink.direct_build_sum_index, ba, krange);
+                    auto *bhas = DirectBuildHasPtr(sink, ba, krange);
+                    uint8_t *agg_has = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
+                    if (!agg_sums_a || !bsums || !bhas || !agg_has) { ba++; continue; }
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
                         if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
                         agg_sums_a[k] += bsums[k];
-                        if (bcnts[k] > 0) agg_has[k] = 1;
+                        if (bhas[k]) agg_has[k] = 1;
                     }
                 } else if (f == "MIN" && mins) {
-                    double *bmins = sink.direct_build_mins.data() + ba * krange;
-                    uint8_t *bhas = sink.direct_build_has.data() + ba * krange;
-                    uint8_t *agg_has = has_arr + a * krange;
-                    double *agg_mins = mins + a * krange;
+                    auto *bmins = DirectBuildDoublePtr(sink.direct_build_mins, sink.direct_build_min_index, ba, krange);
+                    auto *bhas = DirectBuildHasPtr(sink, ba, krange);
+                    uint8_t *agg_has = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
+                    double *agg_mins = DirectDoublePtr(sink.direct_mins, sink.direct_min_index, a, krange);
+                    if (!bmins || !bhas || !agg_has || !agg_mins) { ba++; continue; }
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
                         if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
@@ -963,10 +1035,11 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                         }
                     }
                 } else if (f == "MAX" && maxs) {
-                    double *bmaxs = sink.direct_build_maxs.data() + ba * krange;
-                    uint8_t *bhas = sink.direct_build_has.data() + ba * krange;
-                    uint8_t *agg_has = has_arr + a * krange;
-                    double *agg_maxs = maxs + a * krange;
+                    auto *bmaxs = DirectBuildDoublePtr(sink.direct_build_maxs, sink.direct_build_max_index, ba, krange);
+                    auto *bhas = DirectBuildHasPtr(sink, ba, krange);
+                    uint8_t *agg_has = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
+                    double *agg_maxs = DirectDoublePtr(sink.direct_maxs, sink.direct_max_index, a, krange);
+                    if (!bmaxs || !bhas || !agg_has || !agg_maxs) { ba++; continue; }
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
                         if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
@@ -976,16 +1049,18 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                         }
                     }
                 } else if (f == "COUNT") {
-                    double *bcnts = sink.direct_build_counts.data() + ba * krange;
+                    auto *bcnts = DirectBuildDoublePtr(sink.direct_build_counts, sink.direct_build_count_index, ba, krange);
+                    if (!agg_sums_a || !bcnts) { ba++; continue; }
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
                         if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
                         agg_sums_a[k] += bcnts[k];
                     }
                 } else if (f == "AVG" && avg_counts) {
-                    double *bsums = sink.direct_build_sums.data() + ba * krange;
-                    double *bcnts = sink.direct_build_counts.data() + ba * krange;
-                    double *agg_counts_a = avg_counts + a * krange;
+                    auto *bsums = DirectBuildDoublePtr(sink.direct_build_sums, sink.direct_build_sum_index, ba, krange);
+                    auto *bcnts = DirectBuildDoublePtr(sink.direct_build_counts, sink.direct_build_count_index, ba, krange);
+                    double *agg_counts_a = DirectDoublePtr(sink.direct_counts, sink.direct_avg_index, a, krange);
+                    if (!agg_sums_a || !bsums || !bcnts || !agg_counts_a) { ba++; continue; }
                     for (idx_t r = 0; r < n; r++) {
                         auto k = key_buf[r];
                         if (pkfk ? (k >= krange) : (bc_buf[r] == 0.0)) continue;
@@ -1045,10 +1120,11 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
             bool is_build_agg = (col.agg_on_build.size() > a && col.agg_on_build[a]);
 
             if (f == "COUNT" && ai == DConstants::INVALID_INDEX && !is_build_agg) {
+                double *agg_s = DirectDoublePtr(sink.direct_sums, sink.direct_accum_index, a, krange);
+                if (!agg_s) continue;
 #define DIRECT_COUNT_LOOP(TYPE)                                                                          \
     {                                                                                                    \
         auto *keys = FlatVector::GetData<TYPE>(input.data[pki]);                                         \
-        double *agg_s = sums + a * krange;                                                               \
         for (idx_t r = 0; r < n; r++) {                                                                  \
             if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
@@ -1070,14 +1146,21 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 continue;
             }
 
-            if (is_build_agg && !sink.direct_build_sums.empty()) {
+            if (is_build_agg && HasDirectBuildAggStorage(sink)) {
                 idx_t ba = 0;
                 for (idx_t i = 0; i < a; i++) {
                     if (col.agg_on_build.size() > i && col.agg_on_build[i]) ba++;
                 }
-                double *bsums = sink.direct_build_sums.data() + ba * krange;
-                double *agg_s = sums + a * krange;
-                auto *build_has = sink.direct_build_has.empty() ? nullptr : sink.direct_build_has.data() + ba * krange;
+                auto *bsums = DirectBuildDoublePtr(sink.direct_build_sums, sink.direct_build_sum_index, ba, krange);
+                auto *bcnts = DirectBuildDoublePtr(sink.direct_build_counts, sink.direct_build_count_index, ba, krange);
+                auto *bmins = DirectBuildDoublePtr(sink.direct_build_mins, sink.direct_build_min_index, ba, krange);
+                auto *bmaxs = DirectBuildDoublePtr(sink.direct_build_maxs, sink.direct_build_max_index, ba, krange);
+                auto *build_has = DirectBuildHasPtr(sink, ba, krange);
+                double *agg_s = DirectDoublePtr(sink.direct_sums, sink.direct_accum_index, a, krange);
+                double *agg_c = DirectDoublePtr(sink.direct_counts, sink.direct_avg_index, a, krange);
+                double *agg_min = DirectDoublePtr(sink.direct_mins, sink.direct_min_index, a, krange);
+                double *agg_max = DirectDoublePtr(sink.direct_maxs, sink.direct_max_index, a, krange);
+                uint8_t *agg_has = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
 #define DIRECT_BUILD_AGG_LOOP(KTYPE)                                                                     \
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
@@ -1085,25 +1168,23 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
             if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
             if (k >= krange || !bc[k]) continue;                                                         \
-            if (f == "SUM") {                                                                            \
+            if (f == "SUM" && agg_s && bsums && build_has) {                                             \
                 agg_s[k] += bsums[k];                                                                    \
-                if (has_arr && sink.direct_build_counts[ba * krange + k] > 0) has_arr[a * krange + k] = 1; \
+                if (agg_has && build_has[k]) agg_has[k] = 1;                                             \
             }                                                                                            \
-            else if (f == "AVG") {                                                                       \
+            else if (f == "AVG" && agg_s && bsums && bcnts) {                                            \
                 agg_s[k] += bsums[k];                                                                    \
-                if (avg_counts) avg_counts[a * krange + k] += sink.direct_build_counts[ba * krange + k]; \
+                if (agg_c) agg_c[k] += bcnts[k];                                                         \
             }                                                                                            \
-            else if (f == "COUNT") agg_s[k] += sink.direct_build_counts[ba * krange + k];               \
-            else if (f == "MIN" && has_minmax && build_has) {                                            \
+            else if (f == "COUNT" && agg_s && bcnts) agg_s[k] += bcnts[k];                              \
+            else if (f == "MIN" && has_minmax && bmins && build_has && agg_min && agg_has) {             \
                 if (!build_has[k]) continue;                                                             \
-                auto bv = sink.direct_build_mins[ba * krange + k];                                       \
-                auto s = a * krange + k;                                                                 \
-                if (!has_arr[s] || bv < mins[s]) { mins[s] = bv; has_arr[s] = 1; }                      \
-            } else if (f == "MAX" && has_minmax && build_has) {                                          \
+                auto bv = bmins[k];                                                                      \
+                if (!agg_has[k] || bv < agg_min[k]) { agg_min[k] = bv; agg_has[k] = 1; }                \
+            } else if (f == "MAX" && has_minmax && bmaxs && build_has && agg_max && agg_has) {           \
                 if (!build_has[k]) continue;                                                             \
-                auto bv = sink.direct_build_maxs[ba * krange + k];                                       \
-                auto s = a * krange + k;                                                                 \
-                if (!has_arr[s] || bv > maxs[s]) { maxs[s] = bv; has_arr[s] = 1; }                      \
+                auto bv = bmaxs[k];                                                                      \
+                if (!agg_has[k] || bv > agg_max[k]) { agg_max[k] = bv; agg_has[k] = 1; }                \
             }                                                                                            \
         }                                                                                                \
     }
@@ -1122,24 +1203,22 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                         if (kv.IsNull()) continue;
                         auto k = (idx_t)(kv.GetValue<int64_t>() - kmin);
                         if (k >= krange || !bc[k]) continue;
-                        if (f == "SUM") {
+                        if (f == "SUM" && agg_s && bsums && build_has) {
                             agg_s[k] += bsums[k];
-                            if (has_arr && sink.direct_build_counts[ba * krange + k] > 0) has_arr[a * krange + k] = 1;
-                        } else if (f == "AVG") {
+                            if (agg_has && build_has[k]) agg_has[k] = 1;
+                        } else if (f == "AVG" && agg_s && bsums && bcnts) {
                             agg_s[k] += bsums[k];
-                            if (avg_counts) avg_counts[a * krange + k] += sink.direct_build_counts[ba * krange + k];
+                            if (agg_c) agg_c[k] += bcnts[k];
                         }
-                        else if (f == "COUNT") agg_s[k] += sink.direct_build_counts[ba * krange + k];
-                        else if (f == "MIN" && has_minmax && build_has) {
+                        else if (f == "COUNT" && agg_s && bcnts) agg_s[k] += bcnts[k];
+                        else if (f == "MIN" && has_minmax && bmins && build_has && agg_min && agg_has) {
                             if (!build_has[k]) continue;
-                            auto bv = sink.direct_build_mins[ba * krange + k];
-                            auto s = a * krange + k;
-                            if (!has_arr[s] || bv < mins[s]) { mins[s] = bv; has_arr[s] = 1; }
-                        } else if (f == "MAX" && has_minmax && build_has) {
+                            auto bv = bmins[k];
+                            if (!agg_has[k] || bv < agg_min[k]) { agg_min[k] = bv; agg_has[k] = 1; }
+                        } else if (f == "MAX" && has_minmax && bmaxs && build_has && agg_max && agg_has) {
                             if (!build_has[k]) continue;
-                            auto bv = sink.direct_build_maxs[ba * krange + k];
-                            auto s = a * krange + k;
-                            if (!has_arr[s] || bv > maxs[s]) { maxs[s] = bv; has_arr[s] = 1; }
+                            auto bv = bmaxs[k];
+                            if (!agg_has[k] || bv > agg_max[k]) { agg_max[k] = bv; agg_has[k] = 1; }
                         }
                     }
                     break;
@@ -1157,14 +1236,17 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 // COUNT(col) counts matched rows with non-NULL values — it must
                 // never accumulate the values themselves.
                 bool is_count = (f == "COUNT");
-                auto *dcounts = is_avg ? sink.direct_counts.data() : nullptr;
-                uint8_t *agg_h = (f == "SUM" && has_arr) ? has_arr + a * krange : nullptr;
+                auto *dcounts = is_avg ? DirectDoublePtr(sink.direct_counts, sink.direct_avg_index, a, krange) : nullptr;
+                uint8_t *agg_h = (f == "SUM" && has_arr) ? DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange) : nullptr;
+                double *agg_s = DirectDoublePtr(sink.direct_sums, sink.direct_accum_index, a, krange);
+                if (!agg_s || (is_avg && !dcounts) || (f == "SUM" && !agg_h)) {
+                    continue;
+                }
 #define DIRECT_SUM_LOOP(KTYPE, VTYPE)                                                                    \
     {                                                                                                    \
         auto *keys = FlatVector::GetData<KTYPE>(input.data[pki]);                                        \
         auto *vals = FlatVector::GetData<VTYPE>(input.data[ai]);                                         \
-        double *agg_s = sums + a * krange;                                                               \
-        double *agg_c = dcounts ? dcounts + a * krange : nullptr;                                        \
+        double *agg_c = dcounts;                                                                         \
         for (idx_t r = 0; r < n; r++) {                                                                  \
             if (key_validity && !((key_validity[r / 64] >> (r % 64)) & 1)) continue;                    \
             auto k = (idx_t)((int64_t)keys[r] - kmin);                                                   \
@@ -1203,8 +1285,7 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
                 }
 #undef DIRECT_SUM_KEY_SWITCH
                 if (!ran_typed) {
-                    double *agg_s = sums + a * krange;
-                    double *agg_c = dcounts ? dcounts + a * krange : nullptr;
+                    double *agg_c = dcounts;
                     for (idx_t r = 0; r < n; r++) {
                         auto kv = input.data[pki].GetValue(r);
                         if (kv.IsNull()) continue;
@@ -1220,8 +1301,12 @@ bool TryExecuteDirectSourcePath(const PhysicalAggJoin &op, DataChunk &input, Dat
 #undef DIRECT_SUM_LOOP
             } else if (f == "MIN" || f == "MAX") {
                 bool is_min = (f == "MIN");
-                double *agg_m = is_min ? (mins + a * krange) : (maxs + a * krange);
-                uint8_t *agg_h = has_arr + a * krange;
+                double *agg_m = is_min ? DirectDoublePtr(sink.direct_mins, sink.direct_min_index, a, krange)
+                                       : DirectDoublePtr(sink.direct_maxs, sink.direct_max_index, a, krange);
+                uint8_t *agg_h = DirectHasPtr(sink.direct_has, sink.direct_has_index, a, krange);
+                if (!agg_m || !agg_h) {
+                    continue;
+                }
                 auto vtype = input.data[ai].GetType().InternalType();
                 auto *mm_validity = FlatVector::Validity(input.data[ai]).GetData();
 #define DIRECT_MINMAX_LOOP(KTYPE, VTYPE)                                                                 \

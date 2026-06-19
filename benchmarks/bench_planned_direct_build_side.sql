@@ -1,13 +1,13 @@
 -- Benchmark: physical planned-direct path for build-side numeric aggregates.
 -- Run: build/Release/duckdb < benchmarks/bench_planned_direct_build_side.sql
 --
--- Cascade rewrites are disabled on purpose so this measures the fused operator's
--- planned-direct build-side arrays, not the native build/mixed preagg lowerings.
+-- Logical rewrites are disabled on purpose so this measures the fused operator's
+-- compact planned-direct build-side arrays, not the native build/mixed preagg lowerings.
 
 .timer on
 
 PRAGMA threads=8;
-SELECT aggjoin_set_cascade_enabled(false);
+SELECT aggjoin_set_logical_rewrites_enabled(false);
 SELECT aggjoin_set_operator_enabled(true);
 
 .print === Build-side planned-direct grouped, SUM+COUNT+AVG+MIN+MAX, 50K keys, 3M probe x 1M build ===
@@ -116,7 +116,7 @@ COPY (
 SELECT aggjoin_last_rewrite();
 
 SELECT aggjoin_set_operator_enabled(true);
-SELECT aggjoin_set_cascade_enabled(true);
+SELECT aggjoin_set_logical_rewrites_enabled(true);
 
 DROP TABLE pd_build_low_probe;
 DROP TABLE pd_build_low_build;

@@ -121,6 +121,68 @@ static bool AtLeastRatio(idx_t value, idx_t base, idx_t numerator, idx_t denomin
     return (__int128)value * (__int128)denominator >= (__int128)base * (__int128)numerator;
 }
 
+static bool IsBuildAgg(const AggJoinColInfo &col, idx_t agg_idx) {
+    return col.agg_on_build.size() > agg_idx && col.agg_on_build[agg_idx];
+}
+
+static idx_t DirectBuildAggBytesPerKey(const AggJoinColInfo &col) {
+    idx_t sum_slots = 0;
+    idx_t count_slots = 0;
+    idx_t min_slots = 0;
+    idx_t max_slots = 0;
+    idx_t has_slots = 0;
+    for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
+        if (!IsBuildAgg(col, a)) {
+            continue;
+        }
+        auto &f = col.agg_funcs[a];
+        if (f == "SUM") {
+            sum_slots++;
+            has_slots++;
+        } else if (f == "AVG") {
+            sum_slots++;
+            count_slots++;
+        } else if (f == "COUNT") {
+            count_slots++;
+        } else if (f == "MIN") {
+            min_slots++;
+            has_slots++;
+        } else if (f == "MAX") {
+            max_slots++;
+            has_slots++;
+        }
+    }
+    return sizeof(double) * (sum_slots + count_slots + min_slots + max_slots) +
+           sizeof(uint8_t) * has_slots;
+}
+
+static idx_t DirectAggBytesPerKey(const AggJoinColInfo &col) {
+    idx_t accum_slots = 0;
+    idx_t avg_slots = 0;
+    idx_t min_slots = 0;
+    idx_t max_slots = 0;
+    idx_t has_slots = 0;
+    for (auto &f : col.agg_funcs) {
+        if (f == "SUM") {
+            accum_slots++;
+            has_slots++;
+        } else if (f == "AVG") {
+            accum_slots++;
+            avg_slots++;
+        } else if (f == "COUNT") {
+            accum_slots++;
+        } else if (f == "MIN") {
+            min_slots++;
+            has_slots++;
+        } else if (f == "MAX") {
+            max_slots++;
+            has_slots++;
+        }
+    }
+    return sizeof(double) * (accum_slots + avg_slots + min_slots + max_slots) +
+           sizeof(uint8_t) * has_slots;
+}
+
 static bool StatsValueToInt64(const Value &value, int64_t &out) {
     if (value.IsNull()) {
         return false;
@@ -264,7 +326,7 @@ static LogicalComparisonJoin *FindJoin(LogicalOperator &op) {
 // decorrelation, DEPENDENT_JOIN) nodes: a DELIM_GET replays the OUTER query's
 // tuples into the inner plan. An aggregate matched over such a subtree depends on
 // that correlation, which neither the fused PhysicalAggJoin operator nor the
-// native cascades model -- firing computes the aggregate over the wrong (outer-
+// native logical rewrites model -- firing computes the aggregate over the wrong (outer-
 // independent) relation and silently drops the correlation (TPC-H q02 dropped all
 // rows; q17 inflated ~100x because the subquery AVG was wrong, so the outer
 // l_quantity < AVG filter passed everything). Decline every aggjoin rewrite when
@@ -300,7 +362,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         return;
     }
 
-    // The chain-count cascade lowers entirely to native operators and has complete
+    // The chain-count logical rewrite lowers entirely to native operators and has complete
     // internal gating, including an EXACT-HUGEINT path for integer SUM (whose
     // HUGEINT result the shared IsAggregate gate below excludes for the Value-heavy
     // operator paths). Try it FIRST, before that gate, so integer SUM is not
@@ -309,7 +371,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         if (auto *cc_join = FindJoin(*op->children[0])) {
             auto &cc_agg = op->Cast<LogicalAggregate>();
             auto &cc_child = *op->children[0];
-            if (AggJoinCascadeEnabled() &&
+            if (AggJoinLogicalRewritesEnabled() &&
                 TryRewriteNativeChainCountStar(context, optimizer, op, cc_agg, *cc_join, cc_child, state, has_parent)) {
                 return;
             }
@@ -325,8 +387,8 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
     auto &agg_child = *op->children[0]; // Projection chain above Join
 
     // final-bag covers the SUM/MIN/MAX/AVG split-payload shapes the chain-count
-    // cascade declines (chain-count was already attempted above).
-    if (AggJoinCascadeEnabled() &&
+    // logical rewrite declines (chain-count was already attempted above).
+    if (AggJoinLogicalRewritesEnabled() &&
         TryRewriteNativeFinalBagPreagg(context, optimizer, op, agg, *join, agg_child, state, has_parent)) {
         return;
     }
@@ -623,13 +685,13 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
     if (col.probe_key_cols.empty() || col.build_key_cols.empty()) return;
     if (col.probe_key_cols.size() != col.build_key_cols.size()) return;
 
-    if (AggJoinCascadeEnabled() &&
+    if (AggJoinLogicalRewritesEnabled() &&
         TryRewriteNativeMixedSidePreagg(context, optimizer, op, agg, *join, agg_child, col, need_swap,
                                         state, has_parent)) {
         return;
     }
 
-    if (AggJoinCascadeEnabled() &&
+    if (AggJoinLogicalRewritesEnabled() &&
         TryRewriteNativeBuildPreagg(context, optimizer, op, agg, *join, agg_child, col, build_agg_count, need_swap,
                                     state, has_parent)) {
         return;
@@ -754,20 +816,19 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                         auto na_total = (idx_t)col.agg_funcs.size();
                         bool would_have_minmax = false;
                         bool would_have_avg = false;
-                        idx_t n_build_aggs_est = build_agg_count;
+                        bool has_build_aggs_est = build_agg_count > 0;
                         for (idx_t a = 0; a < na_total; a++) {
                             if (col.agg_funcs[a] == "MIN" || col.agg_funcs[a] == "MAX") would_have_minmax = true;
                             if (col.agg_funcs[a] == "AVG") would_have_avg = true;
                         }
-                        idx_t bytes_per_key = sizeof(idx_t) + sizeof(double) * na_total +
-                                             (would_have_minmax ? (sizeof(double) * 2 + sizeof(uint8_t)) * na_total : 0) +
-                                             (would_have_avg ? sizeof(double) * na_total : 0) +
-                                             (n_build_aggs_est > 0 ? (sizeof(double) * 4 + sizeof(uint8_t)) * n_build_aggs_est : 0);
+                        idx_t bytes_per_key = sizeof(idx_t) +
+                                             DirectAggBytesPerKey(col) +
+                                             DirectBuildAggBytesPerKey(col);
                         idx_t max_working_set = (col.group_cols.empty() || group_matches_join_key)
                                                     ? 32 * 1024 * 1024
                                                     : 16 * 1024 * 1024;
                         if (group_matches_join_key && !col.group_cols.empty() && na_total == 1 &&
-                            !would_have_minmax && !would_have_avg && n_build_aggs_est == 0) {
+                            !would_have_minmax && !would_have_avg && !has_build_aggs_est) {
                             max_working_set = 48 * 1024 * 1024;
                         }
                         idx_t direct_limit = bytes_per_key > 0 ? max_working_set / bytes_per_key : 2000000;
@@ -799,22 +860,12 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         bool has_build_aggs = build_agg_count > 0;
         bool planned_direct_parallel_shape = col.planned_direct_mode && direct_like_shape &&
                                              !composite_shape && !has_unsupported_minmax;
-        bool planned_direct_has_avg = false;
-        bool planned_direct_has_minmax = false;
-        bool planned_direct_has_sum = false;
         if (planned_direct_parallel_shape) {
             for (idx_t a = 0; a < col.agg_funcs.size(); a++) {
                 auto &fn = col.agg_funcs[a];
                 bool on_build = col.agg_on_build.size() > a && col.agg_on_build[a];
                 if (fn == "COUNT") {
                     continue;
-                }
-                if (fn == "AVG") {
-                    planned_direct_has_avg = true;
-                } else if (fn == "SUM") {
-                    planned_direct_has_sum = true;
-                } else if (fn == "MIN" || fn == "MAX") {
-                    planned_direct_has_minmax = true;
                 }
                 if (fn != "AVG" && fn != "SUM" && fn != "MIN" && fn != "MAX") {
                     planned_direct_parallel_shape = false;
@@ -842,16 +893,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         }
         bool planned_direct_sparse_grouped = false;
         if (planned_direct_parallel_shape && !col.group_cols.empty()) {
-            auto na = (idx_t)col.agg_funcs.size();
-            idx_t bytes_per_key = sizeof(double) * na + sizeof(uint8_t);
-            if (planned_direct_has_avg) {
-                bytes_per_key += sizeof(double) * na;
-            }
-            if (planned_direct_has_minmax) {
-                bytes_per_key += sizeof(double) * 2 * na + sizeof(uint8_t) * na;
-            } else if (planned_direct_has_sum) {
-                bytes_per_key += sizeof(uint8_t) * na;
-            }
+            idx_t bytes_per_key = DirectAggBytesPerKey(col) + sizeof(uint8_t);
             __int128 local_bytes = (__int128)col.planned_direct_key_range * (__int128)bytes_per_key;
             planned_direct_sparse_grouped = local_bytes > (__int128)16 * 1024 * 1024;
         }
@@ -984,7 +1026,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
     }
 
     // The fused operator is the riskier, custom-execution path — let a deployment
-    // turn it off independently of the native-lowering cascade.
+    // turn it off independently of the native-lowering logical rewrites.
     if (!AggJoinOperatorEnabled()) {
         return;
     }

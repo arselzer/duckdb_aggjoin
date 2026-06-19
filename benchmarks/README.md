@@ -340,8 +340,8 @@ Representative trace for the grouped mixed case:
 The physical planned-direct operator now has a narrow build-side numeric
 aggregate path for `SUM/COUNT/AVG/MIN/MAX`. The dedicated
 [bench_planned_direct_build_side.sql](./bench_planned_direct_build_side.sql)
-benchmark disables cascade rewrites deliberately, so it measures the fused
-operator's build-side per-key arrays rather than the native preaggregation
+benchmark disables logical rewrites deliberately, so it measures the fused
+operator's compact per-kind build-side arrays rather than the native preaggregation
 lowerings.
 
 The planner guard is intentionally stricter than the probe-side direct guard:

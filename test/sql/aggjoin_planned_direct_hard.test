@@ -12,7 +12,7 @@ statement ok
 PRAGMA threads=8;
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(false);
+SELECT aggjoin_set_logical_rewrites_enabled(false);
 
 # ── Hard shared data set: negative SMALLINT key offsets, NULL join keys,
 #    unmatched probe/build key ranges, duplicate build keys, and NULL payloads.
@@ -415,4 +415,4 @@ statement ok
 SELECT aggjoin_set_operator_enabled(true);
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(true);
+SELECT aggjoin_set_logical_rewrites_enabled(true);

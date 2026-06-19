@@ -134,29 +134,50 @@ void AggJoinOperatorState::Finalize(const PhysicalOperator &op, ExecutionContext
                 }
                 for (idx_t a = 0; a < na; a++) {
                     auto &fn = physical.col.agg_funcs[a];
-                    auto global_off = a * krange + k;
-                    auto local_off = slot * na + a;
+                    auto accum_idx = sink.direct_accum_index[a];
+                    auto avg_idx = sink.direct_avg_index[a];
+                    auto min_idx = sink.direct_min_index[a];
+                    auto max_idx = sink.direct_max_index[a];
+                    auto has_idx = sink.direct_has_index[a];
                     if (fn == "AVG") {
-                        sink.direct_sums[global_off] += parallel_sparse_sums[local_off];
-                        sink.direct_counts[global_off] += parallel_sparse_counts[local_off];
+                        auto global_accum = accum_idx * krange + k;
+                        auto global_count = avg_idx * krange + k;
+                        auto local_accum = slot * sink.direct_accum_slots + accum_idx;
+                        auto local_count = slot * sink.direct_avg_slots + avg_idx;
+                        sink.direct_sums[global_accum] += parallel_sparse_sums[local_accum];
+                        sink.direct_counts[global_count] += parallel_sparse_counts[local_count];
                     } else if (fn == "MIN") {
-                        if (parallel_sparse_has[local_off] &&
-                            (!sink.direct_has[global_off] ||
-                             parallel_sparse_mins[local_off] < sink.direct_mins[global_off])) {
-                            sink.direct_mins[global_off] = parallel_sparse_mins[local_off];
-                            sink.direct_has[global_off] = 1;
+                        auto global_mm = min_idx * krange + k;
+                        auto global_has = has_idx * krange + k;
+                        auto local_mm = slot * sink.direct_min_slots + min_idx;
+                        auto local_has = slot * sink.direct_has_slots + has_idx;
+                        if (parallel_sparse_has[local_has] &&
+                            (!sink.direct_has[global_has] ||
+                             parallel_sparse_mins[local_mm] < sink.direct_mins[global_mm])) {
+                            sink.direct_mins[global_mm] = parallel_sparse_mins[local_mm];
+                            sink.direct_has[global_has] = 1;
                         }
                     } else if (fn == "MAX") {
-                        if (parallel_sparse_has[local_off] &&
-                            (!sink.direct_has[global_off] ||
-                             parallel_sparse_maxs[local_off] > sink.direct_maxs[global_off])) {
-                            sink.direct_maxs[global_off] = parallel_sparse_maxs[local_off];
-                            sink.direct_has[global_off] = 1;
+                        auto global_mm = max_idx * krange + k;
+                        auto global_has = has_idx * krange + k;
+                        auto local_mm = slot * sink.direct_max_slots + max_idx;
+                        auto local_has = slot * sink.direct_has_slots + has_idx;
+                        if (parallel_sparse_has[local_has] &&
+                            (!sink.direct_has[global_has] ||
+                             parallel_sparse_maxs[local_mm] > sink.direct_maxs[global_mm])) {
+                            sink.direct_maxs[global_mm] = parallel_sparse_maxs[local_mm];
+                            sink.direct_has[global_has] = 1;
                         }
                     } else {
-                        sink.direct_sums[global_off] += parallel_sparse_sums[local_off];
-                        if (fn == "SUM" && parallel_sparse_has[local_off]) {
-                            sink.direct_has[global_off] = 1;
+                        auto global_accum = accum_idx * krange + k;
+                        auto local_accum = slot * sink.direct_accum_slots + accum_idx;
+                        sink.direct_sums[global_accum] += parallel_sparse_sums[local_accum];
+                        if (fn == "SUM") {
+                            auto global_has = has_idx * krange + k;
+                            auto local_has = slot * sink.direct_has_slots + has_idx;
+                            if (parallel_sparse_has[local_has]) {
+                                sink.direct_has[global_has] = 1;
+                            }
                         }
                     }
                 }
@@ -171,26 +192,40 @@ void AggJoinOperatorState::Finalize(const PhysicalOperator &op, ExecutionContext
             }
             for (idx_t a = 0; a < na; a++) {
                 auto &fn = physical.col.agg_funcs[a];
-                auto off = a * krange + k;
+                auto accum_idx = sink.direct_accum_index[a];
+                auto avg_idx = sink.direct_avg_index[a];
+                auto min_idx = sink.direct_min_index[a];
+                auto max_idx = sink.direct_max_index[a];
+                auto has_idx = sink.direct_has_index[a];
                 if (fn == "AVG") {
-                    sink.direct_sums[off] += parallel_direct_sums[off];
-                    sink.direct_counts[off] += parallel_direct_counts[off];
+                    auto accum_off = accum_idx * krange + k;
+                    sink.direct_sums[accum_off] += parallel_direct_sums[accum_off];
+                    auto count_off = avg_idx * krange + k;
+                    sink.direct_counts[count_off] += parallel_direct_counts[count_off];
                 } else if (fn == "MIN") {
-                    if (parallel_direct_has[off] &&
-                        (!sink.direct_has[off] || parallel_direct_mins[off] < sink.direct_mins[off])) {
-                        sink.direct_mins[off] = parallel_direct_mins[off];
-                        sink.direct_has[off] = 1;
+                    auto mm_off = min_idx * krange + k;
+                    auto has_off = has_idx * krange + k;
+                    if (parallel_direct_has[has_off] &&
+                        (!sink.direct_has[has_off] || parallel_direct_mins[mm_off] < sink.direct_mins[mm_off])) {
+                        sink.direct_mins[mm_off] = parallel_direct_mins[mm_off];
+                        sink.direct_has[has_off] = 1;
                     }
                 } else if (fn == "MAX") {
-                    if (parallel_direct_has[off] &&
-                        (!sink.direct_has[off] || parallel_direct_maxs[off] > sink.direct_maxs[off])) {
-                        sink.direct_maxs[off] = parallel_direct_maxs[off];
-                        sink.direct_has[off] = 1;
+                    auto mm_off = max_idx * krange + k;
+                    auto has_off = has_idx * krange + k;
+                    if (parallel_direct_has[has_off] &&
+                        (!sink.direct_has[has_off] || parallel_direct_maxs[mm_off] > sink.direct_maxs[mm_off])) {
+                        sink.direct_maxs[mm_off] = parallel_direct_maxs[mm_off];
+                        sink.direct_has[has_off] = 1;
                     }
                 } else {
-                    sink.direct_sums[off] += parallel_direct_sums[off];
-                    if (fn == "SUM" && parallel_direct_has[off]) {
-                        sink.direct_has[off] = 1;
+                    auto accum_off = accum_idx * krange + k;
+                    sink.direct_sums[accum_off] += parallel_direct_sums[accum_off];
+                    if (fn == "SUM") {
+                        auto has_off = has_idx * krange + k;
+                        if (parallel_direct_has[has_off]) {
+                            sink.direct_has[has_off] = 1;
+                        }
                     }
                 }
             }

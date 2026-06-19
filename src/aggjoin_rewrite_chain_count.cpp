@@ -1,7 +1,7 @@
 // Chain-COUNT(*) Yannakakis-style rewrite.
 //
 // Lowers `SELECT COUNT(*) FROM R0, R1, ..., R(n-1) WHERE <linear chain of
-// single-column INNER equi-joins>` into a native frequency-propagation cascade
+// single-column INNER equi-joins>` into a native frequency-propagation logical rewrite
 // (HASH_GROUP_BY -> HASH_JOIN -> HASH_GROUP_BY -> ...), so the intermediate join
 // product is never materialised. This generalises the fixed 3-relation final-bag
 // rewrite to an N-relation linear chain, for the COUNT(*) case only.
@@ -67,7 +67,7 @@ struct ChainEdge {
     LogicalType type_b;
 };
 
-// A user aggregate to propagate through the freq cascade. `home_leaf` is the leaf
+// A user aggregate to propagate through frequency propagation. `home_leaf` is the leaf
 // whose base relation holds the input column (INVALID for COUNT(*)). The
 // frequency-weighted value is carried up the tree as an `_agg` column (plus an
 // `_agg_cnt` column for AVG) and combined at the root -- see FoldNode threading.
@@ -205,7 +205,7 @@ double ColumnMaxAbsFromStats(ClientContext &context, const ChainLeaf &leaf, cons
 }
 
 // The accumulator type an aggregate's value threads through the fold in -- chosen
-// so the cascade matches native EXACTLY, never rounding through a DOUBLE it
+// so the logical rewrite matches native EXACTLY, never rounding through a DOUBLE it
 // shouldn't:
 //   COUNT/COUNT(col)          -> HUGEINT  (exact integer multiplicity sum)
 //   SUM(integer, any width)   -> HUGEINT  (DuckDB SUM(int) returns HUGEINT)
@@ -364,22 +364,25 @@ bool WidenKeys(ClientContext &context, JoinCondition &cond, const LogicalType &l
 }
 
 // Recursively fold the subtree rooted at `node` (the edge to `parent` excluded)
-// into a single CTE. The output CTE exposes the `persistent` columns -- the
-// node's column toward `parent` (when parent is valid) followed by any
-// `extra_keep` columns (e.g. the grouped guard) -- plus a DOUBLE `_freq`. A node
-// with k children produces k stacked aggregates: each fold JOINs one child CTE,
-// then `SUM(node_freq * child_freq)` GROUP BY the still-live columns (the
-// persistent columns + the not-yet-folded children's join columns). This is the
-// general-tree generalisation of the linear chain fold. Leaf subtrees are moved
-// out of leaves[].slot. Returns false on construction failure.
+// into a single CTE. The output CTE exposes the node's column toward `parent`
+// (when parent is valid), any requested `extra_keep` GROUP BY columns that live in
+// this subtree, and a HUGEINT `_freq`. A node with k children produces k stacked
+// aggregates: each fold JOINs one child CTE, then `SUM(node_freq * child_freq)`
+// GROUP BY the still-live columns (persistent GROUP BY columns + not-yet-folded
+// child join columns). This is the general-tree generalisation of the linear
+// chain fold. Leaf subtrees are moved out of leaves[].slot. Returns false on
+// construction failure.
 //
 // out_keep_b/out_keep_t are the persistent columns in order: [up_col (if parent
-// valid)] ++ extra_keep, with their final bindings after all folds.
+// valid)] followed by the GROUP BY columns present in this subtree, in global
+// extra_keep order. out_keep_extra_pos is INVALID for up_col and otherwise points
+// back into extra_keep.
 bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<TreeAdjEdge>> &adj,
               vector<ChainLeaf> &leaves, idx_t node, idx_t parent, const vector<AggSpec> &aggs,
               const vector<std::pair<ColumnBinding, LogicalType>> &extra_keep, unique_ptr<LogicalOperator> &out_cte,
-              vector<ColumnBinding> &out_keep_b, vector<LogicalType> &out_keep_t, ColumnBinding &out_freq_b,
-              LogicalType &out_freq_t, vector<AggState> &out_states) {
+              vector<ColumnBinding> &out_keep_b, vector<LogicalType> &out_keep_t,
+              vector<idx_t> &out_keep_extra_pos, ColumnBinding &out_freq_b, LogicalType &out_freq_t,
+              vector<AggState> &out_states) {
     // ── expression-building helpers ──
     // Two arithmetic modes thread through the fold: DOUBLE (castd/muld) for
     // floating SUM/AVG, and EXACT HUGEINT (casth/mulh) for integer multiplicities
@@ -447,17 +450,51 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
     struct Keep {
         bool transient_child;
         idx_t child_pos;
+        idx_t extra_pos;
         ColumnBinding cur_b;
         LogicalType cur_t;
     };
     vector<Keep> keep;
     if (have_up) {
-        keep.push_back({false, 0, up_col, up_type});
+        keep.push_back({false, 0, DConstants::INVALID_INDEX, up_col, up_type});
     }
-    for (auto &ek : extra_keep) {
-        keep.push_back({false, 0, ek.first, ek.second});
+    for (idx_t i = 0; i < extra_keep.size(); i++) {
+        auto &ek = extra_keep[i];
+        if (BindingsContain(leaves[node].bindings, ek.first)) {
+            keep.push_back({false, 0, i, ek.first, ek.second});
+        }
     }
-    idx_t persistent_count = keep.size();
+    auto emit_keep_outputs = [&](const vector<Keep> &items) -> bool {
+        out_keep_b.clear();
+        out_keep_t.clear();
+        out_keep_extra_pos.clear();
+        if (have_up) {
+            bool found_up = false;
+            for (auto &k : items) {
+                if (!k.transient_child && k.extra_pos == DConstants::INVALID_INDEX) {
+                    out_keep_b.push_back(k.cur_b);
+                    out_keep_t.push_back(k.cur_t);
+                    out_keep_extra_pos.push_back(DConstants::INVALID_INDEX);
+                    found_up = true;
+                    break;
+                }
+            }
+            if (!found_up) {
+                return false;
+            }
+        }
+        for (idx_t pos = 0; pos < extra_keep.size(); pos++) {
+            for (auto &k : items) {
+                if (k.extra_pos == pos) {
+                    out_keep_b.push_back(k.cur_b);
+                    out_keep_t.push_back(k.cur_t);
+                    out_keep_extra_pos.push_back(pos);
+                    break;
+                }
+            }
+        }
+        return true;
+    };
 
     // ── Leaf (no children): COUNT(*) = frequency, plus initialise any aggregate
     // homed here (its local SUM/MIN/MAX/COUNT/AVG over the leaf rows). ──
@@ -513,12 +550,10 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
         }
         preagg->children.push_back(std::move(rel));
         preagg->ResolveOperatorTypes();
-        idx_t ng = persistent_count;
-        out_keep_b.clear();
-        out_keep_t.clear();
+        idx_t ng = keep.size();
         for (idx_t i = 0; i < ng; i++) {
-            out_keep_b.push_back(ColumnBinding(g, i));
-            out_keep_t.push_back(preagg->types[i]);
+            keep[i].cur_b = ColumnBinding(g, i);
+            keep[i].cur_t = preagg->types[i];
         }
         out_freq_b = ColumnBinding(a, 0);
         out_freq_t = preagg->types[ng]; // count_star
@@ -541,11 +576,11 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
             }
         }
         out_cte = std::move(preagg);
-        return true;
+        return emit_keep_outputs(keep);
     }
 
     for (idx_t ci = 0; ci < children.size(); ci++) {
-        keep.push_back({true, ci, children[ci]->my_col, children[ci]->my_type});
+        keep.push_back({true, ci, DConstants::INVALID_INDEX, children[ci]->my_col, children[ci]->my_type});
     }
 
     bool has_freq = false;
@@ -556,14 +591,15 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
         unique_ptr<LogicalOperator> child_cte;
         vector<ColumnBinding> c_keep_b;
         vector<LogicalType> c_keep_t;
+        vector<idx_t> c_keep_extra_pos;
         ColumnBinding c_freq_b;
         LogicalType c_freq_t;
         vector<AggState> child_states;
-        if (!FoldNode(context, optimizer, adj, leaves, children[ci]->nbr, node, aggs, {}, child_cte, c_keep_b, c_keep_t,
-                      c_freq_b, c_freq_t, child_states)) {
+        if (!FoldNode(context, optimizer, adj, leaves, children[ci]->nbr, node, aggs, extra_keep, child_cte, c_keep_b,
+                      c_keep_t, c_keep_extra_pos, c_freq_b, c_freq_t, child_states)) {
             return false;
         }
-        if (c_keep_b.empty()) {
+        if (c_keep_b.empty() || c_keep_extra_pos.size() != c_keep_b.size()) {
             return false;
         }
         idx_t kpos = DConstants::INVALID_INDEX;
@@ -588,6 +624,14 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
         join->children.push_back(std::move(rel));
         join->children.push_back(std::move(child_cte));
         join->ResolveOperatorTypes();
+
+        vector<Keep> joined_keep = keep;
+        for (idx_t i = 1; i < c_keep_b.size(); i++) {
+            if (c_keep_extra_pos[i] == DConstants::INVALID_INDEX) {
+                return false;
+            }
+            joined_keep.push_back({false, 0, c_keep_extra_pos[i], c_keep_b[i], c_keep_t[i]});
+        }
 
         auto g = optimizer.binder.GenerateTableIndex();
         auto a = optimizer.binder.GenerateTableIndex();
@@ -720,11 +764,11 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
 
         auto preagg = make_uniq<LogicalAggregate>(g, a, std::move(aggexprs));
         vector<idx_t> surviving;
-        for (idx_t k = 0; k < keep.size(); k++) {
+        for (idx_t k = 0; k < joined_keep.size(); k++) {
             if (k == kpos) {
                 continue;
             }
-            preagg->groups.push_back(colref(keep[k].cur_t, keep[k].cur_b));
+            preagg->groups.push_back(colref(joined_keep[k].cur_t, joined_keep[k].cur_b));
             surviving.push_back(k);
         }
         preagg->children.push_back(std::move(join));
@@ -733,7 +777,7 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
         idx_t ng = surviving.size();
         vector<Keep> nk;
         for (idx_t pos = 0; pos < ng; pos++) {
-            Keep e = keep[surviving[pos]];
+            Keep e = joined_keep[surviving[pos]];
             e.cur_b = ColumnBinding(g, pos);
             e.cur_t = preagg->types[pos];
             nk.push_back(e);
@@ -764,17 +808,11 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
         rel = std::move(preagg);
     }
 
-    out_keep_b.clear();
-    out_keep_t.clear();
-    for (auto &k : keep) {
-        out_keep_b.push_back(k.cur_b);
-        out_keep_t.push_back(k.cur_t);
-    }
     out_freq_b = cur_freq_b;
     out_freq_t = cur_freq_t;
     out_states = std::move(states);
     out_cte = std::move(rel);
-    return true;
+    return emit_keep_outputs(keep);
 }
 
 // Descend single-child LOGICAL_PROJECTION nodes from `slot` to the underlying
@@ -783,7 +821,7 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
 // each projection to the join-output binding space; it must be a bare passthrough
 // column ref at every level, except that an integer CompressedMaterialization
 // wrapper (__internal_compress_integral) is peeled to its raw column and its
-// offset recorded in *out_compress (so the cascade can re-emit the compressed
+// offset recorded in *out_compress (so the logical rewrite can re-emit the compressed
 // value the parent decompress projection expects). Returns the join's owning
 // slot, or nullptr if the chain isn't proj*->join or the binding can't be traced
 // (computed column, string compress, unextractable offset).
@@ -877,7 +915,7 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
         }
         // SUM(integer) binds to plain "sum" with a HUGEINT result; the shared
         // IsAggregate gate (aggjoin_rewrites.cpp) excludes HUGEINT, so WalkAndReplace
-        // dispatches the chain-count cascade BEFORE that gate specifically so integer
+        // dispatches the chain-count logical rewrite BEFORE that gate specifically so integer
         // SUM reaches here -- it is accumulated EXACTLY in HUGEINT (see FoldNode).
         if (fn != "SUM" && fn != "MIN" && fn != "MAX" && fn != "AVG" && fn != "COUNT" && !IsSetSafe(fn) &&
             !IsVarFamily(fn)) {
@@ -889,7 +927,7 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
         // Aggregate input must reach a bare column through AT MOST ONE cast
         // (DuckDB wraps integer SUM inputs in a widening cast). A multi-level or
         // function/arithmetic-wrapped input bails: re-aggregating the underlying
-        // column through the cascade's own DOUBLE cast could differ from the
+        // column through the logical rewrite's own DOUBLE cast could differ from the
         // user's cast semantics (truncation) or evaluate an unsupported cast that
         // native short-circuits on an empty join (e.g. DATE->DOUBLE).
         Expression *in = ba.children[0].get();
@@ -1001,30 +1039,27 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
         aggs[j].home_leaf = home;
     }
 
-    // ── Root selection: grouped -> the guard node hosting the GROUP BY column(s)
-    // (any tree node); ALL group columns must live on that same node, else bail.
-    // Ungrouped -> the first aggregate's home (any root is correct -- aggregates
-    // propagate to it). ──
+    // ── Root selection: grouped -> any GROUP BY leaf can act as root; GROUP BY
+    // columns on other leaves are threaded up through child keep columns. Ungrouped
+    // -> the first aggregate's home (any root is correct -- aggregates propagate
+    // to it). ──
     idx_t root = 0;
     vector<LogicalType> group_types;
     if (grouped_query) {
-        idx_t guard = FindLeafForBinding(leaves, 0, leaves.size(), group_bindings[0]);
-        if (guard == DConstants::INVALID_INDEX) {
-            return false;
-        }
         for (idx_t i = 0; i < group_bindings.size(); i++) {
-            // Each GROUP BY column binding belongs to exactly one leaf; all must
-            // resolve to the SAME guard node (multi-node GROUP BY is a later stage).
-            if (FindLeafForBinding(leaves, 0, leaves.size(), group_bindings[i]) != guard) {
+            idx_t group_leaf = FindLeafForBinding(leaves, 0, leaves.size(), group_bindings[i]);
+            if (group_leaf == DConstants::INVALID_INDEX) {
                 return false;
             }
             LogicalType gt;
-            if (!TypeForBinding(leaves[guard], group_bindings[i], gt)) {
+            if (!TypeForBinding(leaves[group_leaf], group_bindings[i], gt)) {
                 return false;
             }
             group_types.push_back(gt);
+            if (i == 0) {
+                root = group_leaf;
+            }
         }
-        root = guard;
     } else {
         for (idx_t j = 0; j < aggs.size(); j++) {
             if (!aggs[j].is_count_star) {
@@ -1035,7 +1070,7 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
     }
 
     // ── Perf gate: only fire when at least one leaf is large enough that the
-    // cascade beats native (mirrors the final-bag envelope). Skippable for
+    // logical rewrite beats native (mirrors the final-bag envelope). Skippable for
     // benchmarking with -DAGGJOIN_NO_PLANNER_GATE. ──
 #ifndef AGGJOIN_NO_PLANNER_GATE
     {
@@ -1044,11 +1079,11 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
             max_leaf_est = std::max(max_leaf_est, leaf.estimated_cardinality);
         }
         idx_t join_est = join.has_estimated_cardinality ? (idx_t)join.estimated_cardinality : 0;
-        // The cascade wins only when native must materialise a LARGE intermediate
+        // The logical rewrite wins only when native must materialise a LARGE intermediate
         // join AND that intermediate is a multiplicity blowup of the inputs.
         // Two independent conditions, both required (calibrated 2026-06-15):
         //  - absolute size: a small intermediate (even at high blowup ratio) is
-        //    already cheap for native; the cascade's extra GROUP-BYs then lose.
+        //    already cheap for native; the logical rewrite's extra GROUP-BYs then lose.
         //  - blowup ratio: guards against a large 1:1 scan (join_est big but no
         //    multiplicity) where native is already optimal.
         const idx_t MIN_JOIN_EST = 2000000;
@@ -1131,8 +1166,9 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
     ColumnBinding freq_b;
     LogicalType freq_t;
     vector<AggState> root_states;
+    vector<idx_t> keep_extra_pos;
     if (!FoldNode(context, optimizer, adj, leaves, root, DConstants::INVALID_INDEX, aggs, extra_keep, cte, keep_b,
-                  keep_t, freq_b, freq_t, root_states)) {
+                  keep_t, keep_extra_pos, freq_b, freq_t, root_states)) {
         return false;
     }
     for (idx_t j = 0; j < aggs.size(); j++) {
@@ -1163,8 +1199,13 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
     vector<unique_ptr<Expression>> proj_exprs;
     idx_t group_offset = 0;
     if (grouped_query) {
-        if (keep_b.size() < group_bindings.size()) {
+        if (keep_b.size() != group_bindings.size() || keep_extra_pos.size() != group_bindings.size()) {
             return false;
+        }
+        for (idx_t i = 0; i < keep_extra_pos.size(); i++) {
+            if (keep_extra_pos[i] != i) {
+                return false;
+            }
         }
         // Emit each GROUP BY column (keep_b[i]) in agg.groups order, with per-column
         // compress re-emit. agg.types[i] is the i-th group output's type.
@@ -1288,7 +1329,7 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
         }
     }
     if (AggJoinTraceEnabled()) {
-        fprintf(stderr, "[AGGJOIN] planner rewrite: native chain-count cascade (leaves=%zu, aggs=%zu)\n",
+        fprintf(stderr, "[AGGJOIN] planner rewrite: native chain-count logical rewrite (leaves=%zu, aggs=%zu)\n",
                 leaves.size(), aggs.size());
     }
     SetAggJoinLastRewrite("chain_count");

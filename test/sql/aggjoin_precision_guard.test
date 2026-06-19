@@ -8,7 +8,7 @@
 require aggjoin
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(false);
+SELECT aggjoin_set_logical_rewrites_enabled(false);
 
 statement ok
 CREATE TABLE precision_guard_build AS
@@ -36,4 +36,4 @@ SELECT aggjoin_last_rewrite();
 none
 
 statement ok
-SELECT aggjoin_set_cascade_enabled(true);
+SELECT aggjoin_set_logical_rewrites_enabled(true);

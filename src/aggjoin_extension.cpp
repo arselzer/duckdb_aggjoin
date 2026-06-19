@@ -20,7 +20,7 @@ namespace duckdb {
 void RegisterAggJoinOptimizer(DatabaseInstance &db, bool ignore_disable_static = false);
 void SetAggJoinTestHashBits(int64_t bits);
 void SetAggJoinTestHTCapacity(int64_t capacity);
-void SetAggJoinCascadeEnabled(bool enabled);
+void SetAggJoinLogicalRewritesEnabled(bool enabled);
 void SetAggJoinOperatorEnabled(bool enabled);
 const char *GetAggJoinLastRewrite();
 void ResetAggJoinLastRewrite();
@@ -54,9 +54,9 @@ static void AggjoinSetTestHTCapacityFunction(DataChunk &args, ExpressionState &s
     });
 }
 
-static void AggjoinSetCascadeEnabledFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+static void AggjoinSetLogicalRewritesEnabledFunction(DataChunk &args, ExpressionState &state, Vector &result) {
     UnaryExecutor::Execute<bool, bool>(args.data[0], result, args.size(), [&](bool enabled) {
-        SetAggJoinCascadeEnabled(enabled);
+        SetAggJoinLogicalRewritesEnabled(enabled);
         return enabled;
     });
 }
@@ -75,10 +75,14 @@ static void RegisterAggJoinTestFunctions(ExtensionLoader &loader) {
     loader.RegisterFunction(
         ScalarFunction("aggjoin_set_test_ht_capacity", {LogicalType::BIGINT}, LogicalType::BIGINT,
                        AggjoinSetTestHTCapacityFunction));
-    // Per-path enable/disable (cascade vs. fused operator), runtime-settable.
+    // Per-path enable/disable (logical rewrites vs. fused operator), runtime-settable.
+    loader.RegisterFunction(
+        ScalarFunction("aggjoin_set_logical_rewrites_enabled", {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
+                       AggjoinSetLogicalRewritesEnabledFunction));
+    // Compatibility alias for older tests/scripts.
     loader.RegisterFunction(
         ScalarFunction("aggjoin_set_cascade_enabled", {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
-                       AggjoinSetCascadeEnabledFunction));
+                       AggjoinSetLogicalRewritesEnabledFunction));
     loader.RegisterFunction(
         ScalarFunction("aggjoin_set_operator_enabled", {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
                        AggjoinSetOperatorEnabledFunction));

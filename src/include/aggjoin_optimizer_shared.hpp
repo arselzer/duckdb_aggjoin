@@ -36,10 +36,12 @@ bool AggJoinTraceEnabled();
 bool AggJoinTraceStatsEnabled();
 bool AggJoinStaticDisabledByEnv();
 
-// Per-path enable/disable (cascade = native-lowering frequency cascade;
-// operator = the fused PhysicalAggJoin).  See aggjoin_optimizer.cpp.
+// Per-path enable/disable (logical rewrites = native-lowering preaggregation
+// rewrites; operator = the fused PhysicalAggJoin). See aggjoin_optimizer.cpp.
+bool AggJoinLogicalRewritesEnabled();
 bool AggJoinCascadeEnabled();
 bool AggJoinOperatorEnabled();
+void SetAggJoinLogicalRewritesEnabled(bool enabled);
 void SetAggJoinCascadeEnabled(bool enabled);
 void SetAggJoinOperatorEnabled(bool enabled);
 
