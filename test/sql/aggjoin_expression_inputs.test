@@ -44,6 +44,48 @@ SELECT r.x, CAST(SUM(r.a * r.b) AS INTEGER) FROM r JOIN s ON r.x = s.x GROUP BY 
 2	60
 3	120
 
+# The same arithmetic payload hidden behind a Projection must not be traced
+# through to a base column. A prior bug fused this as SUM(r.a), ignoring `* r.b`.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT CAST(SUM(prod) AS INTEGER)
+FROM (
+  SELECT r.a * r.b AS prod, r.x AS rx, s.x AS sx
+  FROM r JOIN s ON r.x = s.x
+) q;
+----
+220
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+# Likewise, a computed GROUP BY key hidden behind a Projection is not a raw group
+# column the fused operator can emit.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT gx, CAST(SUM(a) AS INTEGER)
+FROM (
+  SELECT r.x + 10 AS gx, r.a AS a, r.x AS rx, s.x AS sx
+  FROM r JOIN s ON r.x = s.x
+) q
+GROUP BY gx
+ORDER BY gx;
+----
+11	20
+12	20
+13	30
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
 # ── CAST-wrapped input (known-documented bug in CLAUDE.md) ──
 
 query I

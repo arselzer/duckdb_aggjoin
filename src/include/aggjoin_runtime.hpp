@@ -502,6 +502,64 @@ inline idx_t TraceProjectionChain(LogicalOperator &op, idx_t idx, int depth) {
     return idx;
 }
 
+// Strict Projection-chain tracer for columns the rewrite will read directly.
+// It accepts passthrough references only. GROUP BY columns may additionally pass
+// through DuckDB's internal compression wrapper, because the caller separately
+// records/decompresses that wrapper. User-visible functions/casts are not safe:
+// tracing SUM(proj_expr) through `proj_expr := a * b` would make the runtime read
+// `a` and silently ignore `* b`.
+inline idx_t TraceProjectionChainPassthrough(LogicalOperator &op, idx_t idx, bool allow_internal_wrappers,
+                                             int depth) {
+    if (op.type != LogicalOperatorType::LOGICAL_PROJECTION) {
+        return idx;
+    }
+    if (op.children.size() != 1) {
+        return DConstants::INVALID_INDEX;
+    }
+    auto &proj = op.Cast<LogicalProjection>();
+    if (idx >= proj.expressions.size()) {
+        return DConstants::INVALID_INDEX;
+    }
+
+    auto trace_binding = [&](const ColumnBinding &binding) -> idx_t {
+        auto child_bindings = op.children[0]->GetColumnBindings();
+        for (idx_t i = 0; i < child_bindings.size(); i++) {
+            if (child_bindings[i] == binding) {
+                return TraceProjectionChainPassthrough(*op.children[0], i, allow_internal_wrappers, depth + 1);
+            }
+        }
+        return DConstants::INVALID_INDEX;
+    };
+
+    auto &expr = proj.expressions[idx];
+    if (expr->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+        auto child_idx = expr->Cast<BoundReferenceExpression>().index;
+        return TraceProjectionChainPassthrough(*op.children[0], child_idx, allow_internal_wrappers, depth + 1);
+    }
+    if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+        return trace_binding(expr->Cast<BoundColumnRefExpression>().binding);
+    }
+    if (allow_internal_wrappers && expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+        auto ci = ExtractCompressInfo(op, idx);
+        if (!ci.has_compress) {
+            return DConstants::INVALID_INDEX;
+        }
+        auto &func = expr->Cast<BoundFunctionExpression>();
+        if (func.children.empty()) {
+            return DConstants::INVALID_INDEX;
+        }
+        auto &child = func.children[0];
+        if (child->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+            auto child_idx = child->Cast<BoundReferenceExpression>().index;
+            return TraceProjectionChainPassthrough(*op.children[0], child_idx, allow_internal_wrappers, depth + 1);
+        }
+        if (child->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+            return trace_binding(child->Cast<BoundColumnRefExpression>().binding);
+        }
+    }
+    return DConstants::INVALID_INDEX;
+}
+
 // ============================================================
 // States
 // ============================================================

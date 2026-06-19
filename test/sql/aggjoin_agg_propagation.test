@@ -1,15 +1,15 @@
-# name: test/sql/aggjoin_chain_count.test
-# description: N-relation linear-chain COUNT(*) frequency-propagation logical rewrite (MVP)
+# name: test/sql/aggjoin_agg_propagation.test
+# description: Acyclic aggregate-propagation logical rewrite
 # group: [aggjoin]
 # differential: skip
 #   Uses aggjoin_last_rewrite() fire-assertions, which require the optimizer to be
 #   live (disabled, the marker is always 'none'). Every expected count was taken
 #   from a native (extension-disabled) run, so the differential pass adds nothing.
 #
-# The logical rewrite fires only on large chains with an estimated multiplicity BLOWUP
+# The logical rewrite fires only on large trees with an estimated multiplicity BLOWUP
 # (join product >> inputs); on near-1:1 chains it bails to native (the extra
 # GROUP-BYs would lose). FIRE cases assert BOTH the value AND that the logical rewrite
-# fired (aggjoin_last_rewrite() = 'chain_count'); BAIL cases assert the value is
+# fired (aggjoin_last_rewrite() = 'agg_propagation'); BAIL cases assert the value is
 # still correct via native AND that the logical rewrite did NOT fire. All fixtures are
 # >= 50K rows. The fire-assertion is the only way to test these rewrites — they
 # lower to native HASH_GROUP_BY/HASH_JOIN and are invisible in EXPLAIN.
@@ -49,7 +49,50 @@ WHERE bl_t0.b = bl_t1.b AND bl_t1.c = bl_t2.c;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
+
+# FIRE: projection-wrapped leaves with filters that DuckDB estimates as selective,
+# but table stats prove are no-ops. The planner should recover base leaf
+# cardinality before applying the blowup gate.
+statement ok
+CREATE TABLE nf_t2(c INT);
+
+statement ok
+INSERT INTO nf_t2 SELECT i % 600 FROM range(120000) t(i);
+
+statement ok
+CREATE TABLE nf_t1(b INT, c INT);
+
+statement ok
+INSERT INTO nf_t1 SELECT i, i % 600 FROM range(120000) t(i);
+
+statement ok
+CREATE TABLE nf_t0(b INT);
+
+statement ok
+INSERT INTO nf_t0 SELECT i FROM range(120000) t(i);
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM (SELECT b FROM nf_t0 WHERE b >= 0) f0
+JOIN (SELECT b, c FROM nf_t1 WHERE b IS NOT NULL) f1 ON f0.b = f1.b
+JOIN (SELECT c FROM nf_t2 WHERE c IS NOT NULL) f2 ON f1.c = f2.c;
+----
+24000000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
 
 # ============================================================================
 # FIRE: 4-table chain that collapses 1:1 then fans out 50x -> 3,000,000.
@@ -90,7 +133,7 @@ WHERE q0.b = q1.b AND q1.c = q2.c AND q2.d = q3.d;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # ============================================================================
 # BAIL (1:1 PK-FK chain): no blowup -> native; correct value, logical rewrite did NOT fire.
@@ -129,7 +172,7 @@ WHERE pf0.b = pf1.b AND pf1.c = pf2.c AND pf2.d = pf3.d;
 200000
 
 query T
-SELECT aggjoin_last_rewrite() != 'chain_count';
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
 ----
 true
 
@@ -174,7 +217,7 @@ WHERE sf.k1 = sd1.k AND sf.k2 = sd2.k AND sf.k3 = sd3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # Grouped by a FACT attribute -> the guard is the star CENTER (interior root,
 # which the linear MVP could not handle). 31,250,000 / 4 = 7,812,500 per group.
@@ -194,7 +237,7 @@ GROUP BY sf.m ORDER BY sf.m;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # Grouped by columns on two sibling dimensions. The GROUP BY columns must be
 # carried from separate child folds back to the fact root without collapsing.
@@ -228,7 +271,7 @@ GROUP BY sd1.g1, sd2.g2 ORDER BY sd1.g1, sd2.g2;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # ============================================================================
 # FIRE (grouped): GROUP BY a column on the root endpoint. The group column is
@@ -275,7 +318,7 @@ GROUP BY gc_t0.g ORDER BY gc_t0.g;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE (grouped): GROUP BY columns can live on different tree nodes.
 statement ok
@@ -293,7 +336,7 @@ GROUP BY gc_t0.g, gc_t2.c ORDER BY gc_t0.g, gc_t2.c LIMIT 3;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # ============================================================================
 # BAIL (empty endpoint): COALESCE -> 0 path is only reachable when fired, but the
@@ -354,7 +397,7 @@ WHERE cy_a.x = cy_b.x AND cy_b.y = cy_c.y AND cy_c.z = cy_a.z;
 60000
 
 query T
-SELECT aggjoin_last_rewrite() != 'chain_count';
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
 ----
 true
 
@@ -395,7 +438,7 @@ WHERE st_f.k1 = st_d1.k AND st_f.k2 = st_d2.k AND st_f.k3 = st_d3.k;
 60000
 
 query T
-SELECT aggjoin_last_rewrite() != 'chain_count';
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
 ----
 true
 
@@ -444,7 +487,7 @@ WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: set-safe MIN/MAX (no _freq weight) + COUNT(col) (SUM of _freq over
 # non-null rows) in one ungrouped query.
@@ -460,7 +503,7 @@ WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: AVG grouped by a fact attribute (guard = star center). AVG carries a
 # weighted sum + weighted count pair and divides at the root.
@@ -481,7 +524,7 @@ GROUP BY af.cat ORDER BY af.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: multi-node aggregates — SUM over the fact AND SUM over a DIMENSION
 # (ad1.dn) in the same query, grouped by a fact attribute. Exercises threading
@@ -503,7 +546,7 @@ GROUP BY af.cat ORDER BY af.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: COUNT(*) + SUM + MIN + MAX mixed in one grouped query.
 statement ok
@@ -523,7 +566,7 @@ GROUP BY af.cat ORDER BY af.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: integer SUM (HUGEINT result) is accumulated EXACTLY in HUGEINT through the
 # logical rewrite. Small-value case over af.iv (INT) -- fires and matches native.
@@ -539,7 +582,7 @@ WHERE af.k1 = ad1.k AND af.k2 = ad2.k AND af.k3 = ad3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # ============================================================================
 # EXACT-INTEGER GUARD: SUM over a BIGINT measure whose join-multiplied total
@@ -585,7 +628,7 @@ WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # Grouped exact SUM by a fact attribute (piecewise) -- each group > 2^53.
 statement ok
@@ -605,7 +648,7 @@ GROUP BY bi_f.cat ORDER BY bi_f.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # COUNT(col) + exact SUM mixed: COUNT also accumulates in HUGEINT now.
 statement ok
@@ -620,7 +663,7 @@ WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # AVG over the same BIGINT measure: the numerator (= the SUM above, 3.9e18) exceeds
 # 2^53, so a DOUBLE numerator would round. AVG(integer) keeps numerator AND
@@ -639,7 +682,7 @@ WHERE bi_f.k1 = bi_d1.k AND bi_f.k2 = bi_d2.k AND bi_f.k3 = bi_d3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # Grouped exact AVG(integer) -- each group's numerator also exceeds 2^53.
 statement ok
@@ -659,7 +702,7 @@ GROUP BY bi_f.cat ORDER BY bi_f.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # ============================================================================
 # EXACT-DECIMAL GUARD: SUM over a DECIMAL(18,2) money column. DuckDB SUM(decimal)
@@ -707,7 +750,7 @@ WHERE dc_f.k1 = dc_d1.k AND dc_f.k2 = dc_d2.k AND dc_f.k3 = dc_d3.k;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # Grouped exact DECIMAL SUM -- group 0 carries the odd-cent fact row.
 statement ok
@@ -727,7 +770,7 @@ GROUP BY dc_f.cat ORDER BY dc_f.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # ============================================================================
 # MULTI-COLUMN GROUP BY: GROUP BY columns ride through every fold as persistent
@@ -771,7 +814,7 @@ GROUP BY mc_t0.g1, mc_t0.g2 ORDER BY mc_t0.g1, mc_t0.g2;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: GROUP BY columns on DIFFERENT nodes (mc_t0.g1 + mc_t2.g3).
 statement ok
@@ -792,7 +835,206 @@ GROUP BY mc_t0.g1, mc_t2.g3 ORDER BY mc_t0.g1, mc_t2.g3;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
+
+# ============================================================================
+# FIRE: composite-key acyclic chain. Each join-tree edge can be a vector of bare
+# equality predicates as long as all predicates connect the same pair of leaves.
+# 3-table chain with 12K rows/table, 600 composite keys, 20x fan-out on each
+# side -> 4,800,000 join rows. SUM payload verifies aggregate propagation across
+# composite folds, not just COUNT(*).
+# ============================================================================
+statement ok
+CREATE TABLE ckey_t2(c INT, d INT);
+
+statement ok
+INSERT INTO ckey_t2 SELECT i % 200, i % 3 FROM range(12000) t(i);
+
+statement ok
+CREATE TABLE ckey_t1(a INT, b INT, c INT, d INT, v INT);
+
+statement ok
+INSERT INTO ckey_t1 SELECT i % 200, i % 3, i % 200, i % 3, i % 11 FROM range(12000) t(i);
+
+statement ok
+CREATE TABLE ckey_t0(a INT, b INT);
+
+statement ok
+INSERT INTO ckey_t0 SELECT i % 200, i % 3 FROM range(12000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT COUNT(*), CAST(SUM(ckey_t1.v) AS BIGINT)
+FROM ckey_t0
+JOIN ckey_t1 ON ckey_t0.a = ckey_t1.a AND ckey_t0.b = ckey_t1.b
+JOIN ckey_t2 ON ckey_t1.c = ckey_t2.c AND ckey_t1.d = ckey_t2.d;
+----
+4800000	23998000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+# FIRE: reversed predicate orientation and NULL composite-key rows. The NULL rows
+# must not join, and condition orientation must not affect edge classification.
+statement ok
+ALTER TABLE ckey_t0 ADD COLUMN v0 INT;
+
+statement ok
+UPDATE ckey_t0 SET v0 = (a + b) % 13;
+
+statement ok
+ALTER TABLE ckey_t2 ADD COLUMN v2 INT;
+
+statement ok
+UPDATE ckey_t2 SET v2 = (c * 2 + d) % 17;
+
+statement ok
+INSERT INTO ckey_t0 VALUES (NULL, 0, 123), (0, NULL, 123);
+
+statement ok
+INSERT INTO ckey_t1 VALUES
+  (NULL, 0, 0, 0, 99),
+  (0, NULL, 0, 0, 99),
+  (0, 0, NULL, 0, 99),
+  (0, 0, 0, NULL, 99);
+
+statement ok
+INSERT INTO ckey_t2 VALUES (NULL, 0, 99), (0, NULL, 99);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT COUNT(*), CAST(SUM(ckey_t1.v) AS BIGINT)
+FROM ckey_t0
+JOIN ckey_t1 ON ckey_t1.a = ckey_t0.a AND ckey_t0.b = ckey_t1.b
+JOIN ckey_t2 ON ckey_t2.c = ckey_t1.c AND ckey_t1.d = ckey_t2.d;
+----
+4800000	23998000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+# FIRE: grouped output columns can ride across opposite sides of composite edges.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IIII
+SELECT ckey_t0.b, ckey_t2.d, COUNT(*), CAST(SUM(ckey_t1.v) AS BIGINT)
+FROM ckey_t0
+JOIN ckey_t1 ON ckey_t0.a = ckey_t1.a AND ckey_t0.b = ckey_t1.b
+JOIN ckey_t2 ON ckey_t1.c = ckey_t2.c AND ckey_t1.d = ckey_t2.d
+GROUP BY ckey_t0.b, ckey_t2.d ORDER BY ckey_t0.b, ckey_t2.d;
+----
+0	0	1600000	7998000
+1	1	1600000	8000800
+2	2	1600000	7999200
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+# FIRE: payloads on different leaves propagate across composite folds.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query IIRR
+SELECT CAST(SUM(ckey_t0.v0) AS BIGINT), CAST(SUM(ckey_t1.v) AS BIGINT),
+       ROUND(AVG(ckey_t2.v2), 6), ROUND(VAR_POP(ckey_t2.v2), 6)
+FROM ckey_t0
+JOIN ckey_t1 ON ckey_t0.a = ckey_t1.a AND ckey_t0.b = ckey_t1.b
+JOIN ckey_t2 ON ckey_t1.c = ckey_t2.c AND ckey_t1.d = ckey_t2.d;
+----
+28440000	23998000	7.928333	23.889864
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+# FIRE: mixed integer widths on composite keys require widening casts.
+statement ok
+CREATE TABLE cw_t2(c INTEGER, d BIGINT);
+
+statement ok
+INSERT INTO cw_t2 SELECT (i % 200)::INTEGER, (i % 3)::BIGINT FROM range(12000) t(i);
+
+statement ok
+CREATE TABLE cw_t1(a INTEGER, b BIGINT, c SMALLINT, d INTEGER, v INT);
+
+statement ok
+INSERT INTO cw_t1 SELECT (i % 200)::INTEGER, (i % 3)::BIGINT, (i % 200)::SMALLINT, (i % 3)::INTEGER, i % 11 FROM range(12000) t(i);
+
+statement ok
+CREATE TABLE cw_t0(a SMALLINT, b TINYINT);
+
+statement ok
+INSERT INTO cw_t0 SELECT (i % 200)::SMALLINT, (i % 3)::TINYINT FROM range(12000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query II
+SELECT COUNT(*), CAST(SUM(cw_t1.v) AS BIGINT)
+FROM cw_t0
+JOIN cw_t1 ON cw_t0.a = cw_t1.a AND cw_t0.b = cw_t1.b
+JOIN cw_t2 ON cw_t1.c = cw_t2.c AND cw_t1.d = cw_t2.d;
+----
+4800000	23998000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+# BAIL: low-fanout composite keys should not trust an inflated join estimate
+# alone. Disable the fused operator so this specifically validates the logical
+# Yannakakis gate.
+statement ok
+CREATE TABLE ckg0(a INT, b INT);
+
+statement ok
+INSERT INTO ckg0 SELECT i::INT, 0::INT FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ckg1(a INT, b INT, c INT, d INT);
+
+statement ok
+INSERT INTO ckg1 SELECT i::INT, 0::INT, i::INT, 0::INT FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ckg2(c INT, d INT);
+
+statement ok
+INSERT INTO ckg2 SELECT i::INT, 0::INT FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*) FROM ckg0
+JOIN ckg1 ON ckg0.a = ckg1.a AND ckg0.b = ckg1.b
+JOIN ckg2 ON ckg1.c = ckg2.c AND ckg1.d = ckg2.d;
+----
+60000
+
+query T
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
+----
+true
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);
 
 # ============================================================================
 # SET-SAFE AGGREGATES: BOOL_AND / BOOL_OR / BIT_AND / BIT_OR are idempotent under
@@ -832,7 +1074,7 @@ false	true	0	63
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: grouped set-safe aggregates.
 statement ok
@@ -849,7 +1091,7 @@ GROUP BY ss_t0.cat ORDER BY ss_t0.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # BAIL: BIT_XOR is multiplicity-sensitive (x ^ x = 0) -> stays native; value correct.
 statement ok
@@ -862,7 +1104,7 @@ WHERE ss_t0.b = ss_t1.b AND ss_t1.c = ss_t2.c;
 0
 
 query T
-SELECT aggjoin_last_rewrite() != 'chain_count';
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
 ----
 true
 
@@ -907,7 +1149,7 @@ FROM vr_t0, vr_t1, vr_t2 WHERE vr_t0.b = vr_t1.b AND vr_t1.c = vr_t2.c;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: VARIANCE = VAR_SAMP, STDDEV = STDDEV_SAMP (SQL-standard sample defaults).
 statement ok
@@ -922,7 +1164,7 @@ FROM vr_t0, vr_t1, vr_t2 WHERE vr_t0.b = vr_t1.b AND vr_t1.c = vr_t2.c;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: grouped VAR_POP by a fact attribute.
 statement ok
@@ -939,7 +1181,7 @@ GROUP BY vr_t0.cat ORDER BY vr_t0.cat;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: a BIGINT input now fires when column STATISTICS bound the actual values
 # small enough that the exact HUGEINT moment can't overflow.  bv holds 0..96, so
@@ -964,7 +1206,7 @@ WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # FIRE: UBIGINT and HUGEINT inputs fire identically — same stats-driven admission
 # (bounded 0..96), same exact value.  The moment accumulates in HUGEINT regardless
@@ -981,7 +1223,7 @@ WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 statement ok
 SELECT aggjoin_reset_rewrite_marker();
@@ -995,7 +1237,7 @@ WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
 query T
 SELECT aggjoin_last_rewrite();
 ----
-chain_count
+agg_propagation
 
 # BAIL: the same column scaled up (bh ~ values × 1e14) overflows the exact moment,
 # so the stats-driven overflow guard still bails to native.
@@ -1007,6 +1249,6 @@ SELECT VAR_POP(vr_big.bh) FROM vr_big, vr_t1, vr_t2
 WHERE vr_big.b = vr_t1.b AND vr_t1.c = vr_t2.c;
 
 query T
-SELECT aggjoin_last_rewrite() != 'chain_count';
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
 ----
 true

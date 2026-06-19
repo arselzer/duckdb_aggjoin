@@ -73,6 +73,8 @@ build/Release/duckdb < benchmarks/bench_sparse_gate.sql
 build/Release/duckdb < benchmarks/bench_hash_nonintegral.sql
 build/Release/duckdb < benchmarks/bench_nulls.sql
 build/Release/duckdb < benchmarks/bench_composite_keys.sql
+build/Release/duckdb < benchmarks/bench_yannakakis_composite_keys.sql
+build/Release/duckdb < benchmarks/bench_yannakakis_expression_keys.sql
 build/Release/duckdb < benchmarks/bench_latency.sql
 build/Release/duckdb < benchmarks/bench_memory.sql
 build/Release/duckdb < benchmarks/bench_varchar.sql
@@ -109,6 +111,10 @@ benchmarks/run_with_timeout.sh benchmarks/bench_build_side_suite.sql 120
 - `AGGJOIN_TRACE=1` logs planner fire/bail reasons. `AGGJOIN_TRACE_STATS=1`
   additionally logs runtime path and observed row/group counts, which is useful
   for the targeted path-validation benchmarks below.
+- `bench_yannakakis_expression_keys.sql` validates the conservative planner
+  guard for deterministic single derived-key joins and the logical rewrite path
+  for composite computed-key edges. It also keeps a filtered-projection case as
+  a guardrail for the current conservative planner gate.
 - `bench_varchar_dense.sql` is the direct benchmark for the new narrow single-key
   `VARCHAR` hash path for numeric `SUM/COUNT/AVG/MIN/MAX`. `bench_varchar_keys.sql`
   remains a wrapper-based smoke test.
@@ -142,6 +148,22 @@ benchmarks/run_with_timeout.sh benchmarks/bench_build_side_suite.sql 120
   a smoke test, not a primary performance result.
 - The latest local run used the standard current build with planner gating enabled.
   The targeted follow-up suites below completed cleanly.
+
+## Planner Decision Matrix
+
+The current planner gate is intentionally conservative. These are the expected
+decisions for the aggregate-propagation family and its nearest guardrails:
+
+| Pattern | Expected planner decision | Coverage |
+|---------|---------------------------|----------|
+| High-blowup bare-key acyclic trees | rewrite to `agg_propagation` | `test/sql/aggjoin_agg_propagation.test` |
+| Projection-wrapped leaves with provably no-op filters | rewrite to `agg_propagation` when the recovered base cardinality still passes the blowup gate | `test/sql/aggjoin_agg_propagation.test` |
+| Composite equality edges | rewrite to `agg_propagation` when fanout/domain stats show duplicate density | `bench_yannakakis_composite_keys.sql` |
+| Composite deterministic computed-key edges | rewrite to `agg_propagation` | `bench_yannakakis_expression_keys.sql` |
+| Deterministic single derived-key-only trees | stay native unless the blowup signal is exceptionally large | `bench_yannakakis_expression_keys.sql` |
+| Filtered projected aliases with single derived keys | stay native on the current benchmarked shape | `bench_yannakakis_expression_keys.sql` |
+| Volatile/subquery/multi-leaf/non-equality/explicit-`NULL` key expressions | stay native | `test/sql/aggjoin_yannakakis_expression_rejects.test` |
+| Low-fanout or near-1:1 trees | stay native | `test/sql/aggjoin_low_fanout_gate.test` |
 
 Historical core/scaling/asymmetric shape studies now live in
 [shape_comparisons/README.md](../shape_comparisons/README.md). The rest of this

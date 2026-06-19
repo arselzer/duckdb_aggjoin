@@ -149,7 +149,7 @@ bool TryRewriteNativeMixedSidePreagg(ClientContext &context, Optimizer &optimize
         info.on_build = col.agg_on_build[a];
         auto child_idx = resolve_binding(*ba.children[0]);
         auto join_idx = child_idx == DConstants::INVALID_INDEX ? DConstants::INVALID_INDEX
-                                                               : TraceProjectionChain(agg_child, child_idx);
+                                                               : TraceProjectionChainPassthrough(agg_child, child_idx);
         if (join_idx == DConstants::INVALID_INDEX || join_idx >= join_bindings.size()) {
             if (AggJoinTraceEnabled()) fprintf(stderr, "[AGGJOIN] native-mixed-side skip: failed to trace agg binding\n");
             return false;

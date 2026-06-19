@@ -26,16 +26,20 @@ Owns optimizer registration, env/test knobs, and the thin entry point into the r
 
 - `src/aggjoin_logical.cpp`
 - `src/aggjoin_rewrites.cpp`
+- `src/aggjoin_rewrite_agg_propagation.cpp`
 - `src/aggjoin_rewrite_build.cpp`
 - `src/aggjoin_rewrite_mixed.cpp`
 - `src/include/aggjoin_rewrites_internal.hpp`
+- `src/include/aggjoin_stats.hpp`
 
 Responsibilities:
 
 - pattern matching on aggregate-over-join shapes
 - cost/gating logic
+- aggregate-propagation rewrites for high-blowup acyclic join trees
 - native build-preagg rewrites
 - native mixed-side rewrites
+- planner statistics helpers for key domains, fanout estimates, and no-op filter proof
 - construction of the logical extension operator
 
 ### Physical operator shell
@@ -122,8 +126,9 @@ Responsibilities:
 
 ## Rewrite families
 
-The optimizer currently has two major native-lowering families:
+The optimizer currently has three major native-lowering families:
 
+- aggregate propagation over high-blowup acyclic join trees
 - build-side native preaggregation
 - mixed-side native preaggregation
 

@@ -75,7 +75,7 @@ void SetAggJoinTestHTCapacity(int64_t capacity) {
 // ── Per-path enable/disable ─────────────────────────────────────────────────
 // The extension bundles two independent mechanisms in one optimizer pass:
 //   * logical rewrites — preaggregation/join-tree rewrites lowered entirely to
-//                        native DuckDB operators (chain-count / final-bag /
+//                        native DuckDB operators (agg-propagation / final-bag /
 //                        mixed / build). No custom execution code.
 //   * the operator     — the fused PhysicalAggJoin (custom in-memory execution).
 // These flags let a deployment run one without the other (e.g. ship the proven

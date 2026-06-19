@@ -215,8 +215,9 @@ bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer
     CompressInfo group_compress;
     if (grouped) {
         auto group_child_idx = resolve_binding(*agg.groups[0]);
-        auto group_join_idx = group_child_idx == DConstants::INVALID_INDEX ? DConstants::INVALID_INDEX
-                                                                           : TraceProjectionChain(agg_child, group_child_idx);
+        auto group_join_idx = group_child_idx == DConstants::INVALID_INDEX
+                                  ? DConstants::INVALID_INDEX
+                                  : TraceProjectionChainPassthrough(agg_child, group_child_idx, true);
         if (group_join_idx == DConstants::INVALID_INDEX || group_join_idx >= top_join_bindings.size() ||
             top_join_bindings[group_join_idx] != pattern.head_key_binding) {
             if (AggJoinTraceEnabled()) {
@@ -253,7 +254,7 @@ bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer
         }
         auto child_idx = resolve_binding(*ba.children[0]);
         auto join_idx = child_idx == DConstants::INVALID_INDEX ? DConstants::INVALID_INDEX
-                                                               : TraceProjectionChain(agg_child, child_idx);
+                                                               : TraceProjectionChainPassthrough(agg_child, child_idx);
         if (join_idx == DConstants::INVALID_INDEX || join_idx >= top_join_bindings.size()) {
             return false;
         }

@@ -108,6 +108,8 @@ PhysicalOperator &CreatePhysicalAggJoinPlan(LogicalAggJoin &op, ClientContext &c
 CompressInfo ExtractCompressInfo(LogicalOperator &op, idx_t idx);
 CompressInfo FindCompressInChain(LogicalOperator &op, idx_t idx);
 idx_t TraceProjectionChain(LogicalOperator &op, idx_t idx, int depth = 0);
+idx_t TraceProjectionChainPassthrough(LogicalOperator &op, idx_t idx, bool allow_internal_wrappers = false,
+                                      int depth = 0);
 
 void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
                     AggJoinRewriteState &state, bool has_parent);

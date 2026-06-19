@@ -1,27 +1,10 @@
+#include "aggjoin_stats.hpp"
 #include "aggjoin_rewrites_internal.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
-
-#include <cmath>
-#include <limits>
 
 namespace duckdb {
 
 namespace {
-
-bool ExtractStatsBinding(Expression &expr, ColumnBinding &binding) {
-    auto cls = expr.GetExpressionClass();
-    if (cls == ExpressionClass::BOUND_COLUMN_REF) {
-        binding = expr.Cast<BoundColumnRefExpression>().binding;
-        return true;
-    }
-    if (cls == ExpressionClass::BOUND_CAST) {
-        return ExtractStatsBinding(*expr.Cast<BoundCastExpression>().child, binding);
-    }
-    return false;
-}
 
 bool IsIntegralPhysicalType(PhysicalType type) {
     switch (type) {
@@ -37,72 +20,6 @@ bool IsIntegralPhysicalType(PhysicalType type) {
     default:
         return false;
     }
-}
-
-bool TryGetIntegerKeyDomainFromStats(ClientContext &context, LogicalOperator &op, ColumnBinding binding,
-                                     idx_t &domain) {
-    LogicalOperator *cur = &op;
-    while (cur) {
-        if (cur->type == LogicalOperatorType::LOGICAL_GET) {
-            auto &get = cur->Cast<LogicalGet>();
-            if (binding.table_index != get.table_index) {
-                return false;
-            }
-            auto &col_ids = get.GetColumnIds();
-            if (binding.column_index >= col_ids.size()) {
-                return false;
-            }
-            auto col_idx = col_ids[binding.column_index];
-            unique_ptr<BaseStatistics> stats;
-#if __has_include("duckdb/main/extension_callback_manager.hpp")
-            if (get.function.statistics_extended) {
-                TableFunctionGetStatisticsInput input(get.bind_data.get(), col_idx);
-                stats = get.function.statistics_extended(context, input);
-            } else if (get.function.statistics) {
-                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
-            } else {
-                return false;
-            }
-#else
-            if (get.function.statistics) {
-                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
-            } else {
-                return false;
-            }
-#endif
-            if (!stats || !NumericStats::HasMinMax(*stats)) {
-                return false;
-            }
-            auto min_value = NumericStats::Min(*stats).GetValue<double>();
-            auto max_value = NumericStats::Max(*stats).GetValue<double>();
-            if (!std::isfinite(min_value) || !std::isfinite(max_value) || max_value < min_value) {
-                return false;
-            }
-            auto domain_d = max_value - min_value + 1.0;
-            if (domain_d <= 0 || domain_d > static_cast<double>(std::numeric_limits<idx_t>::max())) {
-                return false;
-            }
-            domain = static_cast<idx_t>(domain_d);
-            return domain > 0;
-        }
-        if (cur->type == LogicalOperatorType::LOGICAL_PROJECTION && cur->children.size() == 1) {
-            auto &proj = cur->Cast<LogicalProjection>();
-            if (binding.table_index != proj.table_index || binding.column_index >= proj.expressions.size()) {
-                return false;
-            }
-            if (!ExtractStatsBinding(*proj.expressions[binding.column_index], binding)) {
-                return false;
-            }
-            cur = cur->children[0].get();
-            continue;
-        }
-        if (cur->children.size() == 1) {
-            cur = cur->children[0].get();
-            continue;
-        }
-        return false;
-    }
-    return false;
 }
 
 } // namespace
@@ -217,9 +134,10 @@ bool TryRewriteNativeBuildPreagg(ClientContext &context, Optimizer &optimizer, u
             idx_t probe_key_domain = 0;
             idx_t build_key_domain = 0;
             if (key_idx < probe_bindings.size() && col.build_key_cols[0] < build_bindings.size() &&
-                TryGetIntegerKeyDomainFromStats(context, probe_side, probe_bindings[key_idx], probe_key_domain) &&
-                TryGetIntegerKeyDomainFromStats(context, build_side, build_bindings[col.build_key_cols[0]],
-                                                build_key_domain)) {
+                AggJoinTryGetIntegerKeyDomainFromStats(context, probe_side, probe_bindings[key_idx],
+                                                       probe_key_domain) &&
+                AggJoinTryGetIntegerKeyDomainFromStats(context, build_side, build_bindings[col.build_key_cols[0]],
+                                                       build_key_domain)) {
                 dense_duplicate_build_keys = build_est >= build_key_domain &&
                                              build_est - build_key_domain >= build_key_domain / 2;
                 probe_preagg_reduces_rows = probe_est / 2 >= probe_key_domain;
@@ -284,7 +202,7 @@ bool TryRewriteNativeBuildPreagg(ClientContext &context, Optimizer &optimizer, u
         }
         auto child_idx = resolve_binding(*ba.children[0]);
         auto join_idx = child_idx == DConstants::INVALID_INDEX ? DConstants::INVALID_INDEX
-                                                               : TraceProjectionChain(agg_child, child_idx);
+                                                               : TraceProjectionChainPassthrough(agg_child, child_idx);
         if (AggJoinTraceEnabled()) {
             fprintf(stderr, "[AGGJOIN] native-build-preagg agg%llu child_idx=%llu join_idx=%llu\n",
                     (unsigned long long)a, (unsigned long long)child_idx, (unsigned long long)join_idx);

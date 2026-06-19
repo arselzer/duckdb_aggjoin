@@ -1,0 +1,143 @@
+# name: test/sql/aggjoin_yannakakis_expression_rejects.test
+# description: Negative coverage for expression join keys outside the safe Yannakakis rewrite envelope.
+# group: [aggjoin]
+# differential: skip
+
+require aggjoin
+
+statement ok
+PRAGMA threads=1;
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+statement ok
+CREATE TABLE ny0(id INT, g INT, v INT);
+
+statement ok
+INSERT INTO ny0
+SELECT i::INT, (i % 5)::INT, (i % 997)::INT
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ny1(k INT, c INT, v1 INT);
+
+statement ok
+INSERT INTO ny1
+SELECT (i + 1)::INT, (i % 600)::INT, (i % 1009)::INT
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ny2(c_key INT, g2 INT, v2 INT);
+
+statement ok
+INSERT INTO ny2
+SELECT ((i % 600) + 2)::INT, (i % 7)::INT, (i % 991)::INT
+FROM range(60000) t(i);
+
+# Volatile key expression.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE ny_volatile AS
+SELECT COUNT(*) AS cnt
+FROM ny0
+JOIN ny1 ON ny0.id + CAST(random() AS INTEGER) = ny1.k
+JOIN ny2 ON ny1.c = ny2.c_key - 2;
+
+query T
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
+----
+true
+
+statement ok
+DROP TABLE ny_volatile;
+
+# Constant-only key side does not connect two leaves.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM ny0
+JOIN ny1 ON ny0.id + 1 = ny1.k
+JOIN ny2 ON 1 = ny2.c_key;
+----
+0
+
+query T
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
+----
+true
+
+# Key expression spanning two leaves on one side.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM ny0
+JOIN ny1 ON ny0.id + 1 = ny1.k
+JOIN ny2 ON ny0.id + ny1.c = ny2.c_key;
+----
+30100
+
+query T
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
+----
+true
+
+# Scalar subquery inside key expression.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM ny0
+JOIN ny1 ON ny0.id + (SELECT MIN(g) FROM ny0) = ny1.k
+JOIN ny2 ON ny1.c = ny2.c_key - 2;
+----
+5999900
+
+query T
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
+----
+true
+
+# Non-equality join predicates are outside the equi-join tree.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM ny0
+JOIN ny1 ON ny0.id + 1 = ny1.k
+JOIN ny2 ON ny1.c < ny2.c_key AND ny2.c_key < ny1.c + 3;
+----
+11990000
+
+query T
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
+----
+true
+
+# Explicit NULL constants in computed key expressions stay native.
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM ny0
+JOIN ny1 ON ny0.id + NULL = ny1.k
+JOIN ny2 ON ny1.c = ny2.c_key - 2;
+----
+0
+
+query T
+SELECT aggjoin_last_rewrite() != 'agg_propagation';
+----
+true
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);

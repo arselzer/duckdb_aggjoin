@@ -25,7 +25,7 @@ void SetAggJoinOperatorEnabled(bool enabled);
 const char *GetAggJoinLastRewrite();
 void ResetAggJoinLastRewrite();
 
-// Returns which AggJoin rewrite path last fired ("chain_count", "final_bag",
+// Returns which AggJoin rewrite path last fired ("agg_propagation", "final_bag",
 // "native_build", "native_mixed", "fused", or "none"). The native-lowering
 // rewrites are invisible in EXPLAIN, so this is the fire-assertion mechanism for
 // sqllogictest. Reset the marker, run the query, then read it.
@@ -78,10 +78,6 @@ static void RegisterAggJoinTestFunctions(ExtensionLoader &loader) {
     // Per-path enable/disable (logical rewrites vs. fused operator), runtime-settable.
     loader.RegisterFunction(
         ScalarFunction("aggjoin_set_logical_rewrites_enabled", {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
-                       AggjoinSetLogicalRewritesEnabledFunction));
-    // Compatibility alias for older tests/scripts.
-    loader.RegisterFunction(
-        ScalarFunction("aggjoin_set_cascade_enabled", {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
                        AggjoinSetLogicalRewritesEnabledFunction));
     loader.RegisterFunction(
         ScalarFunction("aggjoin_set_operator_enabled", {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,

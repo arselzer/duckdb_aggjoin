@@ -1,6 +1,7 @@
 #include "aggjoin_optimizer_shared.hpp"
 #include "aggjoin_rewrites_internal.hpp"
 #include "aggjoin_runtime.hpp"
+#include "aggjoin_stats.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -13,19 +14,14 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
-
-#include <limits>
 
 namespace duckdb {
 // Optimizer: post-optimize with Projection chain tracing
 // ============================================================
 
 // IsBareColumnKey lives in aggjoin_rewrites_internal.hpp (shared with the
-// chain-COUNT rewrite). (Review bug B, 2026-06-15.)
+// aggregate-propagation rewrite). (Review bug B, 2026-06-15.)
 
 static bool IsEquiJoin(LogicalOperator &op) {
     if(op.type!=LogicalOperatorType::LOGICAL_COMPARISON_JOIN) return false;
@@ -37,6 +33,22 @@ static bool IsEquiJoin(LogicalOperator &op) {
         // keys (LOWER(x)=LOWER(y), x+1=y) which the runtime would otherwise join
         // on the raw column, silently dropping the function. (Review bug B.)
         if(!IsBareColumnKey(*c.left) || !IsBareColumnKey(*c.right)) return false;
+    }
+    return !j.conditions.empty();
+}
+
+static bool IsInnerEqualityJoin(LogicalOperator &op) {
+    if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+        return false;
+    }
+    auto &j = op.Cast<LogicalComparisonJoin>();
+    if (j.join_type != JoinType::INNER) {
+        return false;
+    }
+    for (auto &c : j.conditions) {
+        if (c.comparison != ExpressionType::COMPARE_EQUAL) {
+            return false;
+        }
     }
     return !j.conditions.empty();
 }
@@ -55,18 +67,6 @@ static bool ExtractBinding(Expression &expr, ColumnBinding &binding) {
                 return true;
             }
         }
-    }
-    return false;
-}
-
-static bool ExtractStatsBinding(Expression &expr, ColumnBinding &binding) {
-    auto cls = expr.GetExpressionClass();
-    if (cls == ExpressionClass::BOUND_COLUMN_REF) {
-        binding = expr.Cast<BoundColumnRefExpression>().binding;
-        return true;
-    }
-    if (cls == ExpressionClass::BOUND_CAST) {
-        return ExtractStatsBinding(*expr.Cast<BoundCastExpression>().child, binding);
     }
     return false;
 }
@@ -100,25 +100,6 @@ static bool IsDoubleExactMinMaxPayload(const LogicalType &type) {
     default:
         return false;
     }
-}
-
-static bool TryGetDomainFromMinMax(int64_t min_value, int64_t max_value, idx_t &domain) {
-    if (max_value < min_value) {
-        return false;
-    }
-    __int128 range_wide = (__int128)max_value - (__int128)min_value + 1;
-    if (range_wide <= 0 || range_wide > (__int128)std::numeric_limits<idx_t>::max()) {
-        return false;
-    }
-    domain = (idx_t)range_wide;
-    return domain > 0;
-}
-
-static bool AtLeastRatio(idx_t value, idx_t base, idx_t numerator, idx_t denominator) {
-    if (base == 0 || denominator == 0) {
-        return false;
-    }
-    return (__int128)value * (__int128)denominator >= (__int128)base * (__int128)numerator;
 }
 
 static bool IsBuildAgg(const AggJoinColInfo &col, idx_t agg_idx) {
@@ -183,101 +164,6 @@ static idx_t DirectAggBytesPerKey(const AggJoinColInfo &col) {
            sizeof(uint8_t) * has_slots;
 }
 
-static bool StatsValueToInt64(const Value &value, int64_t &out) {
-    if (value.IsNull()) {
-        return false;
-    }
-    switch (value.type().InternalType()) {
-    case PhysicalType::INT8:
-        out = value.GetValue<int8_t>();
-        return true;
-    case PhysicalType::INT16:
-        out = value.GetValue<int16_t>();
-        return true;
-    case PhysicalType::INT32:
-        out = value.GetValue<int32_t>();
-        return true;
-    case PhysicalType::INT64:
-        out = value.GetValue<int64_t>();
-        return true;
-    case PhysicalType::UINT8:
-        out = value.GetValue<uint8_t>();
-        return true;
-    case PhysicalType::UINT16:
-        out = value.GetValue<uint16_t>();
-        return true;
-    case PhysicalType::UINT32:
-        out = value.GetValue<uint32_t>();
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool TryGetIntegerKeyMinMaxFromStats(ClientContext &context, LogicalOperator &op, ColumnBinding binding,
-                                            int64_t &min_out, int64_t &max_out) {
-    LogicalOperator *cur = &op;
-    while (cur) {
-        if (cur->type == LogicalOperatorType::LOGICAL_GET) {
-            auto &get = cur->Cast<LogicalGet>();
-            if (binding.table_index != get.table_index) {
-                return false;
-            }
-            auto &col_ids = get.GetColumnIds();
-            if (binding.column_index >= col_ids.size()) {
-                return false;
-            }
-            auto col_idx = col_ids[binding.column_index];
-            unique_ptr<BaseStatistics> stats;
-#if __has_include("duckdb/main/extension_callback_manager.hpp")
-            if (get.function.statistics_extended) {
-                TableFunctionGetStatisticsInput input(get.bind_data.get(), col_idx);
-                stats = get.function.statistics_extended(context, input);
-            } else if (get.function.statistics) {
-                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
-            } else {
-                return false;
-            }
-#else
-            if (get.function.statistics) {
-                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
-            } else {
-                return false;
-            }
-#endif
-            if (!stats || !NumericStats::HasMinMax(*stats)) {
-                return false;
-            }
-            int64_t min_value, max_value;
-            if (!StatsValueToInt64(NumericStats::Min(*stats), min_value) ||
-                !StatsValueToInt64(NumericStats::Max(*stats), max_value) ||
-                max_value < min_value) {
-                return false;
-            }
-            min_out = min_value;
-            max_out = max_value;
-            return true;
-        }
-        if (cur->type == LogicalOperatorType::LOGICAL_PROJECTION && cur->children.size() == 1) {
-            auto &proj = cur->Cast<LogicalProjection>();
-            if (binding.table_index != proj.table_index || binding.column_index >= proj.expressions.size()) {
-                return false;
-            }
-            if (!ExtractStatsBinding(*proj.expressions[binding.column_index], binding)) {
-                return false;
-            }
-            cur = cur->children[0].get();
-            continue;
-        }
-        if (cur->children.size() == 1) {
-            cur = cur->children[0].get();
-            continue;
-        }
-        return false;
-    }
-    return false;
-}
-
 static bool IsAggregate(LogicalOperator &op) {
     if(op.type!=LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) return false;
     auto &a=op.Cast<LogicalAggregate>();
@@ -322,6 +208,16 @@ static LogicalComparisonJoin *FindJoin(LogicalOperator &op) {
     return nullptr;
 }
 
+static LogicalComparisonJoin *FindInnerEqualityJoin(LogicalOperator &op) {
+    if (IsInnerEqualityJoin(op)) {
+        return &op.Cast<LogicalComparisonJoin>();
+    }
+    if (op.type == LogicalOperatorType::LOGICAL_PROJECTION && op.children.size() == 1) {
+        return FindInnerEqualityJoin(*op.children[0]);
+    }
+    return nullptr;
+}
+
 // A correlated subquery is decorrelated into DELIM_JOIN / DELIM_GET (and, before
 // decorrelation, DEPENDENT_JOIN) nodes: a DELIM_GET replays the OUTER query's
 // tuples into the inner plan. An aggregate matched over such a subtree depends on
@@ -362,17 +258,17 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         return;
     }
 
-    // The chain-count logical rewrite lowers entirely to native operators and has complete
+    // The agg-propagation logical rewrite lowers entirely to native operators and has complete
     // internal gating, including an EXACT-HUGEINT path for integer SUM (whose
     // HUGEINT result the shared IsAggregate gate below excludes for the Value-heavy
     // operator paths). Try it FIRST, before that gate, so integer SUM is not
     // blocked; it bails cleanly on every shape it does not own.
     if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1) {
-        if (auto *cc_join = FindJoin(*op->children[0])) {
+        if (auto *cc_join = FindInnerEqualityJoin(*op->children[0])) {
             auto &cc_agg = op->Cast<LogicalAggregate>();
             auto &cc_child = *op->children[0];
             if (AggJoinLogicalRewritesEnabled() &&
-                TryRewriteNativeChainCountStar(context, optimizer, op, cc_agg, *cc_join, cc_child, state, has_parent)) {
+                TryRewriteNativeAggPropagation(context, optimizer, op, cc_agg, *cc_join, cc_child, state, has_parent)) {
                 return;
             }
         }
@@ -386,8 +282,8 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
     auto &agg = op->Cast<LogicalAggregate>();
     auto &agg_child = *op->children[0]; // Projection chain above Join
 
-    // final-bag covers the SUM/MIN/MAX/AVG split-payload shapes the chain-count
-    // logical rewrite declines (chain-count was already attempted above).
+    // final-bag covers the SUM/MIN/MAX/AVG split-payload shapes the agg-propagation
+    // logical rewrite declines (agg-propagation was already attempted above).
     if (AggJoinLogicalRewritesEnabled() &&
         TryRewriteNativeFinalBagPreagg(context, optimizer, op, agg, *join, agg_child, state, has_parent)) {
         return;
@@ -456,7 +352,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         auto agg_idx = resolveBinding(*g);
         if (agg_idx == DConstants::INVALID_INDEX) { return; }
         auto ci = FindCompressInChain(agg_child, agg_idx);
-        auto join_idx = TraceProjectionChain(agg_child, agg_idx);
+        auto join_idx = TraceProjectionChainPassthrough(agg_child, agg_idx, true);
         if(join_idx==DConstants::INVALID_INDEX) return;
         if (join_idx >= join_bindings.size()) return;
         auto &b = join_bindings[join_idx];
@@ -471,7 +367,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
         }
         if (si == DConstants::INVALID_INDEX) { return; }
         resolved_groups.push_back({is_p, si, ci});
-       
+
     }
 
     for(auto &e : agg.expressions) {
@@ -529,7 +425,7 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
             }
             return;
         }
-        auto join_idx = TraceProjectionChain(agg_child, agg_child_idx);
+        auto join_idx = TraceProjectionChainPassthrough(agg_child, agg_child_idx);
         if (join_idx == DConstants::INVALID_INDEX || join_idx >= join_bindings.size()) {
             if (AggJoinTraceEnabled()) {
                 fprintf(stderr,
@@ -776,23 +672,27 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
                 int64_t build_key_max = 0;
                 if (probe_key_idx < probe_plan_bindings.size() &&
                     build_key_idx < build_plan_bindings.size() &&
-                    TryGetIntegerKeyMinMaxFromStats(context, build_child,
-                                                    build_plan_bindings[build_key_idx],
-                                                    build_key_min, build_key_max)) {
+                    AggJoinTryGetIntegerKeyMinMaxFromStats(context, build_child,
+                                                           build_plan_bindings[build_key_idx],
+                                                           build_key_min, build_key_max)) {
                     idx_t planned_range = 0;
-                    if (TryGetDomainFromMinMax(build_key_min, build_key_max, planned_range)) {
+                    if (AggJoinTryGetDomainFromMinMax(build_key_min, build_key_max, planned_range)) {
                         stats_build_key_domain = planned_range;
                         int64_t probe_key_min = 0;
                         int64_t probe_key_max = 0;
-                        if (TryGetIntegerKeyMinMaxFromStats(context, probe_child,
-                                                            probe_plan_bindings[probe_key_idx],
-                                                            probe_key_min, probe_key_max) &&
-                            TryGetDomainFromMinMax(probe_key_min, probe_key_max, stats_probe_key_domain)) {
+                        if (AggJoinTryGetIntegerKeyMinMaxFromStats(context, probe_child,
+                                                                   probe_plan_bindings[probe_key_idx],
+                                                                   probe_key_min, probe_key_max) &&
+                            AggJoinTryGetDomainFromMinMax(probe_key_min, probe_key_max, stats_probe_key_domain)) {
                             bool probe_range_covered = probe_key_min >= build_key_min && probe_key_max <= build_key_max;
-                            bool build_density_at_least_1_5x = AtLeastRatio(build_est, stats_build_key_domain, 3, 2);
-                            bool build_density_at_least_3x = AtLeastRatio(build_est, stats_build_key_domain, 3, 1);
-                            bool build_density_at_least_4x = AtLeastRatio(build_est, stats_build_key_domain, 4, 1);
-                            bool build_density_at_least_32x = AtLeastRatio(build_est, stats_build_key_domain, 32, 1);
+                            bool build_density_at_least_1_5x =
+                                AggJoinAtLeastRatio(build_est, stats_build_key_domain, 3, 2);
+                            bool build_density_at_least_3x =
+                                AggJoinAtLeastRatio(build_est, stats_build_key_domain, 3, 1);
+                            bool build_density_at_least_4x =
+                                AggJoinAtLeastRatio(build_est, stats_build_key_domain, 4, 1);
+                            bool build_density_at_least_32x =
+                                AggJoinAtLeastRatio(build_est, stats_build_key_domain, 32, 1);
                             stats_planned_direct_borderline_fanout =
                                 probe_range_covered && build_density_at_least_1_5x;
                             stats_planned_direct_build_fanout =
@@ -905,13 +805,13 @@ void WalkAndReplace(ClientContext &context, Optimizer &optimizer, unique_ptr<Log
             (planned_direct_parallel_shape && stats_planned_direct_borderline_fanout);
         bool planned_direct_build_side_fanout = planned_direct_parallel_shape && has_build_aggs &&
                                                 join_known && probe_est > 0 &&
-                                                AtLeastRatio(join_est, probe_est, 3, 1);
+                                                AggJoinAtLeastRatio(join_est, probe_est, 3, 1);
         planned_direct_build_side_fanout =
             planned_direct_build_side_fanout ||
             (planned_direct_parallel_shape && has_build_aggs && stats_planned_direct_build_fanout);
         bool planned_direct_build_side_strong_fanout = planned_direct_parallel_shape && has_build_aggs &&
                                                        join_known && probe_est > 0 &&
-                                                       AtLeastRatio(join_est, probe_est, 32, 1);
+                                                       AggJoinAtLeastRatio(join_est, probe_est, 32, 1);
         planned_direct_build_side_strong_fanout =
             planned_direct_build_side_strong_fanout ||
             (planned_direct_parallel_shape && has_build_aggs && stats_planned_direct_build_strong_fanout);

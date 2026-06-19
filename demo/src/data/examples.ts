@@ -3,7 +3,7 @@
 // browser's single-threaded engine — slower, so the speedup is visible, but not
 // so large it OOMs. CREATE OR REPLACE makes re-running a card idempotent.
 
-export type ExampleKind = 'operator' | 'cascade'
+export type ExampleKind = 'operator' | 'propagation'
 
 export interface Example {
   id: string
@@ -18,7 +18,7 @@ export interface Example {
 
 export const KIND_LABEL: Record<ExampleKind, string> = {
   operator: 'Fused operator',
-  cascade: 'Native rewrite · Yannakakis',
+  propagation: 'Native rewrite · aggregate propagation',
 }
 
 export const examples: Example[] = [
@@ -85,9 +85,9 @@ ORDER BY band_r.band;`,
   {
     id: 'chain-aggregate-suite',
     title: 'Chain aggregate suite',
-    kind: 'cascade',
+    kind: 'propagation',
     blurb:
-      'SUM, AVG, MIN, and MAX over a 10M-row three-table chain. The cascade computes exact aggregate state while avoiding the expanded join.',
+      'SUM, AVG, MIN, and MAX over a 10M-row three-table chain. The aggregate propagation computes exact aggregate state while avoiding the expanded join.',
     setup: `CREATE OR REPLACE TABLE ca AS
   SELECT i AS k, (i % 97)::DOUBLE AS v FROM range(100000) t(i);
 CREATE OR REPLACE TABLE cb AS
@@ -101,9 +101,9 @@ WHERE ca.k = cb.k AND cb.j = cc.j;`,
   {
     id: 'dblp-graph',
     title: 'DBLP graph · 3-hop paths',
-    kind: 'cascade',
+    kind: 'propagation',
     blurb:
-      'A real 1.05M-edge co-authorship graph (SNAP com-DBLP). Counting 3-edge paths already expands heavily; the cascade propagates per-node frequencies instead of building the product.',
+      'A real 1.05M-edge co-authorship graph (SNAP com-DBLP). Counting 3-edge paths already expands heavily; aggregate propagation carries compact per-node frequencies instead of building the product.',
     dataset: { file: 'dblp.parquet', table: 'edges', sizeLabel: '3.3 MB · 1.05M edges' },
     setup: '',
     query: `SELECT COUNT(*) AS three_hop_paths
@@ -114,7 +114,7 @@ WHERE e1.toNode = e2.fromNode
   {
     id: 'dblp-graph-4hop',
     title: 'DBLP graph · 4-hop paths',
-    kind: 'cascade',
+    kind: 'propagation',
     blurb:
       'The same DBLP graph with one more hop. This is where the Yannakakis-style rewrite starts to look materially different from the native join tree.',
     dataset: { file: 'dblp.parquet', table: 'edges', sizeLabel: '3.3 MB · 1.05M edges' },
@@ -128,9 +128,9 @@ WHERE e1.toNode = e2.fromNode
   {
     id: 'dblp-graph-5hop',
     title: 'DBLP graph · 5-hop paths',
-    kind: 'cascade',
+    kind: 'propagation',
     blurb:
-      'A 5-hop path count on the bundled graph. The native baseline has much more fanout to account for, while the cascade keeps propagating compact counts.',
+      'A 5-hop path count on the bundled graph. The native baseline has much more fanout to account for, while the aggregate propagation keeps propagating compact counts.',
     dataset: { file: 'dblp.parquet', table: 'edges', sizeLabel: '3.3 MB · 1.05M edges' },
     setup: '',
     query: `SELECT COUNT(*) AS five_hop_paths
@@ -141,11 +141,11 @@ WHERE e1.toNode = e2.fromNode
   AND e4.toNode = e5.fromNode;`,
   },
   {
-    id: 'chain-count',
+    id: 'agg-propagation',
     title: 'Three-table chain COUNT',
-    kind: 'cascade',
+    kind: 'propagation',
     blurb:
-      'COUNT(*) over a chain that blows up to 6M join rows. The Yannakakis cascade propagates per-key frequencies and never materialises the product — the plan stays native (no AGGJOIN node), but the 6M-row build vanishes.',
+      'COUNT(*) over a chain that blows up to 6M join rows. Aggregate propagation carries per-key frequencies and never materialises the product — the plan stays native (no AGGJOIN node), but the 6M-row build vanishes.',
     setup: `CREATE OR REPLACE TABLE pt0 AS SELECT i AS k FROM range(60000) t(i);
 CREATE OR REPLACE TABLE pt1 AS SELECT i AS k, (i % 600) AS j FROM range(60000) t(i);
 CREATE OR REPLACE TABLE pt2 AS SELECT (i % 600) AS j FROM range(60000) t(i);`,
@@ -156,9 +156,9 @@ WHERE pt0.k = pt1.k AND pt1.j = pt2.j;`,
   {
     id: 'exact-variance',
     title: 'Exact VAR_POP over a join',
-    kind: 'cascade',
+    kind: 'propagation',
     blurb:
-      'Variance over the same 6M-row chain, via exact integer moments. The cascade is not just faster — it is deterministic and correctly-rounded, where native parallel Welford varies by ~1e-9 across runs.',
+      'Variance over the same 6M-row chain, via exact integer moments. The aggregate propagation is not just faster — it is deterministic and correctly-rounded, where native parallel Welford varies by ~1e-9 across runs.',
     setup: `CREATE OR REPLACE TABLE vt0 AS SELECT i AS k, (i % 97) AS v FROM range(60000) t(i);
 CREATE OR REPLACE TABLE vt1 AS SELECT i AS k, (i % 600) AS j FROM range(60000) t(i);
 CREATE OR REPLACE TABLE vt2 AS SELECT (i % 600) AS j FROM range(60000) t(i);`,

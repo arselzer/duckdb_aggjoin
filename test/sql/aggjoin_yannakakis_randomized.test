@@ -1,0 +1,428 @@
+# name: test/sql/aggjoin_yannakakis_randomized.test
+# description: Differential correctness coverage for logical Yannakakis-style tree rewrites.
+# group: [aggjoin]
+# differential: skip
+#   This file performs its own same-connection differential checks against
+#   PRAGMA disabled_optimizers='extension'. The extension-side query also asserts
+#   aggjoin_last_rewrite() = 'agg_propagation', so the comparison is meaningful.
+
+require aggjoin
+
+statement ok
+PRAGMA threads=1;
+
+statement ok
+SELECT aggjoin_set_operator_enabled(false);
+
+# ============================================================================
+# Pseudo-randomized single-key tree: NULL payloads, grouped output across two
+# leaves, and exact aggregate mixes. 60K x 60K x 60K with a 100x fanout -> 6M.
+# ============================================================================
+statement ok
+CREATE TABLE yr0(b INT, g0 INT, v0 INT);
+
+statement ok
+INSERT INTO yr0
+SELECT i::INT,
+       ((i * 17 + 3) % 11)::INT,
+       CASE WHEN i % 13 = 0 THEN NULL ELSE ((i * 31 + 7) % 1000)::INT END
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE yr1(b INT, c INT, v1 INT);
+
+statement ok
+INSERT INTO yr1
+SELECT i::INT,
+       (i % 600)::INT,
+       ((i * 19 + 11) % 1024)::INT
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE yr2(c INT, g2 INT, v2 INT, flag BOOLEAN);
+
+statement ok
+INSERT INTO yr2
+SELECT (i % 600)::INT,
+       ((i * 23 + 5) % 7)::INT,
+       ((i * 29 + 13) % 997)::INT,
+       (i % 5 = 0)
+FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE yr_ext AS
+SELECT yr0.g0,
+       yr2.g2,
+       COUNT(*) AS c_all,
+       COUNT(yr0.v0) AS c_v0,
+       SUM(yr0.v0) AS s_v0,
+       SUM(yr1.v1) AS s_v1,
+       MIN(yr2.v2) AS min_v2,
+       MAX(yr2.v2) AS max_v2,
+       BOOL_OR(yr2.flag) AS any_flag,
+       BIT_OR(yr1.v1) AS any_bits
+FROM yr0
+JOIN yr1 ON yr0.b = yr1.b
+JOIN yr2 ON yr1.c = yr2.c
+GROUP BY yr0.g0, yr2.g2;
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+statement ok
+PRAGMA disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE yr_native AS
+SELECT yr0.g0,
+       yr2.g2,
+       COUNT(*) AS c_all,
+       COUNT(yr0.v0) AS c_v0,
+       SUM(yr0.v0) AS s_v0,
+       SUM(yr1.v1) AS s_v1,
+       MIN(yr2.v2) AS min_v2,
+       MAX(yr2.v2) AS max_v2,
+       BOOL_OR(yr2.flag) AS any_flag,
+       BIT_OR(yr1.v1) AS any_bits
+FROM yr0
+JOIN yr1 ON yr0.b = yr1.b
+JOIN yr2 ON yr1.c = yr2.c
+GROUP BY yr0.g0, yr2.g2;
+
+statement ok
+PRAGMA disabled_optimizers='';
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM yr_ext EXCEPT ALL SELECT * FROM yr_native)
+    UNION ALL
+    (SELECT * FROM yr_native EXCEPT ALL SELECT * FROM yr_ext)
+) diff;
+----
+0
+
+statement ok
+DROP TABLE yr_native;
+
+statement ok
+DROP TABLE yr_ext;
+
+# ============================================================================
+# Pseudo-randomized composite-key chain: two-column edges, mixed key widths,
+# NULL payloads, grouped output from both endpoints, and exact aggregate mixes.
+# ============================================================================
+statement ok
+CREATE TABLE yrc0(a SMALLINT, b TINYINT, g0 INT, v0 INT);
+
+statement ok
+INSERT INTO yrc0
+SELECT CAST(i % 300 AS SMALLINT),
+       CAST(floor(i / 300) % 20 AS TINYINT),
+       ((i * 7 + 2) % 5)::INT,
+       CASE WHEN i % 17 = 0 THEN NULL ELSE ((i * 37 + 3) % 1000)::INT END
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE yrc1(a INT, b BIGINT, c SMALLINT, d INT, v1 INT);
+
+statement ok
+INSERT INTO yrc1
+SELECT (i % 300)::INT,
+       CAST(floor(i / 300) % 20 AS BIGINT),
+       CAST(i % 400 AS SMALLINT),
+       CAST(floor(i / 400) % 15 AS INT),
+       ((i * 41 + 17) % 2048)::INT
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE yrc2(c BIGINT, d SMALLINT, g2 INT, v2 INT);
+
+statement ok
+INSERT INTO yrc2
+SELECT CAST(i % 400 AS BIGINT),
+       CAST(floor(i / 400) % 15 AS SMALLINT),
+       ((i * 13 + 1) % 3)::INT,
+       ((i * 43 + 19) % 1009)::INT
+FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE yrc_ext AS
+SELECT yrc0.g0,
+       yrc2.g2,
+       COUNT(*) AS c_all,
+       COUNT(yrc0.v0) AS c_v0,
+       SUM(yrc0.v0) AS s_v0,
+       SUM(yrc1.v1) AS s_v1,
+       MIN(yrc2.v2) AS min_v2,
+       MAX(yrc2.v2) AS max_v2
+FROM yrc0
+JOIN yrc1 ON yrc0.a = yrc1.a AND yrc0.b = yrc1.b
+JOIN yrc2 ON yrc1.c = yrc2.c AND yrc1.d = yrc2.d
+GROUP BY yrc0.g0, yrc2.g2;
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+statement ok
+PRAGMA disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE yrc_native AS
+SELECT yrc0.g0,
+       yrc2.g2,
+       COUNT(*) AS c_all,
+       COUNT(yrc0.v0) AS c_v0,
+       SUM(yrc0.v0) AS s_v0,
+       SUM(yrc1.v1) AS s_v1,
+       MIN(yrc2.v2) AS min_v2,
+       MAX(yrc2.v2) AS max_v2
+FROM yrc0
+JOIN yrc1 ON yrc0.a = yrc1.a AND yrc0.b = yrc1.b
+JOIN yrc2 ON yrc1.c = yrc2.c AND yrc1.d = yrc2.d
+GROUP BY yrc0.g0, yrc2.g2;
+
+statement ok
+PRAGMA disabled_optimizers='';
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM yrc_ext EXCEPT ALL SELECT * FROM yrc_native)
+    UNION ALL
+    (SELECT * FROM yrc_native EXCEPT ALL SELECT * FROM yrc_ext)
+) diff;
+----
+0
+
+statement ok
+DROP TABLE yrc_native;
+
+statement ok
+DROP TABLE yrc_ext;
+
+# ============================================================================
+# Deterministic leaf-local join-key expressions: arithmetic on each side should
+# be materialized as computed leaf keys, then folded like ordinary tree edges.
+# ============================================================================
+statement ok
+CREATE TABLE ye0(id INT, g INT, v INT);
+
+statement ok
+INSERT INTO ye0
+SELECT i::INT,
+       (i % 5)::INT,
+       CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 997)::INT END
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ye1(k INT, c INT, v1 INT);
+
+statement ok
+INSERT INTO ye1
+SELECT (i + 1)::INT,
+       (i % 600)::INT,
+       (i % 1009)::INT
+FROM range(60000) t(i);
+
+statement ok
+CREATE TABLE ye2(c_key INT, g2 INT, v2 INT);
+
+statement ok
+INSERT INTO ye2
+SELECT ((i % 600) + 2)::INT,
+       (i % 7)::INT,
+       (i % 991)::INT
+FROM range(60000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE ye_ext AS
+SELECT ye0.g,
+       ye2.g2,
+       COUNT(*) AS c_all,
+       COUNT(ye0.v) AS c_v,
+       SUM(ye0.v) AS s_v,
+       SUM(ye1.v1) AS s_v1,
+       MIN(ye2.v2) AS min_v2,
+       MAX(ye2.v2) AS max_v2
+FROM ye0
+JOIN ye1 ON ye0.id + 1 = ye1.k
+JOIN ye2 ON ye1.c = ye2.c_key - 2
+GROUP BY ye0.g, ye2.g2;
+
+# Single derived-key-only shapes are correctness-covered but planner-gated after
+# local benchmarks showed the logical rewrite losing to native at this scale.
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+statement ok
+PRAGMA disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE ye_native AS
+SELECT ye0.g,
+       ye2.g2,
+       COUNT(*) AS c_all,
+       COUNT(ye0.v) AS c_v,
+       SUM(ye0.v) AS s_v,
+       SUM(ye1.v1) AS s_v1,
+       MIN(ye2.v2) AS min_v2,
+       MAX(ye2.v2) AS max_v2
+FROM ye0
+JOIN ye1 ON ye0.id + 1 = ye1.k
+JOIN ye2 ON ye1.c = ye2.c_key - 2
+GROUP BY ye0.g, ye2.g2;
+
+statement ok
+PRAGMA disabled_optimizers='';
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM ye_ext EXCEPT ALL SELECT * FROM ye_native)
+    UNION ALL
+    (SELECT * FROM ye_native EXCEPT ALL SELECT * FROM ye_ext)
+) diff;
+----
+0
+
+statement ok
+DROP TABLE ye_native;
+
+statement ok
+DROP TABLE ye_ext;
+
+# ============================================================================
+# Projection-wrapped leaves: aliases should remain opaque leaves, while their
+# join-output bindings still form a tree.
+# ============================================================================
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+statement ok
+CREATE TEMP TABLE yep_ext AS
+SELECT p0.g,
+       p2.g2,
+       COUNT(*) AS c_all,
+       COUNT(p0.v) AS c_v,
+       SUM(p0.v) AS s_v,
+       SUM(p1.v1) AS s_v1,
+       MIN(p2.v2) AS min_v2,
+       MAX(p2.v2) AS max_v2
+FROM (SELECT id, id + 1 AS idp, g, v FROM ye0) p0
+JOIN (SELECT k, c, v1 FROM ye1) p1 ON p0.idp = p1.k
+JOIN (SELECT c_key - 2 AS c, g2, v2 FROM ye2) p2 ON p1.c = p2.c
+GROUP BY p0.g, p2.g2;
+
+# Projected aliases expose the same single derived-key pattern as above and
+# should currently stay native.
+query T
+SELECT aggjoin_last_rewrite();
+----
+none
+
+statement ok
+PRAGMA disabled_optimizers='extension';
+
+statement ok
+CREATE TEMP TABLE yep_native AS
+SELECT p0.g,
+       p2.g2,
+       COUNT(*) AS c_all,
+       COUNT(p0.v) AS c_v,
+       SUM(p0.v) AS s_v,
+       SUM(p1.v1) AS s_v1,
+       MIN(p2.v2) AS min_v2,
+       MAX(p2.v2) AS max_v2
+FROM (SELECT id, id + 1 AS idp, g, v FROM ye0) p0
+JOIN (SELECT k, c, v1 FROM ye1) p1 ON p0.idp = p1.k
+JOIN (SELECT c_key - 2 AS c, g2, v2 FROM ye2) p2 ON p1.c = p2.c
+GROUP BY p0.g, p2.g2;
+
+statement ok
+PRAGMA disabled_optimizers='';
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM yep_ext EXCEPT ALL SELECT * FROM yep_native)
+    UNION ALL
+    (SELECT * FROM yep_native EXCEPT ALL SELECT * FROM yep_ext)
+) diff;
+----
+0
+
+statement ok
+DROP TABLE yep_native;
+
+statement ok
+DROP TABLE yep_ext;
+
+# ============================================================================
+# Plan-shape-independent recognition: with join-order disabled, DuckDB can keep
+# unrelated dimensions under a deferred CROSS_PRODUCT and place multiple star
+# predicates above it. The flattened graph collector should still see the
+# underlying tree and the stats fallback should provide the missing join estimate.
+# ============================================================================
+statement ok
+PRAGMA disabled_optimizers='join_order';
+
+statement ok
+CREATE TABLE yrp_d1(k INT);
+
+statement ok
+INSERT INTO yrp_d1 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE yrp_d2(k INT);
+
+statement ok
+INSERT INTO yrp_d2 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE yrp_d3(k INT);
+
+statement ok
+INSERT INTO yrp_d3 SELECT i % 50000 FROM range(250000) t(i);
+
+statement ok
+CREATE TABLE yrp_f(k1 INT, k2 INT, k3 INT, m INT);
+
+statement ok
+INSERT INTO yrp_f
+SELECT i % 50000, i % 50000, i % 50000, i % 4
+FROM range(250000) t(i);
+
+statement ok
+SELECT aggjoin_reset_rewrite_marker();
+
+query I
+SELECT COUNT(*)
+FROM yrp_d1, yrp_d2, yrp_f, yrp_d3
+WHERE yrp_f.k1 = yrp_d1.k
+  AND yrp_f.k2 = yrp_d2.k
+  AND yrp_f.k3 = yrp_d3.k;
+----
+31250000
+
+query T
+SELECT aggjoin_last_rewrite();
+----
+agg_propagation
+
+statement ok
+PRAGMA disabled_optimizers='';
+
+statement ok
+SELECT aggjoin_set_operator_enabled(true);

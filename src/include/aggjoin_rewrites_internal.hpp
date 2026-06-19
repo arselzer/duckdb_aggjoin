@@ -22,7 +22,7 @@ namespace duckdb {
 // wrapped in value-reconciling CASTs, but NOT wrapped in a function or
 // arithmetic expression. LOWER(x), x+1, etc. change the join semantics; treating
 // them as an equi-key on the raw column joins on the wrong values. (Review bug B,
-// 2026-06-15.) Shared by IsEquiJoin and the chain-COUNT rewrite's edge detector.
+// 2026-06-15.) Shared by IsEquiJoin and the aggregate-propagation rewrite's edge detector.
 inline bool IsBareColumnKey(Expression &expr) {
     auto cls = expr.GetExpressionClass();
     if (cls == ExpressionClass::BOUND_COLUMN_REF || cls == ExpressionClass::BOUND_REF) {
@@ -66,7 +66,7 @@ bool TryRewriteNativeFinalBagPreagg(ClientContext &context, Optimizer &optimizer
                                     LogicalAggregate &agg, LogicalComparisonJoin &join, LogicalOperator &agg_child,
                                     AggJoinRewriteState &state, bool has_parent);
 
-bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
+bool TryRewriteNativeAggPropagation(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
                                     LogicalAggregate &agg, LogicalComparisonJoin &join, LogicalOperator &agg_child,
                                     AggJoinRewriteState &state, bool has_parent);
 

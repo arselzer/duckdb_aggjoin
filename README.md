@@ -149,6 +149,8 @@ The current implementation is strongest on:
   and selected `MIN/MAX`
 - build-heavy and mixed probe/build aggregate shapes that are better served by
   native preaggregation than by a fused executor
+- high-blowup acyclic join trees where aggregate propagation can carry compact
+  per-key frequencies instead of materialising the join product
 - narrow 3-way "final-bag" chains where preaggregating the tail of the join
   graph changes the cost materially
 - dense single-key integer workloads, where the fused AGGJOIN operator can use
@@ -189,6 +191,31 @@ unsupported shapes.
 - some type combinations such as `HUGEINT`/`DECIMAL` aggregate paths
 - some DuckDB v1.5.1 `CompressedMaterialization` plans where the fused shape is
   not exposed cleanly to the optimizer
+
+### Aggregate-Propagation Envelope
+
+The `agg_propagation` marker is the native logical rewrite for frequency and
+aggregate propagation. It now covers more than linear chains and more than
+`COUNT(*)`:
+
+- acyclic inner equi-join trees with at least three leaves
+- single-column and composite equality edges
+- deterministic leaf-local computed key expressions, with duplicate computed
+  key projections deduplicated before lowering
+- grouped and ungrouped `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, set-safe bit/boolean
+  aggregates, and exact integer moment handling for variance/stddev families
+- projection-wrapped leaves and provably no-op filters, including stale DuckDB
+  estimates after no-op filters have been optimized away
+
+The planner gate still has deliberate negative space:
+
+- low-fanout or near-1:1 trees stay native
+- deterministic single derived-key-only trees stay native unless the estimated
+  blowup is exceptionally large, because local benchmarks showed that rewrite
+  losing to native on borderline shapes
+- volatile, parameterized, subquery, multi-leaf, constant-only, non-equality, and
+  explicit-`NULL` key expressions stay native
+- cyclic join graphs and disconnected predicate graphs stay native
 
 **Narrow variable-width support:** single-key `VARCHAR` grouped-by-join-key or
 ungrouped numeric `SUM/COUNT/AVG/MIN/MAX` shapes can now use a narrow hash path

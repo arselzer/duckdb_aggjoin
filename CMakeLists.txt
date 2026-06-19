@@ -17,7 +17,7 @@ set(EXTENSION_SOURCES
   src/aggjoin_emit.cpp
   src/aggjoin_emit_direct.cpp
   src/aggjoin_rewrite_build.cpp
-  src/aggjoin_rewrite_chain_count.cpp
+  src/aggjoin_rewrite_agg_propagation.cpp
   src/aggjoin_rewrite_final_bag.cpp
   src/aggjoin_rewrite_mixed.cpp
   src/aggjoin_sink.cpp

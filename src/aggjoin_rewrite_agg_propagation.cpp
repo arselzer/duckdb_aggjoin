@@ -1,12 +1,12 @@
-// Chain-COUNT(*) Yannakakis-style rewrite.
+// Aggregate-propagation Yannakakis-style rewrite.
 //
-// Lowers `SELECT COUNT(*) FROM R0, R1, ..., R(n-1) WHERE <linear chain of
-// single-column INNER equi-joins>` into a native frequency-propagation logical rewrite
+// Lowers `SELECT COUNT(*) FROM R0, R1, ..., R(n-1) WHERE <acyclic tree of
+// INNER equi-joins>` into a native frequency-propagation logical rewrite
 // (HASH_GROUP_BY -> HASH_JOIN -> HASH_GROUP_BY -> ...), so the intermediate join
-// product is never materialised. This generalises the fixed 3-relation final-bag
-// rewrite to an N-relation linear chain, for the COUNT(*) case only.
+// product is never materialised. Each tree edge may be a single equality or a
+// composite vector of equality predicates connecting the same pair of leaves.
 //
-// Correctness sketch (the GYO/Yannakakis foundation): for a linear chain the
+// Correctness sketch (the GYO/Yannakakis foundation): for an acyclic join the
 // join tree has the running-intersection property. Pre-aggregating each relation
 // by its interface key and propagating per-key multiplicity as a DOUBLE `_freq`
 // (leaf _freq = COUNT(*) per key; parent _freq = SUM(parent rows' child _freq))
@@ -14,24 +14,24 @@
 // join rows it represents. SUM of root _freq therefore equals COUNT(*) of the
 // full join, without materialising it. Empty/dangling inputs -> 0 via COALESCE.
 //
-// MVP scope: ungrouped single COUNT(*) over a strict linear chain (>= 3 leaves)
-// of single-condition INNER equi-joins with bare-column keys. Everything else
-// bails (to the existing rules / native) — see the gate list below. Anything not
-// a single-condition INNER equi-join with bare keys is treated as an OPAQUE LEAF
-// (safe: its multiplicity is captured by COUNT(*) over the leaf subtree).
+// Scope: COUNT/SUM/MIN/MAX/AVG/COUNT(col)/set-safe/VAR-style aggregates over an
+// acyclic join tree (>= 3 leaves) whose edges are bare columns or deterministic
+// leaf-local key expressions. Anything outside that shape is treated as an
+// OPAQUE LEAF (safe: its multiplicity is captured by COUNT(*) over the leaf subtree).
 //
 // Review/design context: docs/ (2026-06-15 critical review + Yannakakis design).
 
 #include "aggjoin_rewrites_internal.hpp"
+#include "aggjoin_stats.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+
 #include <cmath>
+#include <limits>
 
 namespace duckdb {
 
@@ -51,20 +51,49 @@ bool ExtractBareBinding(Expression &expr, ColumnBinding &binding) {
     return false;
 }
 
-struct ChainLeaf {
+struct AggPropLeaf {
     unique_ptr<LogicalOperator> *slot = nullptr; // owning slot inside the join tree
     vector<ColumnBinding> bindings;
     vector<LogicalType> types;
     idx_t estimated_cardinality = 0;
 };
 
-struct ChainEdge {
+struct AggPropEdge {
     idx_t leaf_a = 0;
     idx_t leaf_b = 0;
-    ColumnBinding col_a;
-    ColumnBinding col_b;
-    LogicalType type_a;
-    LogicalType type_b;
+    vector<ColumnBinding> cols_a;
+    vector<ColumnBinding> cols_b;
+    vector<LogicalType> types_a;
+    vector<LogicalType> types_b;
+};
+
+struct RawJoinPredicate {
+    unique_ptr<Expression> left;
+    unique_ptr<Expression> right;
+};
+
+struct LoweredJoinPredicate {
+    ColumnBinding left;
+    ColumnBinding right;
+};
+
+struct LeafComputedKey {
+    unique_ptr<Expression> expr;
+    LogicalType type;
+};
+
+struct LeafProjectionInfo {
+    bool projected = false;
+    vector<ColumnBinding> old_bindings;
+    vector<ColumnBinding> new_bindings;
+    vector<ColumnBinding> computed_bindings;
+};
+
+struct JoinKeyRequest {
+    idx_t leaf = DConstants::INVALID_INDEX;
+    bool computed = false;
+    ColumnBinding binding;
+    idx_t computed_idx = DConstants::INVALID_INDEX;
 };
 
 // A user aggregate to propagate through frequency propagation. `home_leaf` is the leaf
@@ -119,7 +148,7 @@ bool BindingsContain(const vector<ColumnBinding> &v, const ColumnBinding &x) {
     return false;
 }
 
-idx_t FindLeafForBinding(const vector<ChainLeaf> &leaves, idx_t lo, idx_t hi, const ColumnBinding &b) {
+idx_t FindLeafForBinding(const vector<AggPropLeaf> &leaves, idx_t lo, idx_t hi, const ColumnBinding &b) {
     for (idx_t i = lo; i < hi; i++) {
         if (BindingsContain(leaves[i].bindings, b)) {
             return i;
@@ -128,7 +157,7 @@ idx_t FindLeafForBinding(const vector<ChainLeaf> &leaves, idx_t lo, idx_t hi, co
     return DConstants::INVALID_INDEX;
 }
 
-bool TypeForBinding(const ChainLeaf &leaf, const ColumnBinding &b, LogicalType &out) {
+bool TypeForBinding(const AggPropLeaf &leaf, const ColumnBinding &b, LogicalType &out) {
     for (idx_t i = 0; i < leaf.bindings.size(); i++) {
         if (leaf.bindings[i] == b) {
             out = leaf.types[i];
@@ -147,61 +176,16 @@ bool TypeForBinding(const ChainLeaf &leaf, const ColumnBinding &b, LogicalType &
 // Used to safely admit wide-INTEGER VAR/STDDEV: the exact HUGEINT moment
 // `n·Σx² − (Σx)²` overflows only if the ACTUAL values are large, which stats
 // can rule out (a BIGINT column whose values fit in 32 bits is just as safe).
-double ColumnMaxAbsFromStats(ClientContext &context, const ChainLeaf &leaf, const ColumnBinding &b) {
+double ColumnMaxAbsFromStats(ClientContext &context, const AggPropLeaf &leaf, const ColumnBinding &b) {
     if (!leaf.slot || !*leaf.slot) {
         return -1.0; // slot already moved out / empty
     }
-    LogicalOperator *cur = leaf.slot->get(); // slot is a pointer to the owning unique_ptr
-    while (cur) {
-        if (cur->type == LogicalOperatorType::LOGICAL_GET) {
-            auto &get = cur->Cast<LogicalGet>();
-            if (b.table_index != get.table_index) {
-                return -1.0; // binding belongs to a projection above the GET
-            }
-            auto &col_ids = get.GetColumnIds();
-            if (b.column_index >= col_ids.size()) {
-                return -1.0;
-            }
-            auto col_idx = col_ids[b.column_index];
-            // Base-table scans expose stats via statistics_extended (v1.5.x);
-            // older table functions via the plain statistics callback.  Mirrors
-            // DuckDB's own propagate_get.cpp.  `statistics_extended` /
-            // `TableFunctionGetStatisticsInput` are v1.5.x-only — the WASM ABI
-            // (v1.4.3) has just the plain `statistics` callback, so the extended
-            // path is compiled in only when the v1.5.x headers are present
-            // (same `__has_include` switch the rest of the extension uses).  On
-            // v1.4.3 a null `statistics` simply yields -1.0 → conservative bail.
-            unique_ptr<BaseStatistics> stats;
-#if __has_include("duckdb/main/extension_callback_manager.hpp")
-            if (get.function.statistics_extended) {
-                TableFunctionGetStatisticsInput input(get.bind_data.get(), col_idx);
-                stats = get.function.statistics_extended(context, input);
-            } else if (get.function.statistics) {
-                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
-            } else {
-                return -1.0;
-            }
-#else
-            if (get.function.statistics) {
-                stats = get.function.statistics(context, get.bind_data.get(), col_idx.GetPrimaryIndex());
-            } else {
-                return -1.0;
-            }
-#endif
-            if (!stats || !NumericStats::HasMinMax(*stats)) {
-                return -1.0;
-            }
-            double lo = std::fabs(NumericStats::Min(*stats).GetValue<double>());
-            double hi = std::fabs(NumericStats::Max(*stats).GetValue<double>());
-            return std::max(lo, hi);
-        }
-        if (cur->children.size() == 1) {
-            cur = cur->children[0].get(); // LogicalFilter passes bindings through unchanged
-            continue;
-        }
-        return -1.0; // join / multi-child / projection — can't resolve cleanly
+    double lo = 0;
+    double hi = 0;
+    if (!AggJoinTryGetNumericMinMaxFromStats(context, **leaf.slot, b, lo, hi)) {
+        return -1.0;
     }
-    return -1.0;
+    return std::max(std::fabs(lo), std::fabs(hi));
 }
 
 // The accumulator type an aggregate's value threads through the fold in -- chosen
@@ -245,67 +229,435 @@ bool IsSetSafe(const string &fn) {
            fn == "BIT_OR";
 }
 
-// Recursively classify the join subtree owned by `slot` into leaves + edges.
-// Decision (internal-vs-leaf) is made BEFORE recursing so a node is never both.
-// Captures the owning unique_ptr slot per leaf so the build phase can move it out.
-void CollectChain(unique_ptr<LogicalOperator> &slot, vector<ChainLeaf> &leaves, vector<ChainEdge> &edges) {
-    auto &node = *slot;
-    if (node.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-        auto &j = node.Cast<LogicalComparisonJoin>();
-        if (j.join_type == JoinType::INNER && j.conditions.size() == 1 &&
-            j.conditions[0].comparison == ExpressionType::COMPARE_EQUAL &&
-            IsBareColumnKey(*j.conditions[0].left) && IsBareColumnKey(*j.conditions[0].right)) {
-            ColumnBinding lb, rb;
-            if (ExtractBareBinding(*j.conditions[0].left, lb) && ExtractBareBinding(*j.conditions[0].right, rb)) {
-                auto c0 = j.children[0]->GetColumnBindings();
-                auto c1 = j.children[1]->GetColumnBindings();
-                bool lb0 = BindingsContain(c0, lb), lb1 = BindingsContain(c1, lb);
-                bool rb0 = BindingsContain(c0, rb), rb1 = BindingsContain(c1, rb);
-                // lb must live in exactly one child, rb in the *other* child.
-                idx_t lb_child = lb0 && !lb1 ? 0 : (lb1 && !lb0 ? 1 : DConstants::INVALID_INDEX);
-                idx_t rb_child = rb0 && !rb1 ? 0 : (rb1 && !rb0 ? 1 : DConstants::INVALID_INDEX);
-                if (lb_child != DConstants::INVALID_INDEX && rb_child != DConstants::INVALID_INDEX &&
-                    lb_child != rb_child) {
-                    idx_t a_lo = leaves.size();
-                    CollectChain(j.children[lb_child], leaves, edges);
-                    idx_t a_hi = leaves.size();
-                    CollectChain(j.children[rb_child], leaves, edges);
-                    idx_t b_hi = leaves.size();
-                    idx_t la = FindLeafForBinding(leaves, a_lo, a_hi, lb);
-                    idx_t lc = FindLeafForBinding(leaves, a_hi, b_hi, rb);
-                    if (la != DConstants::INVALID_INDEX && lc != DConstants::INVALID_INDEX) {
-                        ChainEdge edge;
-                        edge.leaf_a = la;
-                        edge.leaf_b = lc;
-                        edge.col_a = lb;
-                        edge.col_b = rb;
-                        if (TypeForBinding(leaves[la], lb, edge.type_a) &&
-                            TypeForBinding(leaves[lc], rb, edge.type_b)) {
-                            edges.push_back(std::move(edge));
-                        }
-                    }
-                    return;
-                }
-            }
+void CollectExpressionBindings(Expression &expr, vector<ColumnBinding> &bindings) {
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+        auto binding = expr.Cast<BoundColumnRefExpression>().binding;
+        if (!BindingsContain(bindings, binding)) {
+            bindings.push_back(binding);
         }
     }
-    // Opaque leaf.
-    ChainLeaf leaf;
+    ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CollectExpressionBindings(child, bindings); });
+}
+
+bool ExpressionContainsNullConstant(Expression &expr) {
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+        expr.Cast<BoundConstantExpression>().value.IsNull()) {
+        return true;
+    }
+    bool contains_null = false;
+    ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
+        if (ExpressionContainsNullConstant(child)) {
+            contains_null = true;
+        }
+    });
+    return contains_null;
+}
+
+bool IsSupportedJoinKeyExpression(Expression &expr) {
+    ColumnBinding dummy;
+    if (ExtractBareBinding(expr, dummy)) {
+        return true;
+    }
+    return !ExpressionContainsNullConstant(expr) && !expr.IsVolatile() && !expr.HasSubquery() &&
+           !expr.HasParameter() && !expr.IsAggregate() && !expr.IsWindow();
+}
+
+bool ReplaceBoundReferencesWithColumnRefs(unique_ptr<Expression> &expr, const vector<ColumnBinding> &bindings,
+                                          const vector<LogicalType> &types) {
+    if (expr->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+        auto idx = expr->Cast<BoundReferenceExpression>().index;
+        if (idx >= bindings.size() || idx >= types.size()) {
+            return false;
+        }
+        expr = make_uniq<BoundColumnRefExpression>(types[idx], bindings[idx]);
+        return true;
+    }
+    bool ok = true;
+    ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+        if (!ReplaceBoundReferencesWithColumnRefs(child, bindings, types)) {
+            ok = false;
+        }
+    });
+    return ok;
+}
+
+void AddOpaqueLeaf(ClientContext &context, unique_ptr<LogicalOperator> &slot, vector<AggPropLeaf> &leaves) {
+    auto &node = *slot;
+    AggPropLeaf leaf;
     leaf.slot = &slot;
     leaf.bindings = node.GetColumnBindings();
     leaf.types = node.types;
-    leaf.estimated_cardinality = node.has_estimated_cardinality ? node.estimated_cardinality : 0;
+    leaf.estimated_cardinality =
+        node.has_estimated_cardinality ? node.estimated_cardinality : node.EstimateCardinality(context);
+    idx_t no_op_filtered_cardinality = 0;
+    if (AggJoinTryGetNoOpFilteredCardinality(context, node, no_op_filtered_cardinality)) {
+        leaf.estimated_cardinality = std::max(leaf.estimated_cardinality, no_op_filtered_cardinality);
+    }
     leaves.push_back(std::move(leaf));
 }
 
+bool IsFlattenableJoin(LogicalOperator &node, vector<RawJoinPredicate> &predicates) {
+    if (node.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+        auto &j = node.Cast<LogicalComparisonJoin>();
+        if (j.join_type == JoinType::INNER && !j.conditions.empty()) {
+            auto left_bindings = j.children[0]->GetColumnBindings();
+            auto right_bindings = j.children[1]->GetColumnBindings();
+            auto &left_types = j.children[0]->types;
+            auto &right_types = j.children[1]->types;
+            vector<RawJoinPredicate> local;
+            for (auto &cond : j.conditions) {
+                RawJoinPredicate pred;
+                pred.left = cond.left->Copy();
+                pred.right = cond.right->Copy();
+                bool left_refs_ok = ReplaceBoundReferencesWithColumnRefs(pred.left, left_bindings, left_types);
+                bool right_refs_ok = ReplaceBoundReferencesWithColumnRefs(pred.right, right_bindings, right_types);
+                bool left_supported = left_refs_ok && IsSupportedJoinKeyExpression(*pred.left);
+                bool right_supported = right_refs_ok && IsSupportedJoinKeyExpression(*pred.right);
+                if (cond.comparison != ExpressionType::COMPARE_EQUAL || !left_supported || !right_supported) {
+                    return false;
+                }
+                local.push_back(std::move(pred));
+            }
+            for (auto &pred : local) {
+                predicates.push_back(std::move(pred));
+            }
+            return true;
+        }
+    }
+    if (node.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT && node.children.size() == 2) {
+        return true;
+    }
+    return false;
+}
+
+// Recursively classify the join subtree owned by `slot` into leaves plus a flat
+// list of bare equality predicates. Edges are intentionally resolved only after
+// all leaves are known, so a valid star/tree is recognized even when DuckDB's
+// binary join tree groups several unrelated leaves on one side of a later join.
+// Unsupported join nodes become opaque leaves; their multiplicity is then
+// captured by the fold just like a base scan.
+void CollectJoinGraph(ClientContext &context, unique_ptr<LogicalOperator> &slot, vector<AggPropLeaf> &leaves,
+                      vector<RawJoinPredicate> &predicates) {
+    auto &node = *slot;
+    idx_t predicate_base = predicates.size();
+    if (IsFlattenableJoin(node, predicates)) {
+        idx_t leaf_base = leaves.size();
+        for (auto &child : node.children) {
+            CollectJoinGraph(context, child, leaves, predicates);
+        }
+        if (leaves.size() > leaf_base) {
+            return;
+        }
+        predicates.resize(predicate_base);
+    }
+    AddOpaqueLeaf(context, slot, leaves);
+}
+
+bool ResolveJoinKeyRequest(Expression &expr, const vector<AggPropLeaf> &leaves,
+                           vector<vector<LeafComputedKey>> &computed_keys, JoinKeyRequest &request) {
+    ColumnBinding bare;
+    if (ExtractBareBinding(expr, bare)) {
+        idx_t leaf = FindLeafForBinding(leaves, 0, leaves.size(), bare);
+        if (leaf == DConstants::INVALID_INDEX) {
+            return false;
+        }
+        request.leaf = leaf;
+        request.computed = false;
+        request.binding = bare;
+        return true;
+    }
+
+    vector<ColumnBinding> referenced;
+    CollectExpressionBindings(expr, referenced);
+    if (referenced.empty()) {
+        return false; // constants do not connect two leaves
+    }
+    idx_t leaf = DConstants::INVALID_INDEX;
+    for (auto &binding : referenced) {
+        idx_t binding_leaf = FindLeafForBinding(leaves, 0, leaves.size(), binding);
+        if (binding_leaf == DConstants::INVALID_INDEX) {
+            return false;
+        }
+        if (leaf == DConstants::INVALID_INDEX) {
+            leaf = binding_leaf;
+        } else if (leaf != binding_leaf) {
+            return false; // expression spans multiple leaves
+        }
+    }
+
+    request.leaf = leaf;
+    request.computed = true;
+    for (idx_t i = 0; i < computed_keys[leaf].size(); i++) {
+        if (Expression::Equals(*computed_keys[leaf][i].expr, expr)) {
+            request.computed_idx = i;
+            return true;
+        }
+    }
+    request.computed_idx = computed_keys[leaf].size();
+    computed_keys[leaf].push_back({expr.Copy(), expr.return_type});
+    return true;
+}
+
+bool RewriteBindingThroughProjection(const vector<LeafProjectionInfo> &projection_info, ColumnBinding &binding) {
+    for (auto &info : projection_info) {
+        if (!info.projected) {
+            continue;
+        }
+        for (idx_t i = 0; i < info.old_bindings.size(); i++) {
+            if (info.old_bindings[i] == binding) {
+                binding = info.new_bindings[i];
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+ColumnBinding RequestBinding(const JoinKeyRequest &request, const vector<LeafProjectionInfo> &projection_info) {
+    if (request.computed) {
+        return projection_info[request.leaf].computed_bindings[request.computed_idx];
+    }
+    auto binding = request.binding;
+    RewriteBindingThroughProjection(projection_info, binding);
+    return binding;
+}
+
+bool BindingIsDerivedProjectionKey(LogicalOperator &op, const ColumnBinding &binding) {
+    if (op.type == LogicalOperatorType::LOGICAL_PROJECTION && op.children.size() == 1) {
+        auto &proj = op.Cast<LogicalProjection>();
+        if (binding.table_index == proj.table_index && binding.column_index < proj.expressions.size()) {
+            auto &expr = *proj.expressions[binding.column_index];
+            ColumnBinding child_binding;
+            if (ExtractBareBinding(expr, child_binding)) {
+                return BindingIsDerivedProjectionKey(*proj.children[0], child_binding);
+            }
+            if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+                auto child_bindings = proj.children[0]->GetColumnBindings();
+                auto idx = expr.Cast<BoundReferenceExpression>().index;
+                if (idx < child_bindings.size()) {
+                    return BindingIsDerivedProjectionKey(*proj.children[0], child_bindings[idx]);
+                }
+            }
+            return true;
+        }
+    }
+    if (op.children.size() == 1 && BindingsContain(op.children[0]->GetColumnBindings(), binding)) {
+        return BindingIsDerivedProjectionKey(*op.children[0], binding);
+    }
+    return false;
+}
+
+void ApplyComputedKeyProjections(ClientContext &context, Optimizer &optimizer, vector<AggPropLeaf> &leaves,
+                                 vector<vector<LeafComputedKey>> &computed_keys,
+                                 vector<LeafProjectionInfo> &projection_info) {
+    auto colref = [](const LogicalType &t, const ColumnBinding &b) {
+        return make_uniq<BoundColumnRefExpression>(t, b);
+    };
+    projection_info.assign(leaves.size(), LeafProjectionInfo());
+    for (idx_t leaf_idx = 0; leaf_idx < leaves.size(); leaf_idx++) {
+        auto &keys = computed_keys[leaf_idx];
+        if (keys.empty()) {
+            continue;
+        }
+        auto &leaf = leaves[leaf_idx];
+        auto table_index = optimizer.binder.GenerateTableIndex();
+        auto old_bindings = leaf.bindings;
+        auto old_types = leaf.types;
+        vector<unique_ptr<Expression>> expressions;
+        expressions.reserve(old_bindings.size() + keys.size());
+        for (idx_t i = 0; i < old_bindings.size(); i++) {
+            expressions.push_back(colref(old_types[i], old_bindings[i]));
+        }
+        for (auto &key : keys) {
+            expressions.push_back(std::move(key.expr));
+        }
+
+        auto proj = make_uniq<LogicalProjection>(table_index, std::move(expressions));
+        proj->children.push_back(std::move(*leaf.slot));
+        proj->ResolveOperatorTypes();
+
+        LeafProjectionInfo info;
+        info.projected = true;
+        info.old_bindings = std::move(old_bindings);
+        for (idx_t i = 0; i < old_types.size(); i++) {
+            info.new_bindings.push_back(ColumnBinding(table_index, i));
+        }
+        for (idx_t i = 0; i < keys.size(); i++) {
+            info.computed_bindings.push_back(ColumnBinding(table_index, old_types.size() + i));
+        }
+
+        vector<ColumnBinding> new_bindings;
+        new_bindings.reserve(proj->types.size());
+        for (idx_t i = 0; i < proj->types.size(); i++) {
+            new_bindings.push_back(ColumnBinding(table_index, i));
+        }
+        leaf.bindings = std::move(new_bindings);
+        leaf.types = proj->types;
+        *leaf.slot = std::move(proj);
+        projection_info[leaf_idx] = std::move(info);
+        (void)context;
+    }
+}
+
+struct ComputedKeyProjectionRollback {
+    explicit ComputedKeyProjectionRollback(vector<AggPropLeaf> &leaves, vector<LeafProjectionInfo> &projection_info)
+        : leaves(leaves), projection_info(projection_info) {
+    }
+
+    ~ComputedKeyProjectionRollback() {
+        if (!active) {
+            return;
+        }
+        for (idx_t i = 0; i < leaves.size() && i < projection_info.size(); i++) {
+            if (!projection_info[i].projected || !leaves[i].slot || !*leaves[i].slot ||
+                (*leaves[i].slot)->type != LogicalOperatorType::LOGICAL_PROJECTION ||
+                (*leaves[i].slot)->children.size() != 1) {
+                continue;
+            }
+            *leaves[i].slot = std::move((*leaves[i].slot)->children[0]);
+        }
+    }
+
+    void Commit() {
+        active = false;
+    }
+
+    vector<AggPropLeaf> &leaves;
+    vector<LeafProjectionInfo> &projection_info;
+    bool active = true;
+};
+
+bool LowerJoinPredicates(ClientContext &context, Optimizer &optimizer, vector<AggPropLeaf> &leaves,
+                         vector<RawJoinPredicate> &raw_predicates, vector<ColumnBinding> &group_bindings,
+                         vector<AggSpec> &aggs, vector<LoweredJoinPredicate> &predicates,
+                         vector<LeafProjectionInfo> &projection_info) {
+    vector<vector<LeafComputedKey>> computed_keys(leaves.size());
+    struct PendingPredicate {
+        JoinKeyRequest left;
+        JoinKeyRequest right;
+    };
+    vector<PendingPredicate> pending;
+    pending.reserve(raw_predicates.size());
+    for (auto &raw : raw_predicates) {
+        PendingPredicate pred;
+        if (!ResolveJoinKeyRequest(*raw.left, leaves, computed_keys, pred.left) ||
+            !ResolveJoinKeyRequest(*raw.right, leaves, computed_keys, pred.right) ||
+            pred.left.leaf == pred.right.leaf) {
+            return false;
+        }
+        pending.push_back(pred);
+    }
+
+    ApplyComputedKeyProjections(context, optimizer, leaves, computed_keys, projection_info);
+    for (auto &binding : group_bindings) {
+        RewriteBindingThroughProjection(projection_info, binding);
+    }
+    for (auto &agg : aggs) {
+        if (!agg.is_count_star) {
+            RewriteBindingThroughProjection(projection_info, agg.col_b);
+        }
+    }
+
+    predicates.clear();
+    predicates.reserve(pending.size());
+    for (auto &pred : pending) {
+        predicates.push_back({RequestBinding(pred.left, projection_info), RequestBinding(pred.right, projection_info)});
+    }
+    return !predicates.empty();
+}
+
+bool BuildEdgesFromPredicates(const vector<AggPropLeaf> &leaves, const vector<LoweredJoinPredicate> &predicates,
+                              vector<AggPropEdge> &edges) {
+    edges.clear();
+    for (auto &pred : predicates) {
+        idx_t left_leaf = FindLeafForBinding(leaves, 0, leaves.size(), pred.left);
+        idx_t right_leaf = FindLeafForBinding(leaves, 0, leaves.size(), pred.right);
+        if (left_leaf == DConstants::INVALID_INDEX || right_leaf == DConstants::INVALID_INDEX ||
+            left_leaf == right_leaf) {
+            return false;
+        }
+        AggPropEdge *edge = nullptr;
+        for (auto &candidate : edges) {
+            if ((candidate.leaf_a == left_leaf && candidate.leaf_b == right_leaf) ||
+                (candidate.leaf_a == right_leaf && candidate.leaf_b == left_leaf)) {
+                edge = &candidate;
+                break;
+            }
+        }
+        if (!edge) {
+            AggPropEdge new_edge;
+            new_edge.leaf_a = left_leaf;
+            new_edge.leaf_b = right_leaf;
+            edges.push_back(std::move(new_edge));
+            edge = &edges.back();
+        }
+        ColumnBinding col_a;
+        ColumnBinding col_b;
+        if (edge->leaf_a == left_leaf) {
+            col_a = pred.left;
+            col_b = pred.right;
+        } else {
+            col_a = pred.right;
+            col_b = pred.left;
+        }
+        LogicalType type_a;
+        LogicalType type_b;
+        if (!TypeForBinding(leaves[edge->leaf_a], col_a, type_a) ||
+            !TypeForBinding(leaves[edge->leaf_b], col_b, type_b)) {
+            return false;
+        }
+        edge->cols_a.push_back(col_a);
+        edge->cols_b.push_back(col_b);
+        edge->types_a.push_back(std::move(type_a));
+        edge->types_b.push_back(std::move(type_b));
+    }
+    return !edges.empty();
+}
+
+bool EstimateJoinTreeCardinalityFromStats(ClientContext &context, const vector<AggPropLeaf> &leaves,
+                                          const vector<AggPropEdge> &edges, idx_t &estimated) {
+    long double result = 1.0;
+    for (auto &leaf : leaves) {
+        if (leaf.estimated_cardinality == 0) {
+            return false;
+        }
+        result *= static_cast<long double>(leaf.estimated_cardinality);
+    }
+    for (auto &edge : edges) {
+        idx_t domain_a = 0;
+        idx_t domain_b = 0;
+        auto *leaf_a_op = leaves[edge.leaf_a].slot ? leaves[edge.leaf_a].slot->get() : nullptr;
+        auto *leaf_b_op = leaves[edge.leaf_b].slot ? leaves[edge.leaf_b].slot->get() : nullptr;
+        if (!leaf_a_op || !leaf_b_op ||
+            !AggJoinTryGetCompositeKeyDomainFromStats(context, *leaf_a_op, edge.cols_a, edge.types_a, domain_a) ||
+            !AggJoinTryGetCompositeKeyDomainFromStats(context, *leaf_b_op, edge.cols_b, edge.types_b, domain_b)) {
+            return false;
+        }
+        auto denom = std::max(domain_a, domain_b);
+        if (denom == 0) {
+            return false;
+        }
+        result /= static_cast<long double>(denom);
+    }
+    if (result <= 0.0) {
+        return false;
+    }
+    if (result >= static_cast<long double>(std::numeric_limits<idx_t>::max())) {
+        estimated = std::numeric_limits<idx_t>::max();
+    } else {
+        estimated = static_cast<idx_t>(result);
+    }
+    return estimated > 0;
+}
+
 // Per-leaf adjacency for the general acyclic join tree. Each edge records this
-// leaf's join column and the neighbour's join column (raw leaf bindings/types).
+// leaf's join-key vector and the neighbour's join-key vector (raw leaf bindings/types).
 struct TreeAdjEdge {
     idx_t nbr;
-    ColumnBinding my_col;
-    LogicalType my_type;
-    ColumnBinding nbr_col;
-    LogicalType nbr_type;
+    vector<ColumnBinding> my_cols;
+    vector<LogicalType> my_types;
+    vector<ColumnBinding> nbr_cols;
+    vector<LogicalType> nbr_types;
 };
 
 // Build per-leaf adjacency. Returns false unless the equi-join graph is a
@@ -313,7 +665,7 @@ struct TreeAdjEdge {
 // alpha-acyclicity test: a cycle has >= m edges, a disconnected graph fewer
 // reachable nodes. Stars and branching trees ARE accepted (any tree topology),
 // unlike the former path-only check; only cycles and disconnected graphs bail.
-bool BuildAdjacency(const vector<ChainLeaf> &leaves, const vector<ChainEdge> &edges,
+bool BuildAdjacency(const vector<AggPropLeaf> &leaves, const vector<AggPropEdge> &edges,
                     vector<vector<TreeAdjEdge>> &adj) {
     idx_t m = leaves.size();
     if (edges.size() != m - 1) {
@@ -321,8 +673,8 @@ bool BuildAdjacency(const vector<ChainLeaf> &leaves, const vector<ChainEdge> &ed
     }
     adj.assign(m, vector<TreeAdjEdge>());
     for (auto &e : edges) {
-        adj[e.leaf_a].push_back({e.leaf_b, e.col_a, e.type_a, e.col_b, e.type_b});
-        adj[e.leaf_b].push_back({e.leaf_a, e.col_b, e.type_b, e.col_a, e.type_a});
+        adj[e.leaf_a].push_back({e.leaf_b, e.cols_a, e.types_a, e.cols_b, e.types_b});
+        adj[e.leaf_b].push_back({e.leaf_a, e.cols_b, e.types_b, e.cols_a, e.types_a});
     }
     // With m-1 edges, connected <=> acyclic. DFS from node 0.
     vector<bool> seen(m, false);
@@ -370,7 +722,7 @@ bool WidenKeys(ClientContext &context, JoinCondition &cond, const LogicalType &l
 // aggregates: each fold JOINs one child CTE, then `SUM(node_freq * child_freq)`
 // GROUP BY the still-live columns (persistent GROUP BY columns + not-yet-folded
 // child join columns). This is the general-tree generalisation of the linear
-// chain fold. Leaf subtrees are moved out of leaves[].slot. Returns false on
+// path fold. Leaf subtrees are moved out of leaves[].slot. Returns false on
 // construction failure.
 //
 // out_keep_b/out_keep_t are the persistent columns in order: [up_col (if parent
@@ -378,7 +730,7 @@ bool WidenKeys(ClientContext &context, JoinCondition &cond, const LogicalType &l
 // extra_keep order. out_keep_extra_pos is INVALID for up_col and otherwise points
 // back into extra_keep.
 bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<TreeAdjEdge>> &adj,
-              vector<ChainLeaf> &leaves, idx_t node, idx_t parent, const vector<AggSpec> &aggs,
+              vector<AggPropLeaf> &leaves, idx_t node, idx_t parent, const vector<AggSpec> &aggs,
               const vector<std::pair<ColumnBinding, LogicalType>> &extra_keep, unique_ptr<LogicalOperator> &out_cte,
               vector<ColumnBinding> &out_keep_b, vector<LogicalType> &out_keep_t,
               vector<idx_t> &out_keep_extra_pos, ColumnBinding &out_freq_b, LogicalType &out_freq_t,
@@ -431,13 +783,13 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
     };
 
     bool have_up = false;
-    ColumnBinding up_col;
-    LogicalType up_type;
+    vector<ColumnBinding> up_cols;
+    vector<LogicalType> up_types;
     vector<const TreeAdjEdge *> children;
     for (auto &e : adj[node]) {
         if (parent != DConstants::INVALID_INDEX && e.nbr == parent) {
-            up_col = e.my_col;
-            up_type = e.my_type;
+            up_cols = e.my_cols;
+            up_types = e.my_types;
             have_up = true;
         } else {
             children.push_back(&e);
@@ -456,7 +808,9 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
     };
     vector<Keep> keep;
     if (have_up) {
-        keep.push_back({false, 0, DConstants::INVALID_INDEX, up_col, up_type});
+        for (idx_t i = 0; i < up_cols.size(); i++) {
+            keep.push_back({false, 0, DConstants::INVALID_INDEX, up_cols[i], up_types[i]});
+        }
     }
     for (idx_t i = 0; i < extra_keep.size(); i++) {
         auto &ek = extra_keep[i];
@@ -469,17 +823,19 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
         out_keep_t.clear();
         out_keep_extra_pos.clear();
         if (have_up) {
-            bool found_up = false;
+            idx_t found_up = 0;
             for (auto &k : items) {
                 if (!k.transient_child && k.extra_pos == DConstants::INVALID_INDEX) {
                     out_keep_b.push_back(k.cur_b);
                     out_keep_t.push_back(k.cur_t);
                     out_keep_extra_pos.push_back(DConstants::INVALID_INDEX);
-                    found_up = true;
-                    break;
+                    found_up++;
+                    if (found_up == up_cols.size()) {
+                        break;
+                    }
                 }
             }
-            if (!found_up) {
+            if (found_up != up_cols.size()) {
                 return false;
             }
         }
@@ -580,7 +936,10 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
     }
 
     for (idx_t ci = 0; ci < children.size(); ci++) {
-        keep.push_back({true, ci, DConstants::INVALID_INDEX, children[ci]->my_col, children[ci]->my_type});
+        for (idx_t k = 0; k < children[ci]->my_cols.size(); k++) {
+            keep.push_back(
+                {true, ci, DConstants::INVALID_INDEX, children[ci]->my_cols[k], children[ci]->my_types[k]});
+        }
     }
 
     bool has_freq = false;
@@ -599,34 +958,41 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
                       c_keep_t, c_keep_extra_pos, c_freq_b, c_freq_t, child_states)) {
             return false;
         }
-        if (c_keep_b.empty() || c_keep_extra_pos.size() != c_keep_b.size()) {
+        idx_t key_count = children[ci]->my_cols.size();
+        if (c_keep_b.size() < key_count || c_keep_extra_pos.size() != c_keep_b.size()) {
             return false;
         }
-        idx_t kpos = DConstants::INVALID_INDEX;
-        for (idx_t k = 0; k < keep.size(); k++) {
-            if (keep[k].transient_child && keep[k].child_pos == ci) {
-                kpos = k;
-                break;
+        for (idx_t k = 0; k < key_count; k++) {
+            if (c_keep_extra_pos[k] != DConstants::INVALID_INDEX) {
+                return false;
             }
         }
-        if (kpos == DConstants::INVALID_INDEX) {
+        vector<idx_t> kpos;
+        for (idx_t k = 0; k < keep.size(); k++) {
+            if (keep[k].transient_child && keep[k].child_pos == ci) {
+                kpos.push_back(k);
+            }
+        }
+        if (kpos.size() != key_count) {
             return false;
         }
         auto join = make_uniq<LogicalComparisonJoin>(JoinType::INNER);
-        JoinCondition cond;
-        cond.comparison = ExpressionType::COMPARE_EQUAL;
-        cond.left = colref(keep[kpos].cur_t, keep[kpos].cur_b);
-        cond.right = colref(c_keep_t[0], c_keep_b[0]);
-        if (!WidenKeys(context, cond, keep[kpos].cur_t, c_keep_t[0])) {
-            return false;
+        for (idx_t k = 0; k < key_count; k++) {
+            JoinCondition cond;
+            cond.comparison = ExpressionType::COMPARE_EQUAL;
+            cond.left = colref(keep[kpos[k]].cur_t, keep[kpos[k]].cur_b);
+            cond.right = colref(c_keep_t[k], c_keep_b[k]);
+            if (!WidenKeys(context, cond, keep[kpos[k]].cur_t, c_keep_t[k])) {
+                return false;
+            }
+            join->conditions.push_back(std::move(cond));
         }
-        join->conditions.push_back(std::move(cond));
         join->children.push_back(std::move(rel));
         join->children.push_back(std::move(child_cte));
         join->ResolveOperatorTypes();
 
         vector<Keep> joined_keep = keep;
-        for (idx_t i = 1; i < c_keep_b.size(); i++) {
+        for (idx_t i = key_count; i < c_keep_b.size(); i++) {
             if (c_keep_extra_pos[i] == DConstants::INVALID_INDEX) {
                 return false;
             }
@@ -765,11 +1131,17 @@ bool FoldNode(ClientContext &context, Optimizer &optimizer, const vector<vector<
         auto preagg = make_uniq<LogicalAggregate>(g, a, std::move(aggexprs));
         vector<idx_t> surviving;
         for (idx_t k = 0; k < joined_keep.size(); k++) {
-            if (k == kpos) {
-                continue;
+            bool folded_key = false;
+            for (auto pos : kpos) {
+                if (k == pos) {
+                    folded_key = true;
+                    break;
+                }
             }
-            preagg->groups.push_back(colref(joined_keep[k].cur_t, joined_keep[k].cur_b));
-            surviving.push_back(k);
+            if (!folded_key) {
+                preagg->groups.push_back(colref(joined_keep[k].cur_t, joined_keep[k].cur_b));
+                surviving.push_back(k);
+            }
         }
         preagg->children.push_back(std::move(join));
         preagg->ResolveOperatorTypes();
@@ -872,7 +1244,7 @@ unique_ptr<LogicalOperator> *DescendMappingBindings(unique_ptr<LogicalOperator> 
 
 } // namespace
 
-bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
+bool TryRewriteNativeAggPropagation(ClientContext &context, Optimizer &optimizer, unique_ptr<LogicalOperator> &op,
                                     LogicalAggregate &agg, LogicalComparisonJoin &join, LogicalOperator &agg_child,
                                     AggJoinRewriteState &state, bool has_parent) {
     // ── Gate: aggregates limited to SUM/MIN/MAX/AVG/COUNT(col)/COUNT(*),
@@ -915,7 +1287,7 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
         }
         // SUM(integer) binds to plain "sum" with a HUGEINT result; the shared
         // IsAggregate gate (aggjoin_rewrites.cpp) excludes HUGEINT, so WalkAndReplace
-        // dispatches the chain-count logical rewrite BEFORE that gate specifically so integer
+        // dispatches the agg-propagation logical rewrite BEFORE that gate specifically so integer
         // SUM reaches here -- it is accumulated EXACTLY in HUGEINT (see FoldNode).
         if (fn != "SUM" && fn != "MIN" && fn != "MAX" && fn != "AVG" && fn != "COUNT" && !IsSetSafe(fn) &&
             !IsVarFamily(fn)) {
@@ -963,6 +1335,9 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
     }
     unique_ptr<LogicalOperator> *join_slot = DescendMappingBindings(&op->children[0], map_bindings, map_compresses);
     if (!join_slot) {
+        if (AggJoinTraceEnabled()) {
+            fprintf(stderr, "[AGGJOIN] agg-propagation bail: could not descend aggregate projection chain\n");
+        }
         return false;
     }
     // SUM/MIN/etc. over a compressed column would aggregate the compressed value
@@ -970,21 +1345,50 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
     // compress-aware (it is re-emitted, not aggregated).
     for (idx_t j = 0; j < aggs.size(); j++) {
         if (agg_compress[j].has_compress) {
+            if (AggJoinTraceEnabled()) {
+                fprintf(stderr, "[AGGJOIN] agg-propagation bail: aggregate input is compressed\n");
+            }
             return false;
         }
     }
 
-    // ── Phase 1: classify the join tree into leaves + single-key equi edges ──
-    vector<ChainLeaf> leaves;
-    vector<ChainEdge> edges;
-    CollectChain(*join_slot, leaves, edges);
+    // ── Phase 1: classify the join tree into leaves + equi-join tree edges ──
+    vector<AggPropLeaf> leaves;
+    vector<RawJoinPredicate> raw_predicates;
+    vector<LoweredJoinPredicate> predicates;
+    vector<LeafProjectionInfo> projection_info;
+    vector<AggPropEdge> edges;
+    CollectJoinGraph(context, *join_slot, leaves, raw_predicates);
+    if (!LowerJoinPredicates(context, optimizer, leaves, raw_predicates, group_bindings, aggs, predicates,
+                             projection_info)) {
+        if (AggJoinTraceEnabled()) {
+            fprintf(stderr, "[AGGJOIN] agg-propagation bail: could not lower join predicates (leaves=%zu raw_preds=%zu)\n",
+                    leaves.size(), raw_predicates.size());
+        }
+        return false;
+    }
+    ComputedKeyProjectionRollback projection_rollback(leaves, projection_info);
+    if (!BuildEdgesFromPredicates(leaves, predicates, edges)) {
+        if (AggJoinTraceEnabled()) {
+            fprintf(stderr, "[AGGJOIN] agg-propagation bail: lowered predicates do not form leaf edges (leaves=%zu preds=%zu)\n",
+                    leaves.size(), predicates.size());
+        }
+        return false;
+    }
 
     if (leaves.size() < 3) {
+        if (AggJoinTraceEnabled()) {
+            fprintf(stderr, "[AGGJOIN] agg-propagation bail: fewer than 3 leaves (%zu)\n", leaves.size());
+        }
         return false; // < 2 joins: leave single-join shapes to the fused/native path
     }
 
     vector<vector<TreeAdjEdge>> adj;
     if (!BuildAdjacency(leaves, edges, adj)) {
+        if (AggJoinTraceEnabled()) {
+            fprintf(stderr, "[AGGJOIN] agg-propagation bail: leaf graph is not a connected tree (leaves=%zu edges=%zu)\n",
+                    leaves.size(), edges.size());
+        }
         return false; // cyclic or disconnected equi-join graph
     }
 
@@ -1079,6 +1483,12 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
             max_leaf_est = std::max(max_leaf_est, leaf.estimated_cardinality);
         }
         idx_t join_est = join.has_estimated_cardinality ? (idx_t)join.estimated_cardinality : 0;
+        bool used_stats_join_est = false;
+        idx_t stats_join_est = 0;
+        if (EstimateJoinTreeCardinalityFromStats(context, leaves, edges, stats_join_est) && stats_join_est > join_est) {
+            join_est = stats_join_est;
+            used_stats_join_est = true;
+        }
         // The logical rewrite wins only when native must materialise a LARGE intermediate
         // join AND that intermediate is a multiplicity blowup of the inputs.
         // Two independent conditions, both required (calibrated 2026-06-15):
@@ -1090,13 +1500,65 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
         const idx_t BLOWUP_FACTOR = 4;
         bool large_join = join_est >= MIN_JOIN_EST;
         bool blowup = join_est >= max_leaf_est * BLOWUP_FACTOR;
+        bool has_composite_edge = false;
+        bool has_derived_single_key_edge = false;
+        bool has_derived_composite_edge = false;
+        bool saw_composite_key_stats = false;
+        bool composite_duplicate_density = false;
+        for (auto &edge : edges) {
+            bool edge_has_derived_key = false;
+            auto *leaf_a_op = leaves[edge.leaf_a].slot ? leaves[edge.leaf_a].slot->get() : nullptr;
+            auto *leaf_b_op = leaves[edge.leaf_b].slot ? leaves[edge.leaf_b].slot->get() : nullptr;
+            for (auto &col : edge.cols_a) {
+                edge_has_derived_key =
+                    edge_has_derived_key || (leaf_a_op && BindingIsDerivedProjectionKey(*leaf_a_op, col));
+            }
+            for (auto &col : edge.cols_b) {
+                edge_has_derived_key =
+                    edge_has_derived_key || (leaf_b_op && BindingIsDerivedProjectionKey(*leaf_b_op, col));
+            }
+            if (edge_has_derived_key) {
+                if (edge.cols_a.size() > 1) {
+                    has_derived_composite_edge = true;
+                } else {
+                    has_derived_single_key_edge = true;
+                }
+            }
+            if (edge.cols_a.size() <= 1) {
+                continue;
+            }
+            has_composite_edge = true;
+            idx_t domain_a = 0;
+            if (leaf_a_op &&
+                AggJoinTryGetCompositeKeyDomainFromStats(context, *leaf_a_op, edge.cols_a, edge.types_a, domain_a)) {
+                saw_composite_key_stats = true;
+                composite_duplicate_density =
+                    composite_duplicate_density ||
+                    AggJoinAtLeastRatio(leaves[edge.leaf_a].estimated_cardinality, domain_a, 2, 1);
+            }
+            idx_t domain_b = 0;
+            if (leaf_b_op &&
+                AggJoinTryGetCompositeKeyDomainFromStats(context, *leaf_b_op, edge.cols_b, edge.types_b, domain_b)) {
+                saw_composite_key_stats = true;
+                composite_duplicate_density =
+                    composite_duplicate_density ||
+                    AggJoinAtLeastRatio(leaves[edge.leaf_b].estimated_cardinality, domain_b, 2, 1);
+            }
+        }
+        bool composite_stats_reject =
+            has_composite_edge && saw_composite_key_stats && !composite_duplicate_density;
+        const idx_t DERIVED_SINGLE_KEY_BLOWUP_FACTOR = 256;
+        bool derived_single_key_reject =
+            has_derived_single_key_edge && !has_derived_composite_edge &&
+            !AggJoinAtLeastRatio(join_est, max_leaf_est, DERIVED_SINGLE_KEY_BLOWUP_FACTOR, 1);
         if (AggJoinTraceEnabled()) {
             fprintf(stderr,
-                    "[AGGJOIN] chain-count gate: leaves=%zu max_leaf_est=%llu join_est=%llu large_join=%d blowup=%d\n",
+                    "[AGGJOIN] agg-propagation gate: leaves=%zu max_leaf_est=%llu join_est=%llu stats_join_est=%d large_join=%d blowup=%d composite_stats_reject=%d derived_single_key_reject=%d\n",
                     leaves.size(), (unsigned long long)max_leaf_est, (unsigned long long)join_est,
-                    (int)large_join, (int)blowup);
+                    (int)used_stats_join_est, (int)large_join, (int)blowup, (int)composite_stats_reject,
+                    (int)derived_single_key_reject);
         }
-        if (!large_join || !blowup) {
+        if (!large_join || !blowup || composite_stats_reject || derived_single_key_reject) {
             return false;
         }
     }
@@ -1152,6 +1614,7 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
             }
         }
     }
+    projection_rollback.Commit();
 
     // ── Phase 2: fold the whole tree leaf-to-root, moving leaf subtrees out. ──
     // Every GROUP BY column rides through every fold as a persistent kept column,
@@ -1329,10 +1792,10 @@ bool TryRewriteNativeChainCountStar(ClientContext &context, Optimizer &optimizer
         }
     }
     if (AggJoinTraceEnabled()) {
-        fprintf(stderr, "[AGGJOIN] planner rewrite: native chain-count logical rewrite (leaves=%zu, aggs=%zu)\n",
+        fprintf(stderr, "[AGGJOIN] planner rewrite: native agg-propagation logical rewrite (leaves=%zu, aggs=%zu)\n",
                 leaves.size(), aggs.size());
     }
-    SetAggJoinLastRewrite("chain_count");
+    SetAggJoinLastRewrite("agg_propagation");
     op = std::move(final_proj);
     return true;
 }

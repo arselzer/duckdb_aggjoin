@@ -26,7 +26,7 @@ const nativePlanLines = computed(() => (props.bench?.nativePlan ? props.bench.na
 const rewriteLabel = computed(() => {
   const marker = props.bench?.rewrite
   if (props.bench?.planHasAggjoin || marker === 'fused') return 'fused AGGJOIN operator fired'
-  if (marker === 'chain_count') return 'Yannakakis-style native rewrite'
+  if (marker === 'agg_propagation') return 'aggregate-propagation native rewrite'
   if (marker === 'final_bag') return 'final-bag native rewrite'
   if (marker === 'native_build') return 'build-side native rewrite'
   if (marker === 'native_mixed') return 'mixed-side native rewrite'
