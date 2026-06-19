@@ -6,24 +6,41 @@ const props = defineProps<{ bench: BenchResult | null; busy: boolean }>()
 
 const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${ms.toFixed(1)} ms`)
 
-const maxMs = computed(() => (props.bench ? Math.max(props.bench.aggjoinMs, props.bench.nativeMs, 0.01) : 1))
-const aggPct = computed(() => (props.bench ? Math.max((props.bench.aggjoinMs / maxMs.value) * 100, 2) : 0))
-const natPct = computed(() => (props.bench ? Math.max((props.bench.nativeMs / maxMs.value) * 100, 2) : 0))
+const isBenchmark = computed(() => props.bench?.mode === 'benchmark')
+const isOptimizedOnly = computed(() => props.bench?.mode === 'optimized')
+const isNativeOnly = computed(() => props.bench?.mode === 'native')
+const maxMs = computed(() => {
+  if (!props.bench) return 1
+  return Math.max(...[props.bench.aggjoinMs, props.bench.nativeMs, 0.01].filter((ms): ms is number => ms !== null))
+})
+const aggPct = computed(() => (props.bench?.aggjoinMs !== null && props.bench?.aggjoinMs !== undefined ? Math.max((props.bench.aggjoinMs / maxMs.value) * 100, 2) : 0))
+const natPct = computed(() => (props.bench?.nativeMs !== null && props.bench?.nativeMs !== undefined ? Math.max((props.bench.nativeMs / maxMs.value) * 100, 2) : 0))
 
 const speedupLabel = computed(() => {
-  if (!props.bench) return ''
+  if (!props.bench || props.bench.speedup === null) return ''
   const s = props.bench.speedup
   if (s >= 100) return s.toFixed(0)
   if (s >= 10) return s.toFixed(1)
   return s.toFixed(2)
 })
-const faster = computed(() => (props.bench?.speedup ?? 0) >= 1.05)
-const slower = computed(() => !!props.bench && props.bench.speedup < 0.95)
+const faster = computed(() => isBenchmark.value && (props.bench?.speedup ?? 0) >= 1.05)
+const slower = computed(() => isBenchmark.value && (props.bench?.speedup ?? 1) < 0.95)
+const primaryMs = computed(() => props.bench?.mode === 'native' ? props.bench.nativeMs : props.bench?.aggjoinMs)
+const primaryMsLabel = computed(() => typeof primaryMs.value === 'number' ? fmtMs(primaryMs.value) : 'n/a')
+const aggMsLabel = computed(() => typeof props.bench?.aggjoinMs === 'number' ? fmtMs(props.bench.aggjoinMs) : '')
+const nativeMsLabel = computed(() => typeof props.bench?.nativeMs === 'number' ? fmtMs(props.bench.nativeMs) : '')
+const headlineLabel = computed(() => {
+  if (!props.bench) return ''
+  if (props.bench.mode === 'benchmark') return faster.value ? 'aggjoin speedup' : 'no speedup on this shape'
+  if (props.bench.mode === 'optimized') return 'optimized runtime'
+  return 'native runtime'
+})
 
 const planLines = computed(() => (props.bench?.plan ? props.bench.plan.split('\n') : []))
 const nativePlanLines = computed(() => (props.bench?.nativePlan ? props.bench.nativePlan.split('\n') : []))
 
 const rewriteLabel = computed(() => {
+  if (props.bench?.mode === 'native') return 'extension optimizer disabled'
   const marker = props.bench?.rewrite
   if (props.bench?.planHasAggjoin || marker === 'fused') return 'fused AGGJOIN operator fired'
   if (marker === 'agg_propagation') return 'aggregate-propagation native rewrite'
@@ -37,12 +54,22 @@ const rewriteLabel = computed(() => {
 const decision = computed(() => {
   const bench = props.bench
   if (!bench) return null
+  if (bench.mode === 'native') {
+    return {
+      tone: 'slate',
+      title: 'Native-only run',
+      text: 'The extension optimizer was disabled. No optimized path or speedup was measured.',
+      facts: ['extension off', `rows=${bench.result.rowCount.toLocaleString()}`],
+    }
+  }
   const marker = bench.rewrite || 'none'
   if (bench.planHasAggjoin || marker === 'fused') {
     return {
       tone: 'amber',
       title: 'Fused operator',
-      text: 'The extension selected a physical AGGJOIN operator for the optimized run.',
+      text: bench.mode === 'optimized'
+        ? 'The extension selected a physical AGGJOIN operator. Native baseline was skipped.'
+        : 'The extension selected a physical AGGJOIN operator for the optimized run.',
       facts: [`marker=${marker}`, 'optimized plan contains AGGJOIN', `rows=${bench.result.rowCount.toLocaleString()}`],
     }
   }
@@ -65,8 +92,12 @@ const decision = computed(() => {
   return {
     tone: 'slate',
     title: 'Native DuckDB',
-    text: 'No aggjoin rewrite marker was recorded for the optimized run.',
-    facts: ['marker=none', 'extension plan and native baseline are both DuckDB plans', `rows=${bench.result.rowCount.toLocaleString()}`],
+    text: bench.mode === 'optimized'
+      ? 'No aggjoin rewrite marker was recorded. Native baseline was skipped.'
+      : 'No aggjoin rewrite marker was recorded for the optimized run.',
+    facts: bench.mode === 'optimized'
+      ? ['marker=none', 'native baseline skipped', `rows=${bench.result.rowCount.toLocaleString()}`]
+      : ['marker=none', 'extension plan and native baseline are both DuckDB plans', `rows=${bench.result.rowCount.toLocaleString()}`],
   }
 })
 </script>
@@ -74,27 +105,32 @@ const decision = computed(() => {
 <template>
   <section class="panel bench">
     <div class="bar">
-      <span class="eyebrow">benchmark</span>
-      <span v-if="bench" class="tag" :class="bench.rowsMatch ? 'green' : 'slate'">
+      <span class="eyebrow">{{ isBenchmark ? 'benchmark' : 'run result' }}</span>
+      <span v-if="bench && isBenchmark" class="tag" :class="bench.rowsMatch ? 'green' : 'slate'">
         <span class="dot" />{{ bench.rowsMatch ? 'results match' : 'row counts differ' }}
       </span>
+      <span v-else-if="bench && isOptimizedOnly" class="tag amber">optimized only</span>
+      <span v-else-if="bench && isNativeOnly" class="tag slate">native only</span>
     </div>
 
     <!-- idle / busy placeholder -->
-    <div v-if="!bench" class="idle">
-      <div class="plain-loader" :class="{ live: busy }">
-        <span v-if="busy" class="spin ring" />
-        <span class="mono">{{ busy ? 'Measuring aggjoin and native plans' : 'Benchmark a query to compare plans' }}</span>
+      <div v-if="!bench" class="idle">
+        <div class="plain-loader" :class="{ live: busy }">
+          <span v-if="busy" class="spin ring" />
+        <span class="mono">{{ busy ? 'Running query' : 'Run a query to inspect or compare plans' }}</span>
       </div>
     </div>
 
     <template v-else>
       <div class="headline">
-        <div class="multiplier" :class="{ pos: faster, neg: slower }">
+        <div v-if="isBenchmark" class="multiplier" :class="{ pos: faster, neg: slower }">
           <span class="x">×</span><span class="num">{{ speedupLabel }}</span>
         </div>
+        <div v-else class="runtime" :class="{ native: isNativeOnly }">
+          <span class="num">{{ primaryMsLabel }}</span>
+        </div>
         <div class="cap">
-          <p class="eyebrow">{{ faster ? 'aggjoin speedup' : 'no speedup on this shape' }}</p>
+          <p class="eyebrow">{{ headlineLabel }}</p>
           <p class="mono small">
             {{ rewriteLabel }}
           </p>
@@ -102,15 +138,15 @@ const decision = computed(() => {
       </div>
 
       <div class="bars">
-        <div class="row">
-          <div class="lbl"><span class="swatch amber" /> AGGJOIN</div>
+        <div v-if="bench.aggjoinMs !== null" class="row">
+          <div class="lbl"><span class="swatch amber" /> {{ isBenchmark ? 'AGGJOIN' : 'OPTIMIZED' }}</div>
           <div class="track"><div class="fill amber" :style="{ width: aggPct + '%' }" /></div>
-          <div class="val mono">{{ fmtMs(bench.aggjoinMs) }}</div>
+          <div class="val mono">{{ aggMsLabel }}</div>
         </div>
-        <div class="row">
+        <div v-if="bench.nativeMs !== null" class="row">
           <div class="lbl"><span class="swatch slate" /> NATIVE</div>
           <div class="track"><div class="fill slate" :style="{ width: natPct + '%' }" /></div>
-          <div class="val mono">{{ fmtMs(bench.nativeMs) }}</div>
+          <div class="val mono">{{ nativeMsLabel }}</div>
         </div>
       </div>
 
@@ -126,7 +162,7 @@ const decision = computed(() => {
       </div>
 
       <div v-if="planLines.length || nativePlanLines.length" class="plans">
-        <div class="plan-pane">
+        <div v-if="planLines.length" class="plan-pane">
           <div class="plan-head">
             <span class="eyebrow">optimized plan</span>
             <span v-if="bench.planHasAggjoin" class="tag amber">AGGJOIN node</span>
@@ -191,6 +227,14 @@ const decision = computed(() => {
 .multiplier.neg { color: var(--red); }
 .multiplier .x { font-size: 26px; opacity: 0.65; margin-right: 2px; }
 .multiplier .num { font-size: 64px; letter-spacing: 0; }
+.runtime {
+  font-family: var(--font-display);
+  font-weight: 800;
+  color: var(--amber);
+  line-height: 0.95;
+}
+.runtime.native { color: var(--slate); }
+.runtime .num { font-size: 46px; letter-spacing: 0; }
 .cap .small { font-size: 11.5px; color: var(--text-dim); margin: 5px 0 0; }
 
 .bars { padding: 6px 20px 20px; display: grid; gap: 13px; }
@@ -255,6 +299,7 @@ const decision = computed(() => {
   .headline { align-items: flex-start; gap: 10px; padding: 20px 16px 14px; }
   .multiplier .x { font-size: 22px; }
   .multiplier .num { font-size: 52px; }
+  .runtime .num { font-size: 36px; }
   .bars { padding: 6px 16px 18px; }
   .row { grid-template-columns: 78px 1fr 66px; gap: 8px; }
   .decision { grid-template-columns: 1fr; padding: 15px 16px 17px; }

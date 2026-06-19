@@ -33,18 +33,26 @@ export interface QueryResult {
   truncated: boolean
 }
 
+export class QueryTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Query timed out after ${(timeoutMs / 1000).toFixed(timeoutMs >= 10000 ? 0 : 1)}s`)
+    this.name = 'QueryTimeoutError'
+  }
+}
+
 export interface BenchResult {
+  mode: 'benchmark' | 'optimized' | 'native'
   sql: string
-  aggjoinMs: number
-  nativeMs: number
-  speedup: number
+  aggjoinMs: number | null
+  nativeMs: number | null
+  speedup: number | null
   rewrite: string
   result: QueryResult
   plan: string
   nativePlan: string
   planHasAggjoin: boolean
-  nativeRowCount: number
-  rowsMatch: boolean
+  nativeRowCount: number | null
+  rowsMatch: boolean | null
 }
 
 export type ExportFormat = 'csv' | 'parquet'
@@ -155,10 +163,47 @@ export class AggJoinEngine {
     return { columns, rows, rowCount: total, ms, truncated: total > MAX_DISPLAY_ROWS }
   }
 
+  private async queryTable(sql: string, timeoutMs?: number): Promise<any> {
+    const query = this.c().query(sql)
+    if (!timeoutMs || timeoutMs <= 0) return query
+
+    let timedOut = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true
+        void this.cancelActiveQuery().finally(() => reject(new QueryTimeoutError(timeoutMs)))
+      }, timeoutMs)
+    })
+
+    try {
+      return await Promise.race([query, timeout])
+    } catch (e) {
+      query.catch(() => null)
+      if (timedOut) throw new QueryTimeoutError(timeoutMs)
+      throw e
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  async cancelActiveQuery(): Promise<boolean> {
+    const conn = this.conn
+    if (!conn) return false
+    try {
+      if (await conn.cancelSent()) return true
+    } catch { /* best effort */ }
+    try {
+      return await conn.useUnsafe((bindings, connId) => bindings.cancelPendingQuery(connId))
+    } catch {
+      return false
+    }
+  }
+
   /** Run a single statement and return its result (timed). */
-  async run(sql: string): Promise<QueryResult> {
+  async run(sql: string, timeoutMs?: number): Promise<QueryResult> {
     const t0 = performance.now()
-    const table = await this.c().query(sql)
+    const table = await this.queryTable(sql, timeoutMs)
     const ms = performance.now() - t0
     return this.toResult(table, ms)
   }
@@ -195,13 +240,13 @@ export class AggJoinEngine {
   // taking the best. Bails after the first timed run once it exceeds ~700 ms —
   // heavy queries (e.g. a real graph join) don't need three samples and the wait
   // would hurt the demo more than the extra precision helps.
-  private async measureAdaptive(sql: string, maxRuns: number): Promise<{ ms: number; rowCount: number }> {
-    await this.c().query(sql) // warm
+  private async measureAdaptive(sql: string, maxRuns: number, timeoutMs?: number): Promise<{ ms: number; rowCount: number }> {
+    await this.queryTable(sql, timeoutMs) // warm
     let best = Infinity
     let rowCount = 0
     for (let i = 0; i < maxRuns; i++) {
       const t0 = performance.now()
-      const table = await this.c().query(sql)
+      const table = await this.queryTable(sql, timeoutMs)
       const ms = performance.now() - t0
       best = Math.min(best, ms)
       rowCount = table.numRows
@@ -210,8 +255,8 @@ export class AggJoinEngine {
     return { ms: best, rowCount }
   }
 
-  private async explain(sql: string): Promise<string> {
-    const ex = await this.c().query(`EXPLAIN ${sql}`)
+  private async explain(sql: string, timeoutMs?: number): Promise<string> {
+    const ex = await this.queryTable(`EXPLAIN ${sql}`, timeoutMs)
     return ex
       .toArray()
       .map((r: any) => (r.toJSON ? r.toJSON() : r))
@@ -221,7 +266,7 @@ export class AggJoinEngine {
   }
 
   /** Run `sql` with aggjoin on, then native; report both + the plan. */
-  async benchmark(sql: string, runs = 3): Promise<BenchResult> {
+  async benchmark(sql: string, runs = 3, timeoutMs?: number): Promise<BenchResult> {
     const clean = sql.trim().replace(/;\s*$/, '')
 
     // --- aggjoin ON ---
@@ -229,13 +274,13 @@ export class AggJoinEngine {
     try {
       await this.c().query('SELECT aggjoin_reset_rewrite_marker()')
     } catch { /* older builds may not expose the marker helpers */ }
-    const agg = await this.measureAdaptive(clean, runs)
-    const display = await this.run(clean)
+    const agg = await this.measureAdaptive(clean, runs, timeoutMs)
+    const display = await this.run(clean, timeoutMs)
 
     // EXPLAIN (optimizer still on) — show the physical plan.
     let plan = ''
     try {
-      plan = await this.explain(clean)
+      plan = await this.explain(clean, timeoutMs)
     } catch { /* EXPLAIN can fail on some statements; non-fatal */ }
 
     let rewrite = ''
@@ -250,14 +295,15 @@ export class AggJoinEngine {
     let nativePlan = ''
     try {
       try {
-        nativePlan = await this.explain(clean)
+        nativePlan = await this.explain(clean, timeoutMs)
       } catch { /* non-fatal */ }
-      nat = await this.measureAdaptive(clean, runs)
+      nat = await this.measureAdaptive(clean, runs, timeoutMs)
     } finally {
       await this.setOptimizer(true) // always restore
     }
 
     return {
+      mode: 'benchmark',
       sql: clean,
       aggjoinMs: agg.ms,
       nativeMs: nat.ms,
@@ -269,6 +315,79 @@ export class AggJoinEngine {
       planHasAggjoin: /AGGJOIN/i.test(plan),
       nativeRowCount: nat.rowCount,
       rowsMatch: nat.rowCount === display.rowCount,
+    }
+  }
+
+  /** Run only the optimized/extension-enabled path, without the native baseline. */
+  async runOptimized(sql: string, runs = 3, timeoutMs?: number): Promise<BenchResult> {
+    const clean = sql.trim().replace(/;\s*$/, '')
+
+    await this.setOptimizer(true)
+    try {
+      await this.c().query('SELECT aggjoin_reset_rewrite_marker()')
+    } catch { /* older builds may not expose the marker helpers */ }
+
+    const agg = await this.measureAdaptive(clean, runs, timeoutMs)
+    const display = await this.run(clean, timeoutMs)
+
+    let plan = ''
+    try {
+      plan = await this.explain(clean, timeoutMs)
+    } catch { /* EXPLAIN can fail on some statements; non-fatal */ }
+
+    let rewrite = ''
+    try {
+      const marker = await this.c().query('SELECT aggjoin_last_rewrite() AS rewrite')
+      rewrite = String((marker.toArray()[0] as any)?.rewrite ?? '')
+    } catch { /* non-fatal */ }
+
+    return {
+      mode: 'optimized',
+      sql: clean,
+      aggjoinMs: agg.ms,
+      nativeMs: null,
+      speedup: null,
+      rewrite,
+      result: display,
+      plan,
+      nativePlan: '',
+      planHasAggjoin: /AGGJOIN/i.test(plan),
+      nativeRowCount: null,
+      rowsMatch: null,
+    }
+  }
+
+  /** Run only the native DuckDB path, with extension optimizers disabled. */
+  async runNative(sql: string, runs = 3, timeoutMs?: number): Promise<BenchResult> {
+    const clean = sql.trim().replace(/;\s*$/, '')
+
+    await this.setOptimizer(false)
+    let nativePlan = ''
+    let nat: { ms: number; rowCount: number }
+    let display: QueryResult
+    try {
+      try {
+        nativePlan = await this.explain(clean, timeoutMs)
+      } catch { /* EXPLAIN can fail on some statements; non-fatal */ }
+      nat = await this.measureAdaptive(clean, runs, timeoutMs)
+      display = await this.run(clean, timeoutMs)
+    } finally {
+      await this.setOptimizer(true)
+    }
+
+    return {
+      mode: 'native',
+      sql: clean,
+      aggjoinMs: null,
+      nativeMs: nat.ms,
+      speedup: null,
+      rewrite: 'none',
+      result: display,
+      plan: '',
+      nativePlan,
+      planHasAggjoin: false,
+      nativeRowCount: nat.rowCount,
+      rowsMatch: null,
     }
   }
 

@@ -5,10 +5,15 @@ const props = defineProps<{
   modelValue: string
   busy: boolean
   ready: boolean
+  timeoutSeconds: number
 }>()
 const emit = defineEmits<{
   'update:modelValue': [string]
+  'update:timeoutSeconds': [number]
   benchmark: []
+  optimizedOnly: []
+  nativeOnly: []
+  cancel: []
   newQuery: []
 }>()
 
@@ -56,6 +61,10 @@ function onInput(e: Event) {
   emit('update:modelValue', (e.target as HTMLTextAreaElement).value)
   requestAnimationFrame(syncScroll)
 }
+function onTimeoutInput(e: Event) {
+  const value = Number((e.target as HTMLInputElement).value)
+  emit('update:timeoutSeconds', Number.isFinite(value) ? Math.max(0, value) : 0)
+}
 function onKeydown(e: KeyboardEvent) {
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
     e.preventDefault()
@@ -99,9 +108,30 @@ function onKeydown(e: KeyboardEvent) {
       </div>
     </div>
     <div class="actions">
+      <label class="timeout mono">
+        <span>Timeout</span>
+        <input
+          type="number"
+          min="0"
+          step="5"
+          :value="timeoutSeconds"
+          :disabled="busy"
+          @input="onTimeoutInput"
+        />
+        <span>s</span>
+      </label>
       <button class="btn primary" :disabled="busy || !ready" @click="emit('benchmark')">
         <span v-if="busy" class="spin ring" />
-        <span>{{ busy ? 'Measuring' : 'Benchmark' }}</span>
+        <span>{{ busy ? 'Running' : 'Benchmark' }}</span>
+      </button>
+      <button class="btn ghost" :disabled="busy || !ready" @click="emit('optimizedOnly')">
+        Optimized only
+      </button>
+      <button class="btn ghost" :disabled="busy || !ready" @click="emit('nativeOnly')">
+        Native only
+      </button>
+      <button v-if="busy" class="btn danger" :disabled="!ready" @click="emit('cancel')">
+        Cancel
       </button>
     </div>
   </section>
@@ -190,7 +220,25 @@ function onKeydown(e: KeyboardEvent) {
   background: rgba(15, 105, 134, 0.18);
   -webkit-text-fill-color: transparent;
 }
-.actions { display: flex; gap: 10px; padding: 13px 16px; border-top: 1px solid var(--line); }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; padding: 13px 16px; border-top: 1px solid var(--line); }
+.timeout {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.timeout input {
+  width: 58px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 8px 7px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.timeout input:disabled { opacity: 0.55; }
 .btn {
   display: inline-flex;
   align-items: center;
@@ -214,6 +262,8 @@ function onKeydown(e: KeyboardEvent) {
 .primary:hover:not(:disabled) { filter: brightness(1.08); }
 .ghost { color: var(--text-dim); border-color: var(--line-strong); background: var(--panel-2); }
 .ghost:hover:not(:disabled) { color: var(--text); border-color: var(--slate); }
+.danger { color: var(--red); border-color: rgba(200, 79, 60, 0.32); background: rgba(200, 79, 60, 0.08); }
+.danger:hover:not(:disabled) { filter: brightness(1.05); }
 .ring {
   width: 13px;
   height: 13px;

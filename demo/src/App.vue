@@ -19,6 +19,7 @@ const engine = new AggJoinEngine()
 const SQL_KEY = 'aggjoin.demo.sql'
 const SESSIONS_KEY = 'aggjoin.demo.sessions'
 const HISTORY_KEY = 'aggjoin.demo.history'
+const TIMEOUT_KEY = 'aggjoin.demo.timeoutSeconds'
 const MAX_HISTORY = 24
 const MAX_SESSIONS = 24
 
@@ -63,6 +64,7 @@ const result = ref<QueryResult | null>(null)
 const error = ref<string | null>(null)
 const tables = ref<TableInfo[]>([])
 const activeExampleId = ref<string | null>(null)
+const timeoutSeconds = ref(readJson<number>(TIMEOUT_KEY, 30))
 const sessions = ref<SavedSession[]>(readJson<SavedSession[]>(SESSIONS_KEY, []))
 const history = ref<BenchHistoryEntry[]>(readJson<BenchHistoryEntry[]>(HISTORY_KEY, []))
 
@@ -103,6 +105,12 @@ watch(sql, (value) => {
 
 watch(sessions, (value) => writeJson(SESSIONS_KEY, value), { deep: true })
 watch(history, (value) => writeJson(HISTORY_KEY, value), { deep: true })
+watch(timeoutSeconds, (value) => writeJson(TIMEOUT_KEY, value))
+
+function queryTimeoutMs() {
+  const seconds = Number(timeoutSeconds.value)
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined
+}
 
 async function loadExample(ex: Example, opts: { silent?: boolean } = {}) {
   if (busy.value) return
@@ -126,7 +134,7 @@ async function loadExample(ex: Example, opts: { silent?: boolean } = {}) {
     if (ex.autoBenchmark === false) {
       bench.value = null
       result.value = null
-      if (!opts.silent) notify(`loaded “${ex.title}” · press Benchmark to run`)
+      if (!opts.silent) notify(`loaded “${ex.title}” · use Optimized only or Benchmark`)
     } else {
       if (!opts.silent) notify(`built data for “${ex.title}”`)
       await runBenchmark()
@@ -145,11 +153,11 @@ async function runBenchmark() {
   busy.value = true
   error.value = null
   try {
-    const b = await engine.benchmark(sql.value)
+    const b = await engine.benchmark(sql.value, 3, queryTimeoutMs())
     bench.value = b
     result.value = b.result
     rememberBenchmark(b)
-    if (!b.rowsMatch) notify('aggjoin and native returned different row counts', 'err')
+    if (b.rowsMatch === false) notify('aggjoin and native returned different row counts', 'err')
   } catch (e: any) {
     error.value = e?.message ?? String(e)
     bench.value = null
@@ -159,7 +167,47 @@ async function runBenchmark() {
   }
 }
 
+async function runOptimizedOnly() {
+  if (!ready.value) return
+  busy.value = true
+  error.value = null
+  try {
+    const b = await engine.runOptimized(sql.value, 3, queryTimeoutMs())
+    bench.value = b
+    result.value = b.result
+  } catch (e: any) {
+    error.value = e?.message ?? String(e)
+    bench.value = null
+    result.value = null
+  } finally {
+    busy.value = false
+  }
+}
+
+async function runNativeOnly() {
+  if (!ready.value) return
+  busy.value = true
+  error.value = null
+  try {
+    const b = await engine.runNative(sql.value, 3, queryTimeoutMs())
+    bench.value = b
+    result.value = b.result
+  } catch (e: any) {
+    error.value = e?.message ?? String(e)
+    bench.value = null
+    result.value = null
+  } finally {
+    busy.value = false
+  }
+}
+
+async function cancelQuery() {
+  const cancelled = await engine.cancelActiveQuery()
+  notify(cancelled ? 'cancel requested' : 'cancel not available for this query', cancelled ? 'ok' : 'err')
+}
+
 function rememberBenchmark(b: BenchResult) {
+  if (b.mode !== 'benchmark' || b.speedup === null || b.aggjoinMs === null || b.nativeMs === null) return
   const entry: BenchHistoryEntry = {
     id: makeId(),
     at: Date.now(),
@@ -334,7 +382,17 @@ async function dropTable(name: string) {
       </aside>
 
       <div class="main">
-        <SqlPanel v-model="sql" :busy="busy" :ready="ready" @benchmark="runBenchmark" @new-query="newQuery" />
+        <SqlPanel
+          v-model="sql"
+          v-model:timeout-seconds="timeoutSeconds"
+          :busy="busy"
+          :ready="ready"
+          @benchmark="runBenchmark"
+          @optimized-only="runOptimizedOnly"
+          @native-only="runNativeOnly"
+          @cancel="cancelQuery"
+          @new-query="newQuery"
+        />
         <NativeCommandPanel :sql="sql" />
         <BenchPanel :bench="bench" :busy="busy" />
         <ResultsTable :result="result" :error="error" :export-busy="exporting" @export="downloadResult" />
